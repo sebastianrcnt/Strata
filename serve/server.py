@@ -466,7 +466,7 @@ class StrataEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=300)  # local: QUIT writes --conversation-dir first (GBs)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=20)
@@ -489,6 +489,17 @@ class StrataEngine:
                 self.proc = None
                 self.ended = True
                 self.progress, self.last = None, {}
+
+    def persist(self) -> int:
+        """PERSIST: write the conversations to --conversation-dir now.  The caller holds the service's fifo."""
+        self.proc.stdin.write("PERSIST\n")
+        self.proc.stdin.flush()
+        while True:
+            line = self.lines.get(timeout=600)
+            if line is None:
+                raise EngineDied("the engine stopped while saving conversations")
+            if line.startswith("PERSISTED"):
+                return int(line.split()[1])
 
 
 class Vision:
@@ -899,6 +910,16 @@ class Service:
                     with self.status_lock:
                         trace["load_s"] += round(time.perf_counter() - loading, 3)
                         trace["state"] = "queued"
+
+    def persist(self) -> dict:
+        """POST /conversations/save: the engine writes its conversations to disk now (waits for a running request)."""
+        if not hasattr(self.engine, "persist") or not self.engine.alive():
+            return {"status": "unsupported"}
+        with self.fifo:
+            t0 = time.time()
+            n = self.engine.persist()
+        return {"status": "saved" if n >= 0 else "no --conversation-dir", "conversations": max(n, 0),
+                "seconds": round(time.time() - t0, 1)}
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
@@ -1942,6 +1963,9 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 self._json(409 if r == "busy" else 200, {"status": r})
+                return
+            if path == "/conversations/save":                # write the KV conversations to disk now
+                self._json(200, svc.persist())
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:

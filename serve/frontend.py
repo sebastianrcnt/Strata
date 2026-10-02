@@ -71,16 +71,15 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 
 
 def effort_kwargs(value) -> dict:
-    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
+    """A reasoning effort as given by a client -> the template's kwargs.  Local: llama.cpp's rule - "none" turns
+    thinking off, any other value goes to the template as given, which maps it (sharp-seeded: off -> no thinking,
+    minimal/low -> low, high/xhigh/max/ultracode/extreme -> xhigh, anything else -> medium)."""
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
-    if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
-    level = EFFORT[key]
-    return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
+    return {"enable_thinking": False} if key == "none" else {"reasoning_effort": key}
 
 
 def budget_effort(tokens) -> dict:

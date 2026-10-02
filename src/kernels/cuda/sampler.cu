@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -832,6 +833,32 @@ int2* split_scratch(void* stream, size_t entries) {
 }
 
 }  // namespace
+
+namespace {
+int* g_ban_ids = nullptr;
+int g_n_ban = 0;
+__global__ void ban_kernel(float* __restrict__ logits, int n_vocab, const int* __restrict__ ids, int n) {
+    float* row = logits + (size_t) blockIdx.y * n_vocab;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        if (ids[i] >= 0 && ids[i] < n_vocab) row[ids[i]] = __int_as_float(0xff800000);
+}
+}  // namespace
+
+void sampler_set_bans(const int* ids, int n) {
+    if (n <= 0) return;
+    if (cudaMalloc(&g_ban_ids, (size_t) n * sizeof(int)) != cudaSuccess ||
+        cudaMemcpy(g_ban_ids, ids, (size_t) n * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        std::fprintf(stderr, "sampler_set_bans: upload of %d ids failed\n", n);
+        std::exit(1);
+    }
+    g_n_ban = n;
+}
+
+void apply_bans(float* logits, int n_tokens, int n_vocab, void* stream) {
+    if (g_n_ban <= 0 || n_tokens <= 0) return;
+    const dim3 grid((unsigned) std::min(64, (g_n_ban + 255) / 256), (unsigned) n_tokens);
+    ban_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(logits, n_vocab, g_ban_ids, g_n_ban);
+}
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream) {

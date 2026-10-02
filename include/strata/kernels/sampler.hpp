@@ -27,6 +27,11 @@ struct SamplerParams {
     bool greedy = false;
 };
 
+// --ban-tokens (local): token ids whose logits are set to -inf before every verify-window pick.  Set once at start,
+// before any graph capture; apply_bans is a no-op without a list.
+void sampler_set_bans(const int* ids, int n);
+void apply_bans(float* logits, int n_tokens, int n_vocab, void* stream);
+
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
 //
 // **`logits` AND `out` ARE DEVICE POINTERS.**  This is a CUDA kernel launch, not a host function, and nothing
