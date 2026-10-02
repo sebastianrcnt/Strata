@@ -190,6 +190,7 @@ function render(m) {
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  if (tab === "monitor") renderConversations(m.conversations);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -314,6 +315,38 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
   $("req-wrap").classList.toggle("all", reqShowAll);
   $("req-totals").textContent = renderTotals(totals);
+}
+
+function renderConversations(c) {
+  const card = $("conv-card");
+  card.hidden = !c || !c.slots;
+  if (card.hidden) return;
+  const budget = c.budget_mib * 1048576, gbs = (b) => b == null ? "–" : `${gb(b)} GB`;
+  const files = new Map((c.files || []).map((f) => [f.key, f]));
+  const when = (f) => f ? new Date(f.mtime * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}) : "–";
+  const rows = [];
+  if (c.live_tokens > 0)
+    rows.push(`<tr><td>Live</td><td><span class="st-badge st-badge--generating">In GPU</span></td><td class="num">${fmt(c.live_tokens)}</td>
+      <td class="num">–</td><td class="num">–</td><td class="muted">on shutdown</td></tr>`);
+  const parked = (c.parked || []).slice().reverse();   // most recently active first
+  parked.forEach((p, i) => {
+    const f = files.get(p.key);
+    files.delete(p.key);
+    const next = i === parked.length - 1 && parked.length >= c.slots;
+    rows.push(`<tr><td>${i + 1} / ${c.slots}</td><td><span class="st-badge">Parked</span>${next ? ` <span class="st-badge st-badge--queued" title="evicted first when a new conversation needs the room">next out</span>` : ""}</td>
+      <td class="num">${fmt(p.tokens)}</td><td class="num">${gbs(p.bytes)}</td><td class="num">${f ? gbs(f.bytes) : "–"}</td><td>${esc(when(f))}</td></tr>`);
+  });
+  for (let i = parked.length; i < c.slots; i++)
+    rows.push(`<tr><td>${i + 1} / ${c.slots}</td><td class="muted">Empty</td><td class="num">–</td><td class="num">–</td><td class="num">–</td><td>–</td></tr>`);
+  for (const f of [...files.values()].reverse())
+    rows.push(`<tr><td>–</td><td><span class="st-badge st-badge--queued">Disk only</span></td><td class="num">${fmt(f.tokens)}</td>
+      <td class="num">–</td><td class="num">${gbs(f.bytes)}</td><td>${esc(when(f))}</td></tr>`);
+  $("conv-body").innerHTML = rows.join("");
+  $("conv-sum").textContent = `${fmt((c.parked || []).length)} of ${fmt(c.slots)} parked · ${gbs(c.bytes)} of ${gbs(budget)} RAM`;
+  $("conv-bar").style.width = budget ? `${Math.min(100, (100 * c.bytes) / budget)}%` : "0%";
+  const disk = (c.files || []).reduce((a, f) => a + f.bytes, 0);
+  $("conv-note").textContent = (c.reported ? "" : "Waiting for the engine's first report. ") +
+    `Evicted since start: ${fmt(c.evictions)}` + (c.dir ? ` · disk: ${(c.files || []).length} files, ${gbs(disk)} in ${c.dir}` : " · no --conversation-dir");
 }
 
 function facts(el, rows) {
