@@ -123,8 +123,8 @@ $("metrics").innerHTML = METRICS.map((m) => `
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
       <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
-      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
-    </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
+      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Input effective</span></div>
+    </div><span class="st-metric__sub input-detail" id="input-detail"></span>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
     <span class="st-metric__sub" id="ms-${m.key}"></span>`}
     <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
@@ -200,7 +200,7 @@ function renderTotals(t) {
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
   const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
-  return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
+  return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} new input tokens${pSpeed ? `${pSpeed} effective` : ""} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
@@ -235,10 +235,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
             live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-  setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+  const input = StrataInputMetrics.card(live, last, fmt);
+  setMetric("prefill", input.rate == null ? null : fmt(input.rate), "t/s", input.label);
+  $("input-detail").textContent = input.detail;
+  $("mv-prefill").title = StrataInputMetrics.explanation;
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
@@ -295,7 +295,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // recent requests
   const body = $("req-body");
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="8" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
@@ -303,9 +303,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
+      const input = StrataInputMetrics.summary(r);
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`;
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
+      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}<span class="request-input-detail">${fmt(input.fresh)} new</span></td>
+        <td class="num">${fmt(r.reused)}</td>
+        <td class="num" title="${esc(StrataInputMetrics.explanation)}">${input.ms == null ? "–" : `${fmt(input.ms / 1000, 2)} s`}<span class="request-input-detail">${input.rate == null ? "–" : `${fmt(input.rate)} tok/s effective`}</span></td>
+        <td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }

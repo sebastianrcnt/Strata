@@ -168,3 +168,7 @@ main { flex: 1; min-height: 0; display: flex; }
   .facts { grid-template-columns: 1fr; gap: 2px; }
   .facts dd { margin-bottom: var(--st-s-2); }
 }
+
+/* Keep input timing readable on narrow cards and in the scrollable request table. */
+.input-detail { overflow-wrap: anywhere; line-height: 1.5; }
+.request-input-detail { display: block; font-size: var(--st-fs-xs); color: var(--st-ink-muted); white-space: nowrap; }

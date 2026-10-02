@@ -116,11 +116,13 @@
             <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">
-              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num">Tok/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM (experts copied over PCIe are not counted)">Hit rate</th><th class="num">Duration</th></tr></thead>
-              <tbody id="req-body"><tr><td colspan="8" class="muted">No requests yet</td></tr></tbody>
+              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Input prep</th><th class="num">Output</th>
+                <th class="num">Decode tok/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM (experts copied over PCIe are not counted)">Hit rate</th><th class="num">Duration</th></tr></thead>
+              <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
             </table>
           </div>
+          <p class="muted req-totals">Input effective = new tokens ÷ input preparation time, including cache handling.
+            Short inputs can show lower rates despite less waiting. Live values are provisional.</p>
           <p class="muted req-totals" id="req-totals"></p>
         </div>
       </div>
@@ -230,6 +232,7 @@
 </aside>
 <div class="scrim" id="scrim" hidden></div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
+<script src="web/input-metrics.js"></script>
 <script src="web/app.js"></script>
 </body>
 </html>

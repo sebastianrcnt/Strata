@@ -330,7 +330,20 @@ install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it 
 speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
 (in the settings file next to the data folder's record), so updates keep it.
 
-### Running it at startup (Task Scheduler)
+#### Reading the Monitor's input speed
+
+**Input effective** is the number of new prompt tokens divided by the engine's input preparation time.
+Reused tokens are excluded. That time includes cache handling and restoring borrowed expert-cache slots;
+it is not an isolated GPU kernel measurement or the full HTTP time to first token. Short inputs can have
+lower throughput even when they finish sooner.
+
+The last request shows the preparation time, new tokens and reused tokens together. For example,
+3,270 prompt tokens with 2,521 reused means 749 new tokens; 2.468 seconds gives 303.5 tokens/s.
+Recent requests show the same timing alongside the cache counts. During a request, the engine's latest
+progress sample is marked **provisional**; final counts from the previous request are not mixed into it.
+Missing timings are shown as a dash. Existing API field names and engine log formats are unchanged.
+
+## Running it at startup (Task Scheduler)
 
 To have the model up at logon, people start the serve from **Task Scheduler** (or a service). Beware: Windows
 throttles such contexts, and the model's ~40 GB expert load then crawls at **~0.05 GiB/s (13-14 minutes)**
