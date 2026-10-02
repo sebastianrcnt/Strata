@@ -217,6 +217,12 @@ class StrataEngine:
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
+        opts = dict(zip(args, args[1:]))
+        conv_dir = opts.get("--conversation-dir")
+        self.conv_dir = Path(cwd or ".", conv_dir) if conv_dir else None
+        self.conv = {"budget_mib": int(opts.get("--conversation-cache-mib", 0) or 0),   # CACHE lines (Monitor)
+                     "slots": int(opts.get("--conversation-cache-slots", 0) or 0), "reported": False,
+                     "live_tokens": 0, "bytes": 0, "evictions": 0, "parked": []}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
@@ -273,10 +279,43 @@ class StrataEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         for line in proc.stdout:
+            if line.startswith("CACHE "):               # local: the conversation cache report (Monitor)
+                self._parse_cache(line)
+                continue
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
         lines.put(None)
+
+    def _parse_cache(self, line: str):
+        """CACHE <live tokens> <parked bytes> <evictions> [<key>:<tokens>:<bytes> ...], oldest parked first."""
+        f = line.split()
+        try:
+            parked = [{"key": k, "tokens": int(t), "bytes": int(b)}
+                      for k, t, b in (x.split(":") for x in f[4:])]
+            self.conv.update(reported=True, live_tokens=int(f[1]), bytes=int(f[2]), evictions=int(f[3]),
+                             parked=parked)
+        except (ValueError, IndexError):
+            pass
+
+    def conversations(self) -> dict:
+        """The conversation cache for the Monitor: the parked conversations and the --conversation-dir files."""
+        out = dict(self.conv)
+        files = []
+        if self.conv_dir and self.conv_dir.is_dir():
+            for p in self.conv_dir.glob("*.bin"):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                parts = p.stem.split("-")
+                files.append({"name": p.name, "key": parts[1] if len(parts) >= 3 else None,
+                              "tokens": int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None,
+                              "bytes": st.st_size, "mtime": st.st_mtime})
+            files.sort(key=lambda x: x["mtime"])
+        out["dir"] = str(self.conv_dir) if self.conv_dir else None
+        out["files"] = files
+        return out
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -1094,7 +1133,9 @@ class Service:
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        conv = self.engine.conversations() if hasattr(self.engine, "conversations") else None
+        return {"engine": engine, "live": live, "conversations": conv,
+                "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
