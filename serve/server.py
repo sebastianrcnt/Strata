@@ -255,7 +255,7 @@ class StrataEngine:
             try:                                        # QUIT first, as close() does: the engine frees its memory
                 self.proc.stdin.write("QUIT\n")
                 self.proc.stdin.flush()
-                self.proc.wait(timeout=20)
+                self.proc.wait(timeout=300)
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 self.proc.terminate()
                 self.proc.wait(timeout=20)
@@ -409,9 +409,20 @@ class StrataEngine:
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
+            self.proc.wait(timeout=300)                  # QUIT writes --conversation-dir first (GBs)
         except Exception:
             self.proc.kill()
+
+    def persist(self) -> int:
+        """PERSIST: write the conversations to --conversation-dir now.  The caller holds the service's fifo."""
+        self.proc.stdin.write("PERSIST\n")
+        self.proc.stdin.flush()
+        while True:
+            line = self.lines.get(timeout=600)
+            if line is None:
+                raise EngineDied("the engine stopped while saving conversations")
+            if line.startswith("PERSISTED"):
+                return int(line.split()[1])
 
 
 class Vision:
@@ -637,6 +648,7 @@ class Service:
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.cors_origins: set[str] = set()            # local: origins allowed cross-origin (config "cors_origins")
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
@@ -734,6 +746,16 @@ class Service:
             return
         with self.fifo:
             self.ensure_loaded()
+
+    def persist(self) -> dict:
+        """POST /conversations/save: the engine writes its conversations to disk now (waits for a running request)."""
+        if not hasattr(self.engine, "persist") or not self.engine.alive():
+            return {"status": "unsupported"}
+        with self.fifo:
+            t0 = time.time()
+            n = self.engine.persist()
+        return {"status": "saved" if n >= 0 else "no --conversation-dir", "conversations": max(n, 0),
+                "seconds": round(time.time() - t0, 1)}
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
@@ -1488,6 +1510,25 @@ def make_handler(svc: Service):
         def log_message(self, fmt, *args):
             pass
 
+        # local: CORS for the configured origins ("cors_origins" in the config), as llama-server --cors-origins
+        def end_headers(self):
+            origin = self.headers.get("Origin") if getattr(self, "headers", None) else None
+            if origin and origin in svc.cors_origins:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+            super().end_headers()
+
+        def do_OPTIONS(self):
+            origin = self.headers.get("Origin")
+            self.send_response(204 if origin in svc.cors_origins else 403)
+            if origin in svc.cors_origins:
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers",
+                                 self.headers.get("Access-Control-Request-Headers") or "Content-Type, Authorization")
+                self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def _json(self, code, obj):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
@@ -1617,6 +1658,9 @@ def make_handler(svc: Service):
             if path == "/unload":                            # give the GPU back now (between requests)
                 r = svc.unload()
                 self._json(409 if r == "busy" else 200, {"status": r})
+                return
+            if path == "/conversations/save":                # write the KV conversations to disk now
+                self._json(200, svc.persist())
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
@@ -2023,6 +2067,7 @@ def main() -> int:
               file=sys.stderr)
         return 2
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.cors_origins = set(cfg.get("cors_origins") or [])
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
