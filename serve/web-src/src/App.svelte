@@ -7,6 +7,7 @@
   import ChatView from "./chat/ChatView.svelte";
   import MonitorView from "./monitor/MonitorView.svelte";
   import SetupView from "./setup/SetupView.svelte";
+  import MemoryView from "./memory/MemoryView.svelte";
 
   start();
   // the server's "web_chat": false hides the Chat tab (the page then opens on the Monitor)
@@ -14,6 +15,7 @@
   const tabs = $derived([
     ...(chatOn ? [{id: "chat", label: "Chat"}] : []),
     {id: "monitor", label: "Monitor"},
+    {id: "memory", label: "Memory"},
     {id: "about", label: "Setup"},
   ]);
   $effect(() => { if (server.healthLoaded) showTab(location.hash.slice(1), chatOn); });
@@ -29,6 +31,7 @@
         <Tabs.Content value="chat" class="view view--chat"><ChatView active={ui.tab === "chat"} /></Tabs.Content>
       {/if}
       <Tabs.Content value="monitor" class="view view--scroll">{#if ui.tab === "monitor"}<MonitorView />{/if}</Tabs.Content>
+      <Tabs.Content value="memory" class="view view--scroll">{#if ui.tab === "memory"}<MemoryView />{/if}</Tabs.Content>
       <Tabs.Content value="about" class="view view--scroll">{#if ui.tab === "about"}<SetupView />{/if}</Tabs.Content>
     {/if}
   </Tabs.Root>

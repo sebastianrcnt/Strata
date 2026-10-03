@@ -8,11 +8,11 @@ afterAll(async () => { await b?.close(); srv?.stop(); });
 
 test("web_chat false: no Chat tab, #chat lands on the Monitor, arrow keys move between tabs", async () => {
   const {page, errors} = await open(b, srv.url, {hash: "#chat"});
-  expect(await page.$$eval("[role=tab]", (t) => t.map((x) => x.textContent))).toEqual(["Monitor", "Setup"]);
+  expect(await page.$$eval("[role=tab]", (t) => t.map((x) => x.textContent))).toEqual(["Monitor", "Memory", "Setup"]);
   expect(await page.$eval("[role=tab][data-state=active]", (t) => t.textContent)).toBe("Monitor");
   await page.focus("#tab-btn-monitor");
   await page.keyboard.press("ArrowRight");
-  expect(await page.$eval("[role=tab][data-state=active]", (t) => t.textContent)).toBe("Setup");
+  expect(await page.$eval("[role=tab][data-state=active]", (t) => t.textContent)).toBe("Memory");
   expect(errors).toEqual([]);
 }, 30000);
 

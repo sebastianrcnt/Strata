@@ -1,7 +1,7 @@
 // Page-level state: the tab, the theme and the toasts.
 import {store} from "./storage.js";
 
-export const TABS = ["chat", "monitor", "about"];
+export const TABS = ["chat", "monitor", "memory", "about"];
 export const ui = $state({tab: "monitor", theme: document.documentElement.dataset.theme || "dark", toasts: []});
 
 // ------------------------------------------------------------------ tabs (the URL hash keeps the tab across reloads)

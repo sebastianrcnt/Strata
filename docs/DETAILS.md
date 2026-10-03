@@ -890,10 +890,18 @@ then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without
 
 ### The web app
 
-The page at `/` has Chat, Monitor and Setup tabs. `"web_chat": false` in `strata-<model>.json` (or
+The page at `/` has Chat, Monitor, Memory and Setup tabs. `"web_chat": false` in `strata-<model>.json` (or
 `serve/server.py --no-web-chat`) hides the Chat tab and opens the page on the Monitor; the API is unchanged, and
 Setup keeps **Defaults for other apps** (the server-wide sampling defaults, `GET`/`POST /settings`). Its source is
 `serve/web-src` (Svelte, built with Bun and Vite into `serve/web`; see `serve/web-src/README.md`).
+
+**Memory** draws where the experts live: the model file on the SSD, the RAM arena (every expert), the VRAM cache
+(`expert_slots`), with the measured disk and PCIe traffic between them and, per request, the share of the expert
+work done from the cache, over PCIe (`pcie_frac` of the misses) and on the CPU. Its map has one cell per expert
+(48 layers x 512): the cached ones are the first `expert_slots` pairs of `data/expert-profile.bin`, which the build
+copies into `serve/web/expert-profile.js`. That is the placement at start: the adaptive tier's later swaps and the
+routed experts are not reported by the engine, so the lights of the sweep while the model works are drawn at the
+measured hit rate, not from the real routing.
 
 ### API request monitor
 
