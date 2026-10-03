@@ -53,7 +53,7 @@ Successful handoffs log separate release/load/encode/unload/restore seconds for 
 
 ## Measured validation (2026-10-04)
 
-RTX 3090 24 GiB, Ryzen 5 5600X, 78.4 GiB usable RAM, CUDA 13.2 engine, ORCA BF16-derived ISTA allocation GGUF.
+RTX 3090 24 GiB, Ryzen 5 5600X, 78.4 GiB usable RAM, driver 595.84, CUDA 13.2 engine, ORCA BF16-derived ISTA allocation GGUF.
 Vision helper built from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d, matching 907,543,008-byte BF16 mmproj,
 GPU encoding with max_tokens 1024 and headroom_mib 2048. These figures cover this configuration, not all images.
 
@@ -68,8 +68,11 @@ GPU encoding with max_tokens 1024 and headroom_mib 2048. These figures cover thi
   unload 0.1136 s, synchronized restore 0.3409 s. The remaining time includes prompt/decode/server work.
   The cached repeat took 0.495 s and performed no expert handoff or encoder startup.
 - Two images used one handoff, encoding 0.1437 s, total 5.541 s including prompt/decode.
+- A fresh 4096×3072 image after the adaptive/MTP run returned VISION 73 correctly in 5.675 s;
+  the resulting prompt used 1154 tokens, exercising the configured 1024-image-token limit. Its cached repeat
+  classified Yellow without a handoff, and text afterward matched the baseline.
 - Sampled free VRAM increased from approximately 334–448 MiB to 2056–2062 MiB during lending;
-  minimum available host RAM over the suite was 17,840 MiB. Sampling interval was 50 ms.
+  minimum available host RAM over the suite and large-image check was 17,680 MiB. Sampling interval was 50 ms.
   Experts stayed at 8980 slots / 17,391 MiB after lending; KV and parked conversations remained usable.
 
 The normal CUDA VMM allocation rounds the expert arena upward; this validation had two fewer expert slots than
