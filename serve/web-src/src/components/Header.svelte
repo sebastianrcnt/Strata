@@ -1,7 +1,7 @@
 <script>
   import {Tabs} from "bits-ui";
   import {ui, flipTheme} from "../lib/ui.svelte.js";
-  import {server, auth} from "../lib/server.svelte.js";
+  import {server, auth, monitor} from "../lib/server.svelte.js";
   import {fmt} from "../lib/format.js";
   import Button from "../ui/Button.svelte";
 
@@ -11,8 +11,12 @@
   const status = $derived.by(() => {
     if (auth.needed) return {lamp: "error", text: "API key needed"};
     if (!server.reachable) return {lamp: "error", text: "Server not reachable"};
-    const live = server.metrics?.live;
+    let live = server.metrics?.live;
     if (!live) return {lamp: "", text: "Connecting…"};
+    // on the Monitor the 5-a-second stream is fresher than the 1-a-second metrics: both should say the same
+    const s = server.stream;
+    if (ui.tab === "monitor" && monitor.live && s?.state)
+      live = {...live, state: s.state, tok_s: s.tok_s ?? live.tok_s, prompt_read: s.prompt_read, prompt_total: s.prompt_total};
     if (live.queued > 0) return {lamp: "on", text: `${live.queued} queued`};
     if (live.state === "reading") {
       const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
