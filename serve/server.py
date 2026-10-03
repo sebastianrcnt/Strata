@@ -1067,8 +1067,8 @@ class Service:
             effort = (ctk.get("reasoning_effort") or req.get("reasoning_effort") or reasoning.get("effort")
                       or output_config.get("effort"))
             effort = str(effort).strip().lower() if effort is not None else ""
-            budgets = {"minimal": 256, "low": 512, "medium": 1024,
-                       "high": 2048, "xhigh": 4096, "max": 0, "maximum": 0}
+            budgets = {"minimal": 256, "low": 1024, "medium": 4096,
+                       "high": 8192, "xhigh": 16384, "max": 0, "maximum": 0}
             value = budgets.get(effort, self.reasoning_budget_tokens)
         if isinstance(value, float) and value.is_integer():
             value = int(value)

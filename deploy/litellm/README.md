@@ -22,11 +22,12 @@ The compatibility flags in the config also prevent LiteLLM from dropping native
 `thinking.type=adaptive` and `output_config.effort` for an unknown model.
 Review both patch anchors before upgrading the image.
 
-Strata maps effort to a thinking cap: minimal 256 (OpenAI only), low 512, medium
-1024, high 2048, xhigh 4096, max unlimited. An explicit
+Strata maps effort to a thinking cap: minimal 256 (OpenAI only), low 1024, medium
+4096, high 8192, xhigh 16384, max unlimited. An explicit
 `reasoning_budget_tokens` overrides effort; the total `max_tokens` still applies.
 Effort is advertised under `capabilities.effort` in model list/detail responses.
 
-Validation: syntax and mock-engine mapping tests; a Messages request through
-LiteLLM with low effort reached 512 thinking tokens, then continued with text.
-This verifies routing and the cap, not answer quality or every level end to end.
+Validation: syntax and mock-engine mapping tests cover the current effort tiers.
+An earlier Messages request through LiteLLM with the previous low cap reached
+512 thinking tokens, then continued with text. That check verified routing and
+the old cap, not answer quality or the new tiers end to end.
