@@ -3064,8 +3064,8 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> usage;
     if (o.serve) {
         usage.assign((size_t) 3 * (size_t) g.n_layers * (size_t) g.n_expert, 0);
-        drive.d.usage = usage.data();
-        drive.d.usage_n = g.n_layers * g.n_expert;
+        drive.d.expert_use = usage.data();
+        drive.d.expert_use_n = g.n_layers * g.n_expert;
     }
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
@@ -4524,7 +4524,7 @@ int main(int argc, char** argv) {
         // experts the VRAM cache holds now (one bit each), little-endian.  After every DONE, beside CACHE.
         auto report_usage = [&] {
             if (usage.empty()) return;
-            const int64_t n = drive.d.usage_n;
+            const int64_t n = drive.d.expert_use_n;
             std::vector<uint8_t> raw(usage.size() * sizeof(uint32_t) + (size_t) (n + 7) / 8, 0);
             std::memcpy(raw.data(), usage.data(), usage.size() * sizeof(uint32_t));
             uint8_t* bits = raw.data() + usage.size() * sizeof(uint32_t);

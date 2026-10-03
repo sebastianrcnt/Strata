@@ -16,6 +16,7 @@ export function fakeServer() {
              prompt_read: null, prompt_total: null, tok_s: null},
     settings: {shared: false, defaults: {}},
     mcp,
+    experts: {available: false},
     polls: 0,
   };
   const json = (o) => new Response(JSON.stringify(o), {headers: {"Content-Type": "application/json"}});
@@ -32,6 +33,7 @@ export function fakeServer() {
       if (path === "/metrics") { state.polls++; return json(state.metrics); }
       if (path === "/api/current-stream") return json(state.stream);
       if (path === "/mcp") return json(state.mcp);
+      if (path === "/experts") return json(state.experts);
       if (path === "/settings") {
         if (req.method === "POST") { const b = await req.json(); state.settings = {shared: !!b.defaults, defaults: b.defaults || {}}; }
         return json(state.settings);
@@ -60,3 +62,19 @@ export async function open(b, url, {width = 1440, height = 900, scheme = "dark",
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// a USAGE report like the engine's: the VRAM cache holds the profile's first `slots` experts, lookups fall off with
+// the rank, and those the cache does not hold go to the CPU (a few over PCIe). `scale` grows the counts.
+export function usageReport(slots = 8980, scale = 1) {
+  const bin = require("node:fs").readFileSync(new URL("../../../data/expert-profile.bin", import.meta.url));
+  const h = new Uint32Array(bin.buffer.slice(bin.byteOffset + 4, bin.byteOffset + 24));
+  const L = h[1], E = h[2], n = L * E, pairs = new Uint16Array(bin.buffer.slice(bin.byteOffset + 24, bin.byteOffset + 24 + h[4] * 4));
+  const b = new Uint8Array(n * 12 + Math.ceil(n / 8)), u = new Uint32Array(b.buffer, 0, n * 3);
+  for (let r = 0; r < pairs.length / 2; r++) {
+    const i = pairs[2 * r] * E + pairs[2 * r + 1], c = Math.floor((scale * 4e5) / (r + 50));
+    if (r < slots) { u[i] = c; b[n * 12 + (i >> 3)] |= 1 << (i & 7); }
+    else if (r % 5 === 0) u[n + i] = c;
+    else u[2 * n + i] = c;
+  }
+  return Buffer.from(b).toString("base64");
+}

@@ -1,30 +1,19 @@
 <script>
-  // How the cache is spread over the layers: each bar is the share of one layer's experts that the profile puts in
-  // VRAM at start.
-  import {fmt} from "../lib/format.js";
-
-  let {perLayer, experts} = $props();
-
-  const max = $derived(Math.max(1, ...perLayer));
-  const lo = $derived(Math.min(...perLayer)), hi = $derived(Math.max(...perLayer));
+  // One bar per layer: `values` 0..1 (null: nothing to show), on 0..max; hover names the layer.
+  let {values, max = 1, summary, describe} = $props();
   let hover = $state(null);
 </script>
 
 <div class="layers">
   <div class="head">
-    {#if hover != null}
-      <span>Layer {hover}</span><strong>{fmt(perLayer[hover])} of {fmt(experts)} experts cached</strong>
-      <span class="muted">{fmt((100 * perLayer[hover]) / experts, 1)}%</span>
-    {:else}
-      <span>From {fmt(lo)} to {fmt(hi)} of {fmt(experts)} experts a layer</span>
-    {/if}
+    {#if hover != null}<span>Layer {hover}</span><strong>{describe(hover)}</strong>{:else}<span>{summary}</span>{/if}
   </div>
-  <div class="bars" onmouseleave={() => (hover = null)} role="img" aria-label="Cached experts per layer, from {lo} to {hi}">
-    {#each perLayer as n, l}
-      <span class="bar" class:on={hover === l} style:height="{(100 * n) / max}%" onmouseenter={() => (hover = l)} role="presentation"></span>
+  <div class="bars" onmouseleave={() => (hover = null)} role="img" aria-label={summary}>
+    {#each values as v, l}
+      <span class="bar" class:on={hover === l} style:height="{v == null ? 0 : (100 * v) / max}%" onmouseenter={() => (hover = l)} role="presentation"></span>
     {/each}
   </div>
-  <div class="axis" aria-hidden="true"><span>layer 0</span><span>{perLayer.length - 1}</span></div>
+  <div class="axis" aria-hidden="true"><span>layer 0</span><span>{values.length - 1}</span></div>
 </div>
 
 <style>

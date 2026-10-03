@@ -20,3 +20,25 @@ test("the cache's share of the experts against the share of the lookups it answe
   expect(await page.textContent(".tiers")).toContain("PLE n-gram table");
   expect(errors).toEqual([]);
 }, 30000);
+
+test("an engine that reports its expert usage: measured shares, per layer, the map and the misses", async () => {
+  const {usageReport} = await import("./harness.js");
+  srv.state.experts = {available: true, layers: 48, experts: 512, now: usageReport(8980, 2), before: usageReport(8980, 1), at: 1};
+  try {
+    const {page, errors} = await open(b, srv.url, {hash: "#memory"});
+    await page.waitForSelector(".usage canvas");
+    const lead = await page.textContent(".lead");
+    expect(lead).toContain("36.5%");                 // the residency bits: 8,980 of 24,576
+    expect(await page.textContent(".cmp")).toContain("since the engine started");
+    expect(await page.$$eval(".layers .bar", (b) => b.length)).toBe(48);
+    expect(await page.$$eval(".usage__list .row", (r) => r.length)).toBe(12);
+    await page.click("text=Last request");
+    expect(await page.textContent(".cmp")).toContain("in the last request");
+    const c = await (await page.$(".usage canvas")).boundingBox();
+    await page.mouse.move(c.x + 1, c.y + 2);
+    expect(await page.textContent(".usage .tip")).toContain("Layer 0 · expert 0");
+    expect(errors).toEqual([]);
+  } finally {
+    srv.state.experts = {available: false};
+  }
+}, 30000);
