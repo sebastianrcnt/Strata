@@ -7,11 +7,11 @@
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
+<link rel="stylesheet" href="web/console.css">
 <script>
   // the theme before the first paint: the saved choice, else the system's
   try {
-    const t = localStorage.getItem("strata.theme") ||
-      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const t = localStorage.getItem("strata.theme") || "dark";
     document.documentElement.dataset.theme = t;
   } catch (e) {}
 </script>
@@ -25,7 +25,7 @@
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>Setup</button>
   </nav>
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
@@ -88,6 +88,12 @@
         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
       </div>
 
+      <section class="current-stream" aria-label="Current generation stream">
+        <div class="current-stream-head"><span class="current-stream-dot"></span><span>Current stream</span><span id="current-stream-phase">Idle</span></div>
+        <div class="current-stream-row"><span class="current-stream-label">Prefill</span><div class="current-prefill" id="current-prefill"><i id="current-prefill-bar"></i></div><span id="current-prefill-count">–</span></div>
+        <div class="current-stream-row"><span class="current-stream-label">Decode</span><div class="current-stream-window"><div id="current-stream-tape"><span id="current-stream-old"></span><span id="current-stream-new"></span><i class="current-stream-cursor" hidden></i></div></div><span id="current-stream-rate">–</span></div>
+      </section>
+      <div class="track-toolbar"><div class="track-controls"><select id="track-range" aria-label="Graph time range"><option value="30">30 s</option><option value="60" selected>1 min</option><option value="300">5 min</option></select><button id="track-fold" class="st-btn">Fold all</button><button id="track-live" class="st-btn" aria-pressed="true">● Live</button></div><span id="track-ruler">Last 60 seconds · now →</span></div>
       <div class="metrics" id="metrics">
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
       </div>
@@ -127,6 +133,7 @@
         </div>
       </div>
 
+      <div class="st-card request-inspector"><div class="req-head"><span class="card-title">Request details</span><span class="muted small">Select a row above</span></div><dl class="facts" id="request-facts"><dt>Status</dt><dd>No request selected</dd></dl></div>
       <div class="st-card conv-card" id="conv-card" hidden>
         <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="conv-sum"></span></div>
         <div class="st-progress"><div class="st-progress__bar" id="conv-bar" style="width:0%"></div></div>

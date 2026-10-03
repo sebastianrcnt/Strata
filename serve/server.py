@@ -1115,6 +1115,23 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
+    def current_stream(self) -> dict:
+        """A bounded live text preview. No prompts or completed output are retained here."""
+        with self.status_lock:
+            s = dict(self.status)
+        busy = bool(s.get("busy"))
+        reading = busy and s.get("first_token") is None
+        progress = getattr(self.engine, "progress", None) if reading else None
+        return {"state": "reading" if reading else "generating" if busy else "idle",
+                "request": s.get("started") if busy else None,
+                "phase": s.get("phase") if busy else None,
+                "tail": str(s.get("tail") or "")[-600:] if busy and not reading else "",
+                "generated": s.get("generated", 0) if busy else 0,
+                "prompt_tokens": s.get("prompt_tokens") if busy else None,
+                "prompt_read": progress[0] if progress else None,
+                "prompt_total": progress[1] if progress else None,
+                "tok_s": round(self._tok_s(), 1) if busy and not reading else None}
+
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
@@ -1929,6 +1946,10 @@ def make_handler(svc: Service):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if path == "/api/current-stream":
+                if self._authorized():
+                    self._json(200, svc.current_stream())
                 return
             if path == "/metrics":
                 if self._authorized():

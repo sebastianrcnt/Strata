@@ -1078,6 +1078,39 @@ class WebApp(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 404)
 
+    def test_current_stream_is_bounded_ephemeral_and_authorized(self):
+        svc = self.svc
+        with svc.status_lock:
+            previous = dict(svc.status)
+        key = svc.api_key
+        try:
+            svc.api_key = "stream-key"
+            self.assertEqual(self.get("/api/current-stream")[0], 401)
+            with svc.status_lock:
+                svc.status.update(busy=True, started=123, first_token=time.time(),
+                                  generated=8, phase="thinking", tail="x" * 900, prompt_tokens=42)
+            headers = {"Authorization": "Bearer stream-key"}
+            code, _, body = self.get("/api/current-stream", headers)
+            self.assertEqual(code, 200)
+            stream = json.loads(body)
+            self.assertEqual(stream["tail"], "x" * 600)
+            self.assertEqual(stream["phase"], "thinking")
+            self.assertEqual(stream["request"], 123)
+            self.assertNotIn("tail", json.loads(self.get("/metrics", headers)[2])["live"])
+            with svc.status_lock:
+                svc.status["first_token"] = None
+            self.assertEqual(json.loads(self.get("/api/current-stream", headers)[2])["tail"], "")
+            with svc.status_lock:
+                svc.status["busy"] = False
+            idle = json.loads(self.get("/api/current-stream", headers)[2])
+            self.assertEqual(idle["tail"], "")
+            self.assertIsNone(idle["request"])
+        finally:
+            svc.api_key = key
+            with svc.status_lock:
+                svc.status.clear()
+                svc.status.update(previous)
+
     def test_metrics(self):
         data = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}).encode()
         urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=data,

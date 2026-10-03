@@ -109,7 +109,7 @@ async function loadHealth() {
 
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
-  {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
+  {key: "speed", label: "Decode", icon: "gauge", unit: "t/s", series: "tok_s"},
   {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
@@ -118,27 +118,80 @@ const METRICS = [
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
-$("metrics").innerHTML = METRICS.map((m) => `
-  <div class="st-card metric-card"><div class="st-metric">
-    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
-    ${m.key === "speed" ? `<div class="speed-values">
-      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
-      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Input effective</span></div>
-    </div><span class="st-metric__sub input-detail" id="input-detail"></span>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
-    <span class="st-metric__sub" id="ms-${m.key}"></span>`}
-    <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
-      <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
-      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
-      ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
-        <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
-        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
-  </div></div>`).join("");
+const trackColors = ["#bfd38a", "#c9f0d5", "#b4d2a2", "#9bc7dc", "#d1ae55", "#b788ba", "#baa6c6", "#91abbf", "#b5b5ac", "#d29e8e"];
+const tracks = [METRICS[0], {key:"prefill", label:"Input effective", unit:"t/s"}, ...METRICS.slice(1), {key:"ram", label:"System RAM", unit:"GB"}];
+let trackRange = 60, trackLive = true, selectedRequest = null, displayedRequests = [];
+const trackHistory = {};
+$("metrics").innerHTML = tracks.map((m,i) => `
+  <div class="st-card metric-card" data-track="${m.key}" style="--track-color:${trackColors[i]}">
+    <button class="track-label" aria-expanded="true"><span class="track-name">${esc(m.label)}</span>
+      <span class="st-metric__value" id="mv-${m.key}">–</span><span class="st-metric__sub" id="ms-${m.key}"></span>
+      ${m.key === "prefill" ? '<span class="input-detail" id="input-detail"></span>' : ""}</button>
+    <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none" aria-label="${esc(m.label)} history">
+      <path class="area" fill="currentColor" opacity=".07"/><path class="line" fill="none" stroke="currentColor" stroke-width="1.25" vector-effect="non-scaling-stroke"/></svg>
+    <div class="track-meter"><i id="meter-${m.key}"></i></div>
+  </div>`).join("");
+document.querySelectorAll(".metric-card").forEach(card => {
+  if(!["speed","prefill","vram","temp"].includes(card.dataset.track)) {
+    card.classList.add("folded"); card.querySelector("button").setAttribute("aria-expanded","false");
+  }
+});
+function foldTrack(card, folded) {
+  card.classList.toggle("folded", folded);
+  card.querySelector("button").setAttribute("aria-expanded", String(!folded));
+}
+$("metrics").onclick = e => {
+  const button = e.target.closest(".track-label");
+  if (button) { const card = button.closest(".metric-card"); foldTrack(card, !card.classList.contains("folded")); }
+};
+$("track-fold").onclick = () => {
+  const cards = [...document.querySelectorAll(".metric-card")];
+  const fold = cards.some(c => !c.classList.contains("folded"));
+  cards.forEach(c => foldTrack(c, fold));
+  $("track-fold").textContent = fold ? "Unfold all" : "Fold all";
+};
+$("track-range").onchange = e => { trackRange = Number(e.target.value); if(lastMetrics && trackLive) render(lastMetrics); };
+$("track-live").onclick = () => {
+  trackLive = !trackLive;
+  $("track-live").textContent = trackLive ? "● Live" : "■ Paused";
+  $("track-live").setAttribute("aria-pressed", String(trackLive));
+  if(trackLive && lastMetrics) render(lastMetrics);
+};
+$("req-body").onclick = e => {
+  const row = e.target.closest("tr[data-request-index]");
+  if(!row || !lastMetrics) return;
+  selectedRequest = displayedRequests[Number(row.dataset.requestIndex)]?.time;
+  renderRequestFacts();
+};
+$("req-body").onkeydown = e => {
+  if(e.key === "Enter" || e.key === " ") { const row = e.target.closest("tr[data-request-index]"); if(row){e.preventDefault(); row.click();} }
+};
+function renderRequestFacts() {
+  const r = displayedRequests.find(r => r.time === selectedRequest);
+  document.querySelectorAll("#req-body tr[data-request-time]").forEach(row => row.classList.toggle("selected", Number(row.dataset.requestTime) === selectedRequest));
+  if(!r) return;
+  const input = StrataInputMetrics.summary(r);
+  facts($("request-facts"), [["Time", new Date(r.time*1000).toLocaleString()], ["Status", r.finish || "–"],
+    ["Input tokens", fmt(r.prompt_tokens)], ["New tokens", fmt(input.fresh)], ["Reused from cache", fmt(r.reused)],
+    ["Input preparation", input.ms == null ? "–" : `${fmt(input.ms/1000,2)} s`],
+    ["Input effective", input.rate == null ? "–" : `${fmt(input.rate)} tok/s`],
+    ["Output tokens", fmt(r.output_tokens)], ["Decode", `${fmt(r.decode_tok_s,1)} tok/s`], ["Duration", `${fmt(r.duration_s,2)} s`]]);
+}
 
 function spark(id, values, max) {
   const svg = $(id);
-  const v = (values || []).map((x) => (x == null ? 0 : x));
-  if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
+  const timestamps = lastMetrics?.history?.t || [];
+  const count = timestamps.length ? timestamps.filter(t => t >= timestamps[timestamps.length-1] - trackRange).length : trackRange;
+  const v = (values || []).slice(-Math.max(2,count)).map(x => x == null ? 0 : x);
+  if (v.length < 2) { const meter = $(`meter-${id.slice(3)}`); if(meter) meter.style.height = "0%"; svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
   const top = Math.max(max || 0, ...v, 1e-9);
+  const meter = $(`meter-${id.slice(3)}`);
+  if(meter) meter.style.height = `${Math.min(100, v[v.length-1]/top*100)}%`;
+  svg.onpointermove = e => {
+    const bounds = svg.getBoundingClientRect();
+    const i = Math.max(0, Math.min(v.length-1, Math.round((e.clientX-bounds.left)/bounds.width*(v.length-1))));
+    svg.setAttribute("title", `${fmt(v[i],2)} · sample ${i+1}/${v.length}`);
+  };
   const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
   const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
   svg.querySelector(".line").setAttribute("d", line);
@@ -159,6 +212,11 @@ async function poll() {
       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
     } else if (r.ok) {
       lastMetrics = await r.json();
+      // The server retains 60 one-second readings. Keep up to five minutes in this browser.
+      for(const [key, values] of Object.entries(lastMetrics.history || {})) {
+        trackHistory[key] = trackHistory[key] ? [...trackHistory[key], values[values.length-1]].slice(-300) : values.slice(-300);
+      }
+      lastMetrics.history = {...trackHistory};
       metricsFailures = 0;
       render(lastMetrics);
     } else {
@@ -189,8 +247,8 @@ function render(m) {
     setPill("idle", "Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
-  if (tab === "monitor") renderConversations(m.conversations);
+  if (tab === "monitor" && trackLive) renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  if (tab === "monitor" && trackLive) renderConversations(m.conversations);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -272,6 +330,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   spark("sp-disk", h.disk_read_mb);
 
+  setMetric("ram", hw.ram_used == null ? null : gb(hw.ram_used), "GB", hw.ram_total ? `of ${gb(hw.ram_total)} GB` : "");
+  spark("sp-ram", h.ram_used, hw.ram_total);
+  $("track-ruler").textContent = `Last ${Math.min(trackRange, h.tok_s?.length || 0)} seconds · now →`;
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;
   let used = 0;
@@ -293,19 +354,20 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
 
   // recent requests
+  displayedRequests = requests;
   const body = $("req-body");
   if (!requests.length) {
     body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
-    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
+    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 5).map((r, index) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
       const input = StrataInputMetrics.summary(r);
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`;
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}<span class="request-input-detail">${fmt(input.fresh)} new</span></td>
+      return `<tr data-request-index="${index}" data-request-time="${r.time}" tabindex="0"><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}<span class="request-input-detail">${fmt(input.fresh)} new</span></td>
         <td class="num">${fmt(r.reused)}</td>
         <td class="num" title="${esc(StrataInputMetrics.explanation)}">${input.ms == null ? "–" : `${fmt(input.ms / 1000, 2)} s`}<span class="request-input-detail">${input.rate == null ? "–" : `${fmt(input.rate)} tok/s effective`}</span></td>
         <td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
@@ -314,10 +376,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   const all = $("req-all");
   kept = kept == null ? requests.length : kept;
-  all.hidden = kept <= 12;
+  all.hidden = kept <= 5;
   all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
   $("req-wrap").classList.toggle("all", reqShowAll);
   $("req-totals").textContent = renderTotals(totals);
+  renderRequestFacts();
 }
 
 function renderConversations(c) {
@@ -1014,3 +1077,51 @@ if (startQuestion) history.replaceState(null, "", location.pathname + location.h
 loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
+
+
+// A small current-only preview, also covering requests from other API clients.
+let streamRequest = null, streamTail = "";
+function renderCurrentStream(s) {
+  const reading = s.state === "reading", generating = s.state === "generating";
+  $("current-stream-phase").textContent = reading ? "Prefill" : generating ? (s.phase === "thinking" ? "Thinking" : s.phase === "answering" ? "Answer" : s.phase || "Decode") : "Idle";
+  const known = reading && s.prompt_total > 0 && s.prompt_read != null;
+  $("current-prefill").classList.toggle("indeterminate", reading && !known);
+  $("current-prefill-bar").style.width = known ? `${Math.min(100,100*s.prompt_read/s.prompt_total)}%` : generating ? "100%" : "0%";
+  $("current-prefill-count").textContent = known ? `${kfmt(s.prompt_read)} / ${kfmt(s.prompt_total)}` : reading ? (s.prompt_tokens ? `${kfmt(s.prompt_tokens)} tokens` : "Preparing") : generating ? "Done" : "–";
+  $("current-stream-rate").textContent = generating && s.tok_s != null ? `${fmt(s.tok_s,1)} t/s` : "–";
+  const cursor = document.querySelector(".current-stream-cursor");
+  cursor.hidden = !generating;
+  if(!generating) {
+    streamRequest = s.request; streamTail = "";
+    $("current-stream-old").textContent = reading ? "Waiting for prefill" : "Waiting for a request";
+    $("current-stream-new").textContent = "";
+    return;
+  }
+  if(s.request !== streamRequest) { streamRequest = s.request; streamTail = ""; }
+  const tail = s.tail || "";
+  if(tail === streamTail) return;
+  let overlap = Math.min(streamTail.length,tail.length);
+  while(overlap > 0 && !tail.startsWith(streamTail.slice(-overlap))) overlap--;
+  const fresh = tail.slice(overlap).slice(-80).replace(/\s+/g," ");
+  const visible = tail.slice(-160).replace(/\s+/g," ");
+  $("current-stream-old").textContent = fresh ? visible.slice(0,Math.max(0,visible.length-fresh.length)) : visible;
+  $("current-stream-new").textContent = fresh;
+  streamTail = tail;
+  const tape = $("current-stream-tape");
+  tape.getAnimations().forEach(a=>a.cancel());
+  if(!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    const distance = Math.min(80,$("current-stream-new").getBoundingClientRect().width);
+    tape.animate([{transform:`translateX(${distance}px)`},{transform:"translateX(0)"}],{duration:190,easing:"linear"});
+  }
+}
+async function pollCurrentStream() {
+  if(tab === "monitor" && trackLive && !document.hidden) {
+    try {
+      const r = await fetch("api/current-stream",{headers:headers(),cache:"no-store"});
+      if(r.ok) { const s = await r.json(); if(tab === "monitor" && trackLive) renderCurrentStream(s); }
+      else { renderCurrentStream({state:"idle"}); $("current-stream-phase").textContent = r.status === 401 ? "API key needed" : "Unavailable"; }
+    } catch (_) { renderCurrentStream({state:"idle"}); $("current-stream-phase").textContent = "Disconnected"; }
+  }
+  setTimeout(pollCurrentStream,200);
+}
+pollCurrentStream();
