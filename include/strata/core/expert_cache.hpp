@@ -73,6 +73,12 @@ public:
     /// Byte offset of each slot in the arena (null for uniform slots).
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
     void close();
+    // Only between requests, after adaptive copies are joined and committed.
+    bool lend_for_vision(size_t free_bytes_required, std::string& err);
+    bool reclaim_after_vision(std::string& err);
+    bool vmm_enabled() const { return vmm_bytes_ != 0; }
+    bool lent() const { return !lent_bytes_.empty(); }
+
 
     bool valid() const { return base_ != nullptr; }
     int64_t slots() const { return slots_; }
@@ -146,7 +152,16 @@ private:
     uint8_t* blocking_staging_ = nullptr;
     std::size_t blocking_staging_bytes_ = 0;
 #endif
+    bool open_vmm(size_t bytes, std::string& err);
+    bool map_vmm_chunk(size_t i, std::string& err);
+    void close_vmm();
     uint8_t* base_ = nullptr;
+    size_t vmm_bytes_ = 0, vmm_chunk_ = 0;
+    int vmm_device_ = 0;
+    std::vector<uint64_t> vmm_handles_;
+    std::vector<bool> vmm_mapped_;
+    std::vector<uint8_t> lent_bytes_;
+    size_t lent_offset_ = 0;
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;

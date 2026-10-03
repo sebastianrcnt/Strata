@@ -228,6 +228,7 @@ class StrataEngine:
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.vision_memory_failed = False
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
@@ -436,6 +437,8 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        if getattr(self, "vision_memory_failed", False):
+            raise EngineDied("expert memory restoration failed; reload the engine before generating")
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -529,6 +532,31 @@ class StrataEngine:
                 self.ended = True
                 self.progress, self.last = None, {}
 
+    def vision_memory(self, release_mib: int | None = None):
+        """Idle-only control; Service.fifo must be held. Never infer after a failed restoration."""
+        if not self.info.get("vision_lending"):
+            raise ValueError("GPU expert lending needs an engine built with VMM and STRATA_EXPERT_VMM=1")
+        command = f"VISION_RELEASE {release_mib}" if release_mib is not None else "VISION_RESTORE"
+        expected = "VISION_RELEASED" if release_mib is not None else "VISION_RESTORED"
+        try:
+            self.proc.stdin.write(command + "\n")
+            self.proc.stdin.flush()
+            while True:
+                line = self.lines.get(timeout=600)
+                if line is None:
+                    raise EngineDied("the engine stopped during vision memory handoff")
+                if line.startswith(expected + " "):
+                    if release_mib is None:
+                        self.vision_memory_failed = False
+                    return
+                if line.startswith("ERR "):
+                    raise ValueError(line[4:].strip())
+        except (OSError, queue.Empty, ValueError, EngineDied) as e:
+            if release_mib is None:
+                self.vision_memory_failed = True
+                raise EngineDied(f"expert restoration failed; generation is disabled: {e}") from e
+            raise
+
     def persist(self) -> int:
         """PERSIST: write the conversations to --conversation-dir now.  The caller holds the service's fifo."""
         self.proc.stdin.write("PERSIST\n")
@@ -554,10 +582,17 @@ class Vision:
             args += ["--threads", str(cfg["threads"])]
         if cfg.get("max_tokens"):
             args += ["--max-tokens", str(cfg["max_tokens"])]
-        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
-        self.stopped = False
-        self._start()
+        self.expert_swap = cfg.get("expert_swap") is True
+        self.headroom_mib = cfg.get("headroom_mib", 2048)
+        if self.expert_swap and (not cfg.get("gpu") or isinstance(self.headroom_mib, bool) or
+                                 not isinstance(self.headroom_mib, int) or not 1 <= self.headroom_mib <= 65536):
+            raise ValueError("vision expert_swap requires gpu=true and headroom_mib=1..65536")
+        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        self.proc = None
+        self.stopped = True
+        if not self.expert_swap:
+            self._start()
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
 
@@ -572,7 +607,7 @@ class Vision:
         self.stopped = False
 
     def alive(self) -> bool:
-        return not self.stopped and self.proc.poll() is None
+        return not self.stopped and self.proc is not None and self.proc.poll() is None
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
@@ -582,7 +617,9 @@ class Vision:
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         try:
-            self.proc.kill()
+            if self.proc is not None:
+                self.proc.kill()
+                self.proc.wait(timeout=20)
         except OSError:
             pass
         self._start()
@@ -629,36 +666,78 @@ class Vision:
         return out.getvalue()
 
     def encode(self, source: str) -> tuple[Path, int]:
-        """-> (embeddings file, number of image tokens)."""
-        data = self.normalize(self.load(source))
-        key = hashlib.sha256(data).hexdigest()[:32]
+        return self.encode_batch([source])[0]
+
+    def encode_batch(self, sources, engine=None) -> list[tuple[Path, int]]:
+        """One handoff per image batch, none when every normalized image is already cached."""
+        if len(sources) > 64:
+            raise ValueError("one image batch supports at most 64 images")
+        prepared = []
+        for source in sources:
+            data = self.normalize(self.load(source))
+            prepared.append((hashlib.sha256(data).hexdigest()[:32], data))
         with self.lock:
-            if key in self.cache:
-                return self.cache[key]
-            img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
-            img.write_bytes(data)
-            try:
-                self.proc.stdin.write(f"ENC {img} {out}\n")
-                self.proc.stdin.flush()
-                line = self.proc.stdout.readline().strip()
-            finally:                                                   # #352: also when the encoder's pipe is gone
-                img.unlink(missing_ok=True)
-            if not line.startswith("OK"):
-                raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
-                                                                     "the vision encoder stopped"))
-            self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
-                old = next(iter(self.cache))
-                self.cache.pop(old)[0].unlink(missing_ok=True)
+            self.batch_keys = {key for key, _ in prepared}
+            missing = any(key not in self.cache for key, _ in prepared)
+            if not missing:
+                return [self.cache[key] for key, _ in prepared]
+            if getattr(self, "expert_swap", False):
+                if engine is None:
+                    raise ValueError("GPU vision lending requires the engine and the request FIFO")
+                # Even a partial release failure must run the recovery command.
+                try:
+                    engine.vision_memory(self.headroom_mib)
+                    self._start()
+                    return [self._encode_data(key, data) for key, data in prepared]
+                finally:
+                    try:
+                        self.unload()
+                    except Exception as e:
+                        # Never reallocate while an unreaped encoder may still own the lent memory.
+                        engine.vision_memory_failed = True
+                        raise EngineDied(f"vision encoder could not release its GPU memory: {e}") from e
+                    engine.vision_memory()
+            return [self._encode_data(key, data) for key, data in prepared]
+
+    def _encode_data(self, key, data):
+        if key in self.cache:
             return self.cache[key]
+        img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
+        img.write_bytes(data)
+        try:
+            self.proc.stdin.write(f"ENC {img} {out}\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline().strip()
+        finally:
+            img.unlink(missing_ok=True)
+        if not line.startswith("OK"):
+            out.unlink(missing_ok=True)
+            raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
+                                                                 "the vision encoder stopped"))
+        self.cache[key] = (out, int(line.split()[1]))
+        if len(self.cache) > 64:
+            old = next(key for key in self.cache if key not in self.batch_keys)
+            self.cache.pop(old)[0].unlink(missing_ok=True)
+        return self.cache[key]
 
     def close(self):
+        if self.proc is None:
+            return
+        proc = self.proc
         try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+            if proc.poll() is None:
+                proc.stdin.write("QUIT\n")
+                proc.stdin.flush()
+                proc.wait(timeout=10)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            proc.kill()
+            proc.wait(timeout=20)  # must be reaped before the engine reallocates its expert memory
+        finally:
+            if proc.poll() is not None:
+                proc.stdin.close()
+                proc.stdout.close()
+                self.proc = None
+                self.stopped = True
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -886,7 +965,8 @@ class Service:
         return value if value > 0 else None
 
     def _vision_down(self) -> bool:
-        return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+        return self.vision is not None and not getattr(self.vision, "expert_swap", False) and \
+            hasattr(self.vision, "alive") and not self.vision.alive()
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -1227,7 +1307,11 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+                if getattr(self.vision, "expert_swap", False):
+                    self.ensure_loaded()
+                    encoded = self.vision.encode_batch(images, self.engine)
+                else:
+                    encoded = [self.vision.encode(src) for src in images]
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -2585,7 +2669,14 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
-        if lazy and cfg.get("vision"):
+        swap = (cfg.get("vision") or {}).get("expert_swap") is True
+        if swap:
+            vdev = (cfg.get("vision") or {}).get("cuda_device")
+            if cfg.get("backend") == "hip" or len(gpu_list(cfg)) > 1 or \
+                    vdev is not None and int(vdev) != (gpu_list(cfg) or [0])[0]:
+                ap.error("vision expert_swap currently requires the engine's single CUDA GPU")
+            env["STRATA_EXPERT_VMM"] = "1"
+        if lazy and cfg.get("vision") and not swap:
             ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)
