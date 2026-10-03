@@ -4859,7 +4859,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
-        std::printf("INFO vision_lending=%d\n", xcache.vmm_enabled() && stages.empty());
+        std::printf("INFO vision_lending=%d\n", xcache.vmm_enabled() && stages.empty() && !remote_caches);
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;

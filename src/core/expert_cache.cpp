@@ -343,7 +343,7 @@ bool ExpertCache::lend_for_vision(size_t free_bytes_required, std::string& err) 
     try { lent_bytes_.resize(size); }
     catch (const std::bad_alloc&) { err = "not enough host RAM for the expert snapshot"; return false; }
     if (cudaMemcpy(lent_bytes_.data(), base_ + lent_offset_, size, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        lent_bytes_.clear();
+        std::vector<uint8_t>().swap(lent_bytes_);
         err = "cannot snapshot expert memory";
         return false;
     }
@@ -368,6 +368,12 @@ bool ExpertCache::reclaim_after_vision(std::string& err) {
         if (!map_vmm_chunk(i, err)) return false;
     if (cudaMemcpy(base_ + lent_offset_, lent_bytes_.data(), lent_bytes_.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
         err = "cannot restore the expert snapshot";
+        return false;
+    }
+    // Pageable H2D cudaMemcpy may return after staging but before DMA completes. The decoder's streams
+    // are nonblocking and do not inherit legacy-stream ordering, so restoration must finish before ACK.
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = "cannot synchronize restored expert memory";
         return false;
     }
     std::vector<uint8_t>().swap(lent_bytes_);

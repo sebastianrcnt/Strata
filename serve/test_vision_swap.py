@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from serve.server import EngineDied, StrataEngine, Vision, Service, enable_vision_swap, ByteTokenizer, MockEngine, serve
+from serve.server import EngineStuck, EngineDied, StrataEngine, Vision, Service, enable_vision_swap, ByteTokenizer, MockEngine, serve
 from serve.frontend import ChatTemplate
 
 
@@ -186,7 +186,7 @@ class VisionSwap(unittest.TestCase):
         self.assertFalse(e.vision_memory_failed)
 
     def test_swap_device_validation(self):
-        cfg = {"gpu": [0], "vision": {"expert_swap": True, "cuda_device": 0}}
+        cfg = {"args": ["--expert-cache", "auto"], "gpu": [0], "vision": {"expert_swap": True, "cuda_device": 0}}
         for device in (-1, True, 0.5, "0.5", "not-a-device", 8):
             with self.subTest(device=device):
                 with self.assertRaises(ValueError):
@@ -198,10 +198,52 @@ class VisionSwap(unittest.TestCase):
         with self.assertRaises(ValueError):
             enable_vision_swap(cfg, {"CUDA_VISIBLE_DEVICES": "1"})
         env = {}
-        self.assertTrue(enable_vision_swap({"gpu": [2], "vision": {"expert_swap": True, "cuda_device": "2"}}, env))
+        self.assertTrue(enable_vision_swap({"args": ["--expert-cache", "auto"], "gpu": [2], "vision": {"expert_swap": True, "cuda_device": "2"}}, env))
         self.assertEqual(env["STRATA_EXPERT_VMM"], "1")
-        self.assertTrue(enable_vision_swap({"vision": {"expert_swap": True}}, {})) # same inherited visibility
+        self.assertTrue(enable_vision_swap({"args": ["--expert-cache", "auto"], "vision": {"expert_swap": True}}, {})) # same inherited visibility
         self.assertFalse(enable_vision_swap({}, {}))
+
+    def test_remote_and_absent_expert_cache_rejected_at_startup(self):
+        for args in ([], ["--expert-cache", "0"], ["--expert-cache", "auto", "--expert-cache-device1", "32"]):
+            with self.assertRaises(ValueError):
+                enable_vision_swap({"args": args, "vision": {"expert_swap": True}}, {})
+
+    def test_unreaped_encoder_blocks_reload_and_preserves_process(self):
+        tok = ByteTokenizer()
+        e = MockEngine(tok, "ok")
+        e.restart = mock.Mock()
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        v = Vision.__new__(Vision)
+        v.proc = proc
+        with self.assertRaises(EngineStuck):
+            v._start()
+        self.assertIs(v.proc, proc)
+        v.expert_swap = True
+        v.unload = mock.Mock(side_effect=__import__("subprocess").TimeoutExpired("encoder", 20))
+        svc = Service(e, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"), vision=v)
+        with self.assertRaises(EngineStuck):
+            svc.ensure_loaded()
+        self.assertIs(v.proc, proc)
+        e.restart.assert_not_called()
+        self.assertTrue(e.vision_memory_failed)
+        self.assertIn("explicitly unload", svc.engine_error(EngineDied("failed")))
+
+    def test_poisoned_live_engine_requires_explicit_unload_not_new_image_retry(self):
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc = SimpleNamespace(stdin=io.StringIO())
+        e.info = {"vision_lending": 1}
+        e.vision_memory_failed = True
+        svc = Service(MockEngine(ByteTokenizer(), "ok"), ByteTokenizer(),
+                      ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.engine = e
+        svc.loaded = lambda: True
+        with self.assertRaises(EngineDied):
+            svc.ensure_loaded()
+        v = self.vision([])
+        with self.assertRaises(EngineDied):
+            v.encode_batch(["new"], e)
+        self.assertEqual(e.proc.stdin.getvalue(), "")
 
     def test_invalid_swap_config_is_rejected_without_spawning(self):
         for config in ({"gpu": False}, {"gpu": True, "headroom_mib": 0},

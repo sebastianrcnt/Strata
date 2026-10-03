@@ -614,6 +614,10 @@ class Vision:
         self.cache: dict[str, tuple[Path, int]] = {}
 
     def _start(self, cancel=None):
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                raise EngineStuck("the previous vision encoder is still alive; reap it before starting another")
+            self.close()
         args, log, env = self.spawn
         try:
             self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
@@ -736,6 +740,8 @@ class Vision:
             if getattr(self, "expert_swap", False):
                 if engine is None:
                     raise ValueError("GPU vision lending requires the engine and the request FIFO")
+                if getattr(engine, "vision_memory_failed", False) or getattr(engine, "vision_protocol_failed", False):
+                    raise EngineDied("expert memory handoff failed; explicitly unload then load before a new image")
                 # Even a partial release failure must run the recovery command.
                 try:
                     timing = {"images": len(prepared), "uncached_images": sum(key not in self.cache for key, _ in prepared)}
@@ -869,6 +875,15 @@ def enable_vision_swap(cfg: dict, env: dict) -> bool:
         actual = env.get("CUDA_VISIBLE_DEVICES")
         if actual is not None and actual != str(devices[0]):
             raise ValueError("vision cuda_device override conflicts with the engine's CUDA_VISIBLE_DEVICES")
+    args = cfg.get("args") or []
+    opts = dict(zip(args, args[1:]))
+    cache = opts.get("--expert-cache", "0")
+    if cache != "auto" and (not str(cache).isdigit() or int(cache) <= 0):
+        raise ValueError("vision expert_swap requires --expert-cache auto or a positive slot count")
+    for device in (1, 2, 3):
+        value = opts.get(f"--expert-cache-device{device}", "0")
+        if not str(value).isdigit() or int(value) != 0:
+            raise ValueError("vision expert_swap does not support remote expert caches")
     env["STRATA_EXPERT_VMM"] = "1"
     return True
 
@@ -1081,9 +1096,27 @@ class Service:
         except Exception:
             return None
 
+    def _reap_swap_encoder(self):
+        v = self.vision
+        if v is not None and getattr(v, "expert_swap", False) and getattr(v, "proc", None) is not None:
+            try:
+                v.unload()
+            except (OSError, subprocess.SubprocessError, EngineStuck) as e:
+                self.engine.vision_memory_failed = True
+                raise EngineStuck("the previous vision encoder has not exited; model reload stays blocked") from e
+
+    def engine_error(self, error) -> str:
+        if getattr(self.engine, "vision_memory_failed", False) or getattr(self.engine, "vision_protocol_failed", False):
+            return f"{error}; explicitly unload then load the model to recover"
+        return f"{error}; the next request restarts it"
+
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
+        self._reap_swap_encoder()
+        if self.loaded() and (getattr(self.engine, "vision_memory_failed", False) or
+                              getattr(self.engine, "vision_protocol_failed", False)):
+            raise EngineDied("expert memory handoff failed; explicitly unload then load the model to recover")
         if self.loaded() and not self._vision_down():
             return
         if self.before_load:
@@ -1120,7 +1153,8 @@ class Service:
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
-        if self.loaded() and not self._vision_down():
+        if self.loaded() and not self._vision_down() and not (
+                getattr(self.engine, "vision_memory_failed", False) or getattr(self.engine, "vision_protocol_failed", False)):
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -1156,6 +1190,7 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
+            self._reap_swap_encoder()
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
@@ -1553,7 +1588,7 @@ class Service:
                             finish = "error"
                             note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
                             log = getattr(self.engine, "log_path", None)
-                            print(f"[strata] {e}. {note} The next request starts the engine again."
+                            print(f"[strata] {self.engine_error(e)}. {note}"
                                   f"{' Its log: ' + log if log else ''}", flush=True)
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
@@ -2244,7 +2279,7 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineDied, EngineStuck) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
@@ -2295,7 +2330,7 @@ def make_handler(svc: Service):
             except (GpuBusy, EngineStarting) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                self._json(503, {"error": {"type": "server_error", "message": svc.engine_error(e)}})
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
@@ -2457,7 +2492,7 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                err = {"error": {"type": "server_error", "message": svc.engine_error(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
@@ -2506,7 +2541,7 @@ def make_handler(svc: Service):
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                err = {"type": "error", "error": {"type": "api_error", "message": svc.engine_error(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
