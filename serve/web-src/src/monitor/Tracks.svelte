@@ -11,13 +11,16 @@
   import Value from "../ui/Value.svelte";
   import Tip from "../ui/Tip.svelte";
   import Spark from "./Spark.svelte";
+  import {idleAsGap} from "../lib/history.js";
 
   let {metrics} = $props();
 
-  let folded = $state(store.get("folded", ["gpu", "power", "pcie", "cpu", "disk", "ram"]));
+  // open by default: what moves while the model works; folded: what stays flat (VRAM sits near full, RAM and temperature
+  // change slowly)
+  let folded = $state(store.get("folded.v2", ["vram", "temp", "power", "cpu", "disk", "ram"]));
   const fold = (key) => {
     folded = folded.includes(key) ? folded.filter((k) => k !== key) : [...folded, key];
-    store.set("folded", folded);
+    store.set("folded.v2", folded);
   };
   const live = $derived(metrics?.live || {});
   const generating = $derived(live.state === "generating");
@@ -35,9 +38,9 @@
     const bigDisk = hw.disk_read_mb >= 1000;
     const toGb = (a) => a?.map((b) => (b == null ? null : b / 1073741824));
     return [
-      {key: "speed", label: "Decode", value: speed == null ? null : fmt(speed, 1), unit: "tok/s", series: h.tok_s, active: generating,
+      {key: "speed", label: "Decode", value: speed == null ? null : fmt(speed, 1), unit: "tok/s", series: idleAsGap(h.tok_s), active: generating,
        sub: generating ? "now" : last ? "last request" : ""},
-      {key: "prefill", label: "Input effective", value: input.rate == null ? null : fmt(input.rate), unit: "tok/s", series: h.prefill_tok_s_mean,
+      {key: "prefill", label: "Input effective", value: input.rate == null ? null : fmt(input.rate), unit: "tok/s", series: idleAsGap(h.prefill_tok_s_mean),
        sub: input.detail, tip: inputMetrics.explanation, active: live.state === "reading"},
       {key: "gpu", label: "GPU load", value: hw.gpu_util == null ? null : fmt(hw.gpu_util), unit: "%", series: h.gpu_util, max: 100,
        sub: multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || ""},
@@ -61,7 +64,7 @@
     ];
   });
   const allFolded = $derived(folded.length >= rows.length);
-  const foldAll = () => { folded = allFolded ? [] : rows.map((r) => r.key); store.set("folded", folded); };
+  const foldAll = () => { folded = allFolded ? [] : rows.map((r) => r.key); store.set("folded.v2", folded); };
   const RANGES = [{value: "30", label: "30 s"}, {value: "60", label: "1 min"}, {value: "300", label: "5 min"}];
   let range = $state(String(monitor.range));
   $effect(() => { monitor.range = Number(range); });
@@ -81,11 +84,12 @@
     <div class="ruler" aria-hidden="true">{#each ticks as t}<span>{t}</span>{/each}<span>now</span></div>
     {#each rows as r (r.key)}
       {@const isFolded = folded.includes(r.key)}
-      <button class="label" class:folded={isFolded} aria-expanded={!isFolded} onclick={() => fold(r.key)}>
-        <span class="name"><span class="tri" class:open={!isFolded}></span>{#if r.tip}<Tip text={r.tip}>{r.label}</Tip>{:else}{r.label}{/if}</span>
+      <div class="label" class:folded={isFolded}>
+        <button class="fold" aria-expanded={!isFolded} onclick={() => fold(r.key)}><span class="tri" class:open={!isFolded}></span>{r.label}</button>
+        {#if r.tip}<Tip text={r.tip}><span class="q" aria-label="What is {r.label}?">?</span></Tip>{/if}
         <Value value={r.value} unit={r.unit} active={r.active} />
         {#if !isFolded && r.sub}<span class="sub">{r.sub}</span>{/if}
-      </button>
+      </div>
       <Spark values={r.series} max={r.max} range={monitor.range} label={r.label} unit={r.sparkUnit || r.unit} folded={isFolded} />
     {/each}
   </div>
@@ -96,21 +100,25 @@
   .ruler-pad { background: var(--head); }
   .ruler { display: flex; justify-content: space-between; align-items: center; height: 18px; padding: 0 3px; background: var(--chart);
            font-size: var(--fs-s); color: var(--dim); }
-  .label { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-content: start; gap: 2px 8px; height: 58px; padding: 5px 10px 5px 7px;
-           border: 0; background: var(--panel); color: var(--text); text-align: left; cursor: pointer; }
-  .label:hover { background: var(--cell); }
+  .label { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-content: start; align-items: center; gap: 2px 6px;
+           height: 58px; padding: 4px 10px 4px 3px; background: var(--panel); }
   .label.folded { height: 24px; align-content: center; padding-top: 0; padding-bottom: 0; }
-  .name { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--dim); white-space: nowrap; }
+  .label :global(.value) { justify-self: end; }
+  .fold { display: flex; align-items: center; gap: 6px; min-width: 0; height: 20px; padding: 0 4px; border: 0; border-radius: var(--r);
+          background: none; color: var(--dim); font-size: var(--fs-m); white-space: nowrap; cursor: pointer; }
+  .fold:hover { background: var(--cell); color: var(--text); }
+  .q { display: inline-grid; place-items: center; width: 14px; height: 14px; border-radius: 50%; background: var(--cell); color: var(--dim);
+       font-size: 10px; text-decoration: none; }
   .tri { flex: none; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 5px solid var(--off);
          transition: transform 120ms; }
   .tri.open { transform: rotate(90deg); }
-  .sub { grid-column: 1 / -1; font-size: var(--fs-s); color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sub { grid-column: 1 / -1; padding-left: 4px; font-size: var(--fs-s); color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   @media (max-width: 640px) {
     .grid { grid-template-columns: minmax(0, 1fr); }
     .ruler-pad { display: none; }
-    .label { height: auto; grid-template-columns: minmax(0, 1fr) auto; padding: 4px 8px; }
-    .label.folded { height: 24px; }
+    .label { height: auto; padding: 3px 8px 3px 3px; }
+    .label.folded { height: 26px; }
     .grid :global(.spark) { height: 46px; }
-    .grid :global(.spark.folded) { height: 14px; }
+    .grid :global(.spark.folded) { display: none; }
   }
 </style>

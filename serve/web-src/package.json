@@ -6,12 +6,15 @@
     "dev": "vite",
     "build": "vite build",
     "check": "svelte-check",
-    "test": "bun test",
-    "preview": "bun preview.js"
+    "test": "bun test src",
+    "preview": "bun preview.js",
+    "e2e": "vite build && bun test e2e --timeout 30000",
+    "deploy": "bun deploy.js"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "bits-ui": "^2.19.5",
+    "playwright-core": "^1.63.0",
     "svelte": "^5.57.1",
     "svelte-check": "^4.7.6",
     "vite": "^8.3.2"

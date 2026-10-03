@@ -7,7 +7,7 @@
 {#if text}
   <Tooltip.Root>
     <Tooltip.Trigger>
-      {#snippet child({props})}<span {...props} class="tip__trigger">{@render children()}</span>{/snippet}
+      {#snippet child({props})}<button type="button" {...props} class="tip__trigger">{@render children()}</button>{/snippet}
     </Tooltip.Trigger>
     <Tooltip.Portal>
       <Tooltip.Content class="tip" sideOffset={4}>{text}</Tooltip.Content>

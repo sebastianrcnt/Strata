@@ -21,8 +21,9 @@
                          : generating ? (PHASES[s.phase] || (s.phase ? s.phase[0].toUpperCase() + s.phase.slice(1) : "Generating"))
                          : live.state === "unloaded" ? "Unloaded" : monitor.live ? "Idle" : "Paused");
   const known = $derived(reading && s.prompt_total > 0 && s.prompt_read != null);
-  const pct = $derived(known ? (100 * s.prompt_read) / s.prompt_total
-                       : generating && live.max_tokens ? Math.min(100, (100 * s.generated) / live.max_tokens) : 0);
+  // the input bar shows only how much of the input is read (a new request starts it from zero, without animating)
+  const readPct = $derived(known ? Math.min(100, (100 * s.prompt_read) / s.prompt_total) : generating ? 100 : 0);
+  const busy = $derived(reading || generating);
 
   // ------------------------------------------------------------------ the output tape
   // The server sends the last 4,096 characters; new characters are let out over a few frames so the tape moves
@@ -79,53 +80,54 @@
     {#if server.streamStatus}<Badge tone="error">{server.streamStatus}</Badge>{/if}
     {#if queued > 0}<Badge tone="warn">{queued} queued</Badge>{/if}
     {#if generating}
-      <Value value={fmt(s.generated)} unit="tokens" /><Value value={s.tok_s == null ? null : fmt(s.tok_s, 1)} unit="tok/s" active />
+      <Value value={live.max_tokens ? `${fmt(s.generated)} / ${fmt(live.max_tokens)}` : fmt(s.generated)} unit="tokens" />
+      <Value value={s.tok_s == null ? null : fmt(s.tok_s, 1)} unit="tok/s" active />
     {:else if known}
       <Value value={`${fmt(s.prompt_read)} / ${fmt(s.prompt_total)}`} unit="tokens" active />
     {:else if !reading && last}
       <span>last: {fmt(last.output_tokens)} tokens{last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}</span>
     {/if}
   {/snippet}
-  <div class="progress" class:indeterminate={reading && !known}><i style:width="{pct}%" class:reading></i></div>
-
-  <div class="row">
-    <button class="row__label" aria-expanded={openInput} onclick={() => (openInput = !openInput)}><span class="tri" class:open={openInput}></span>Input</button>
-    <div class="row__body muted">{reading ? (known ? `${fmt(pct)}% read` : s.prompt_tokens ? `${fmt(s.prompt_tokens)} tokens` : "Preparing") : generating ? "Read" : "–"}</div>
-    <span class="row__end">{known ? `${kfmt(s.prompt_read)} / ${kfmt(s.prompt_total)}` : ""}</span>
-  </div>
-  {#if openInput}
-    <pre class="text">{reading || generating ? previewUnicode(s.prompt_preview || "Preparing input…") : "Waiting for a request"}</pre>
-  {/if}
-
-  <div class="row">
-    <button class="row__label" aria-expanded={openOutput} onclick={() => (openOutput = !openOutput)}><span class="tri" class:open={openOutput}></span>Output</button>
-    <div class="tape-window">
-      <div class="tape">
-        {#if generating}<span>{tapeOld}</span><span class="tape__new">{tapeNew}</span><i class="tape__cursor"></i>
-        {:else}<span>{reading ? "Waiting for the input to be read" : "Waiting for a request"}</span>{/if}
-      </div>
+  {#if busy || openInput || openOutput}
+    <div class="row">
+      <button class="row__label" aria-expanded={openInput} onclick={() => (openInput = !openInput)}><span class="tri" class:open={openInput}></span>Input</button>
+      {#key s.request}
+        <div class="bar" class:indeterminate={reading && !known}><i style:width="{readPct}%"></i></div>
+      {/key}
+      <span class="row__end">{known ? `${kfmt(s.prompt_read)} / ${kfmt(s.prompt_total)}` : reading ? (s.prompt_tokens ? `${kfmt(s.prompt_tokens)} tokens` : "preparing") : generating ? "read" : "–"}</span>
     </div>
-    <span class="row__end"></span>
-  </div>
-  {#if openOutput}
-    <pre class="text" bind:this={outputPanel}>{generating ? shown : "Waiting for a request"}</pre>
+    {#if openInput}
+      <pre class="text">{busy ? previewUnicode(s.prompt_preview || "Preparing input…") : "Waiting for a request"}</pre>
+    {/if}
+
+    <div class="row">
+      <button class="row__label" aria-expanded={openOutput} onclick={() => (openOutput = !openOutput)}><span class="tri" class:open={openOutput}></span>Output</button>
+      <div class="tape-window">
+        <div class="tape">
+          {#if generating}<span>{tapeOld}</span><span class="tape__new">{tapeNew}</span><i class="tape__cursor"></i>
+          {:else}<span>{reading ? "waiting for the input to be read" : "waiting for a request"}</span>{/if}
+        </div>
+      </div>
+      <span class="row__end"></span>
+    </div>
+    {#if openOutput}
+      <pre class="text" bind:this={outputPanel}>{generating ? shown : "Waiting for a request"}</pre>
+    {/if}
   {/if}
 </Panel>
 
 <style>
-  .progress { height: 2px; background: var(--well); overflow: hidden; }
-  .progress i { display: block; height: 100%; background: var(--accent); transition: width 180ms linear; }
-  .progress i.reading { background: var(--value); }
-  .progress.indeterminate i { width: 30% !important; background: var(--value); animation: slide 1.2s linear infinite; }
+  .bar { height: 3px; border-radius: 2px; background: var(--well); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--value); transition: width 180ms linear; }
+  .bar.indeterminate i { width: 30% !important; animation: slide 1.2s linear infinite; }
   .row { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; align-items: center; gap: 8px; height: 28px; padding: 0 10px 0 6px; }
-  .row + .row, .text + .row { border-top: 1px solid var(--gap); }
+  .row { border-top: 1px solid var(--gap); }
   .row__label { display: flex; align-items: center; gap: 6px; height: 100%; padding: 0; border: 0; background: none; color: var(--dim);
                 font-size: var(--fs-s); cursor: pointer; }
   .row__label:hover { color: var(--text); }
   .tri { width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 5px solid currentColor;
          transition: transform 120ms; }
   .tri.open { transform: rotate(90deg); }
-  .row__body { font-size: var(--fs-s); }
   .row__end { font-size: var(--fs-s); color: var(--dim); text-align: right; white-space: nowrap; }
   .tape-window { position: relative; min-width: 0; height: 20px; overflow: hidden;
                  mask-image: linear-gradient(to right, transparent, black 15%, black); }

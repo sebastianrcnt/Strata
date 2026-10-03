@@ -15,8 +15,15 @@ bun install
 bun run dev        # Vite dev server with hot reload; the API goes to STRATA_URL (default http://127.0.0.1:8081)
 bun run build      # writes serve/web/{index.html,app.js,app.css}: commit them with the source change
 bun run preview    # the built page as the server serves it, API passed to STRATA_URL (port 5174)
-bun test           # unit tests (input metrics, Markdown)
+bun test           # unit tests (input metrics, Markdown, graph history)
+bun run e2e        # builds, then drives the page in Chrome against a fake server (no GPU, no Strata needed)
 bun run check      # svelte-check
+STRATA_DEPLOY=host:/path/to/serve/web STRATA_URL=http://host:8081 bun run deploy   # hot-swap into a running server
 ```
+
+`bun run e2e` uses the installed Google Chrome; `E2E_BROWSER=chromium` uses Playwright's own build instead
+(`bunx playwright-core install chromium`). `bun run deploy` needs the server's `serve/web` to be a directory it reads
+(the default install, or one directory mount in Docker): the server reads those files on every request, so no restart
+is needed. It backs the target up next to itself first and checks that the server then serves the new `app.js`.
 
 `"web_chat": false` in the server config (or `--no-web-chat`) hides the Chat tab; the page reads it from `/health`.

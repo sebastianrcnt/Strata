@@ -2,6 +2,7 @@
 // while the Monitor shows it), /mcp. Each poll replaces its object whole ($state.raw), so the views update only
 // the values that changed.
 import {store} from "./storage.js";
+import {mergeHistory} from "./history.js";
 import {ui, toast} from "./ui.svelte.js";
 
 export const auth = $state({key: store.get("apikey", ""), needed: false});
@@ -53,8 +54,9 @@ export async function loadHealth() {
 }
 
 // ------------------------------------------------------------------ /metrics, every second
-// The server retains 60 one-second readings; the browser keeps up to five minutes.
-const history = {};
+// The server retains 60 one-second readings; the browser keeps up to five minutes, across reloads too.
+let history = store.get("history", null);
+let savedAt = 0;
 let failures = 0, keyWarned = false;
 async function fetchMetrics() {
   try {
@@ -64,10 +66,9 @@ async function fetchMetrics() {
       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under Setup.", 6000); }
     } else if (r.ok) {
       const m = await r.json();
-      for (const [key, values] of Object.entries(m.history || {})) {
-        history[key] = history[key] ? [...history[key], values[values.length - 1]].slice(-300) : values.slice(-300);
-      }
-      m.history = {...history};
+      history = mergeHistory(history, m.history, Date.now());
+      m.history = history.series;
+      if (Date.now() - savedAt > 5000) { store.set("history", history); savedAt = Date.now(); }
       auth.needed = false;
       failures = 0;
       server.reachable = true;
@@ -122,6 +123,7 @@ export const projectionLoaded = () => {
 };
 
 export function start() {
+  addEventListener("pagehide", () => { if (history) store.set("history", history); });
   loadHealth().then(loadMcp);
   pollMetrics();
   pollStream();
