@@ -2,8 +2,11 @@
 
 The page at `/` (Chat, Monitor, Setup), written in Svelte 5 and built with Vite and Bun. The build writes
 `serve/web/index.html`, `serve/web/app.js` and `serve/web/app.css`; those built files are committed, so running Strata
-needs neither Bun nor Node. The design system files next to them (`tokens.css`, `components.css`, `sprite.svg`,
-`fonts/`) are served as they are and are not part of the build. `monitor.html` / `monitor.js` (the API request monitor
+needs neither Bun nor Node. The page's look is its own: `src/styles/tokens.css` (greys, two accents - orange for running, cyan for values and
+selection - three type sizes, one radius) and the small kit in `src/ui/` (Panel, Button, Badge, Value, Check, Segmented,
+Select, Tip, Sheet, Facts). Keyboard and focus behaviour of tabs, selects, toggles, tooltips and the sheet come from
+[Bits UI](https://bits-ui.com) (headless); the styling is ours. `sprite.svg` (icons) is served as it is;
+`tokens.css` / `components.css` in `serve/web` remain only for the API request monitor page. `monitor.html` / `monitor.js` (the API request monitor
 at `/api-monitor`) are separate and unchanged.
 
 ```sh

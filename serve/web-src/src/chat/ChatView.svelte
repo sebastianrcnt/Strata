@@ -4,10 +4,10 @@
   import {server, loadMcp} from "../lib/server.svelte.js";
   import Message from "./Message.svelte";
   import Composer from "./Composer.svelte";
-  import SamplingDrawer from "./SamplingDrawer.svelte";
+  import ChatSettings from "./ChatSettings.svelte";
 
   let {active} = $props();
-  let scroller = $state(), drawerOpen = $state(false);
+  let scroller = $state(), settingsOpen = $state(false);
 
   // follow the answer while the reader is at the bottom
   const nearBottom = () => scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120;
@@ -27,12 +27,12 @@
   }
 </script>
 
-<div class="chat-scroll" bind:this={scroller}>
+<div class="scroll" bind:this={scroller}>
   <div class="chat">
     {#if !chat.messages.length}
-      <div class="chat-empty">
-        <div class="chat-empty__title">Ask anything</div>
-        <div class="chat-empty__sub">{server.health.model} runs on this PC. Nothing leaves it.</div>
+      <div class="empty">
+        <div class="empty__title">Ask anything</div>
+        <div class="muted">{server.health.model} runs on this PC. Nothing leaves it.</div>
       </div>
     {/if}
     {#each chat.messages as m, i (m.time + ":" + i)}
@@ -40,16 +40,13 @@
     {/each}
   </div>
 </div>
-<Composer {active} onSettings={() => { drawerOpen = true; loadMcp(); }} />
-<SamplingDrawer bind:open={drawerOpen} />
+<Composer {active} onSettings={() => { settingsOpen = true; loadMcp(); }} />
+<ChatSettings bind:open={settingsOpen} />
 
 <style>
-  .chat-scroll { flex: 1; min-height: 0; overflow-y: auto; font-size: 14px; }
-  .chat { max-width: 860px; margin: 0 auto; padding: var(--st-s-8) var(--st-s-6) var(--st-s-6); display: flex;
-          flex-direction: column; gap: var(--st-s-6); }
-  .chat-empty { margin: 12vh auto 0; text-align: center; }
-  .chat-empty__title { font-weight: var(--st-fw-black); font-size: var(--st-fs-display); line-height: var(--st-lh-tight); letter-spacing: -.02em; }
-  .chat-empty__sub { margin-top: var(--st-s-3); color: var(--st-ink-muted); }
-  .chat :global(.st-bubble) { font-size: 14px; }
-  @media (max-width: 640px) { .chat { padding: var(--st-s-5) var(--st-s-4); } }
+  .scroll { flex: 1; min-height: 0; overflow-y: auto; }
+  .chat { max-width: 820px; margin: 0 auto; padding: 24px 20px; display: flex; flex-direction: column; gap: 18px; font-size: 13px; }
+  .empty { margin: 14vh auto 0; text-align: center; display: flex; flex-direction: column; gap: 6px; }
+  .empty__title { font-size: var(--fs-l); font-weight: var(--fw-b); }
+  @media (max-width: 640px) { .chat { padding: 16px 12px; } }
 </style>

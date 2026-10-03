@@ -1,0 +1,47 @@
+/* Page base, shared text helpers and the few classes that raw HTML (the chat's Markdown) needs. */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { display: flex; flex-direction: column; overflow: hidden; background: var(--gap); color: var(--text);
+       font: var(--fw) var(--fs-m)/1.4 var(--font); font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased; }
+#app { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+[hidden] { display: none !important; }
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--value); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 1.5px solid var(--value); outline-offset: 1px; }
+::selection { background: var(--value-tint); }
+* { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+
+.muted { color: var(--dim); }
+.small { font-size: var(--fs-s); }
+.mono { font-family: var(--mono); }
+
+.icon { width: 16px; height: 16px; flex: none; }
+.icon--s { width: 13px; height: 13px; }
+
+/* a bare icon button, also used inside rendered Markdown */
+.iconbtn { display: inline-grid; place-items: center; width: var(--ctl-h); height: var(--ctl-h); padding: 0; border: 0;
+           border-radius: var(--r); background: transparent; color: var(--dim); cursor: pointer; }
+.iconbtn:hover { background: var(--cell-hover); color: var(--text); }
+
+/* tables */
+.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-m); }
+.tbl th { position: sticky; top: 0; z-index: 1; height: 22px; padding: 0 8px; background: var(--head); color: var(--dim);
+          font-weight: var(--fw); font-size: var(--fs-s); text-align: left; white-space: nowrap; }
+.tbl td { height: 26px; padding: 3px 8px; white-space: nowrap; border-top: 1px solid var(--gap); }
+.tbl .num { text-align: right; }
+.tbl .sub { display: block; font-size: var(--fs-s); color: var(--dim); }
+
+/* small round-cornered labels */
+.chip { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 7px; border-radius: var(--r);
+        background: var(--cell); font-size: var(--fs-s); color: var(--text); }
+
+.msg-error { color: var(--danger); background: var(--danger-tint); border-radius: var(--r); padding: 8px 10px; }
+
+/* a code block in an answer (built as HTML by lib/markdown.js) */
+.code { margin: 10px 0; border-radius: var(--r); background: var(--well); overflow: hidden; }
+.code__head { display: flex; align-items: center; justify-content: space-between; height: var(--head-h); padding: 0 4px 0 10px;
+              background: var(--head); color: var(--dim); font-size: var(--fs-s); }
+.code pre { margin: 0; padding: 10px; overflow: auto; font: var(--fs-m)/1.55 var(--mono); }
+
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

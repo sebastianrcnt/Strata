@@ -3,6 +3,9 @@
   // the output. Prompts and output are not kept: only the server's bounded preview is shown.
   import {server, monitor} from "../lib/server.svelte.js";
   import {fmt, kfmt} from "../lib/format.js";
+  import Panel from "../ui/Panel.svelte";
+  import Badge from "../ui/Badge.svelte";
+  import Value from "../ui/Value.svelte";
 
   let {metrics} = $props();
 
@@ -14,17 +17,10 @@
   const queued = $derived(live.queued || 0);
 
   const PHASES = {thinking: "Thinking", answering: "Answering"};
-  const badge = $derived(reading ? ["reading", "Reading"] : generating ? ["generating", "Generating"]
-                         : live.state === "unloaded" ? ["", "Unloaded"] : ["", monitor.live ? "Idle" : "Paused"]);
-  const label = $derived(reading ? "Reading the prompt"
+  const title = $derived(reading ? "Reading the input"
                          : generating ? (PHASES[s.phase] || (s.phase ? s.phase[0].toUpperCase() + s.phase.slice(1) : "Generating"))
-                         : "Waiting for a request");
+                         : live.state === "unloaded" ? "Unloaded" : monitor.live ? "Idle" : "Paused");
   const known = $derived(reading && s.prompt_total > 0 && s.prompt_read != null);
-  const detail = $derived(
-    known ? `${fmt(s.prompt_read)} / ${fmt(s.prompt_total)} tokens · ${fmt((100 * s.prompt_read) / s.prompt_total)}%`
-    : reading ? (s.prompt_tokens ? `${fmt(s.prompt_tokens)} tokens` : "Preparing")
-    : generating ? `${fmt(s.generated)} tokens${s.tok_s != null ? ` · ${fmt(s.tok_s, 1)} tok/s` : ""}`
-    : last ? `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}` : "");
   const pct = $derived(known ? (100 * s.prompt_read) / s.prompt_total
                        : generating && live.max_tokens ? Math.min(100, (100 * s.generated) / live.max_tokens) : 0);
 
@@ -68,81 +64,78 @@
   const tapeNew = $derived(flat(fresh).slice(-80));
   const tapeOld = $derived.by(() => { const v = flat(shown).slice(-160); return v.slice(0, Math.max(0, v.length - tapeNew.length)); });
 
-  let openPrefill = $state(false), openDecode = $state(false);
-  let decodePanel = $state();
+  let openInput = $state(false), openOutput = $state(false);
+  let outputPanel = $state();
   $effect.pre(() => {
     shown;
-    if (!decodePanel) return;
-    const follow = decodePanel.scrollHeight - decodePanel.scrollTop - decodePanel.clientHeight < 24;
-    if (follow) queueMicrotask(() => { if (decodePanel) decodePanel.scrollTop = decodePanel.scrollHeight; });
+    if (!outputPanel) return;
+    const follow = outputPanel.scrollHeight - outputPanel.scrollTop - outputPanel.clientHeight < 24;
+    if (follow) queueMicrotask(() => { if (outputPanel) outputPanel.scrollTop = outputPanel.scrollHeight; });
   });
 </script>
 
-<section class="now st-card" aria-label="What the model is doing now">
-  <div class="now__head">
-    <span class="st-badge {badge[0] ? `st-badge--${badge[0]}` : ''}">{badge[1]}</span>
-    {#if queued > 0}<span class="st-badge st-badge--queued">{queued} queued</span>{/if}
-    <span class="now__label">{label}</span>
-    <span class="now__detail muted">{detail}</span>
-    {#if server.streamStatus}<span class="now__status st-badge st-badge--queued">{server.streamStatus}</span>{/if}
-  </div>
-  <div class="st-progress" data-tone={reading ? "info" : undefined}><div class="st-progress__bar" style:width="{pct}%"></div></div>
+<Panel {title} lamp={reading ? "value" : generating ? "on" : ""} flush aria-label="What the model is doing now">
+  {#snippet tools()}
+    {#if server.streamStatus}<Badge tone="error">{server.streamStatus}</Badge>{/if}
+    {#if queued > 0}<Badge tone="warn">{queued} queued</Badge>{/if}
+    {#if generating}
+      <Value value={fmt(s.generated)} unit="tokens" /><Value value={s.tok_s == null ? null : fmt(s.tok_s, 1)} unit="tok/s" active />
+    {:else if known}
+      <Value value={`${fmt(s.prompt_read)} / ${fmt(s.prompt_total)}`} unit="tokens" active />
+    {:else if !reading && last}
+      <span>last: {fmt(last.output_tokens)} tokens{last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}</span>
+    {/if}
+  {/snippet}
+  <div class="progress" class:indeterminate={reading && !known}><i style:width="{pct}%" class:reading></i></div>
 
-  <div class="now__row">
-    <button class="now__expand" aria-expanded={openPrefill} onclick={() => (openPrefill = !openPrefill)}>{openPrefill ? "▾" : "▸"} Input</button>
-    <div class="prefill" class:indeterminate={reading && !known}>
-      <i style:width={known ? `${Math.min(100, pct)}%` : generating ? "100%" : "0%"}></i>
-    </div>
-    <span class="now__count">{known ? `${kfmt(s.prompt_read)} / ${kfmt(s.prompt_total)}` : reading ? "Reading" : generating ? "Done" : "–"}</span>
+  <div class="row">
+    <button class="row__label" aria-expanded={openInput} onclick={() => (openInput = !openInput)}><span class="tri" class:open={openInput}></span>Input</button>
+    <div class="row__body muted">{reading ? (known ? `${fmt(pct)}% read` : s.prompt_tokens ? `${fmt(s.prompt_tokens)} tokens` : "Preparing") : generating ? "Read" : "–"}</div>
+    <span class="row__end">{known ? `${kfmt(s.prompt_read)} / ${kfmt(s.prompt_total)}` : ""}</span>
   </div>
-  {#if openPrefill}
-    <pre class="now__text">{reading || generating ? previewUnicode(s.prompt_preview || "Preparing input…") : "Waiting for a request"}</pre>
+  {#if openInput}
+    <pre class="text">{reading || generating ? previewUnicode(s.prompt_preview || "Preparing input…") : "Waiting for a request"}</pre>
   {/if}
 
-  <div class="now__row">
-    <button class="now__expand" aria-expanded={openDecode} onclick={() => (openDecode = !openDecode)}>{openDecode ? "▾" : "▸"} Output</button>
+  <div class="row">
+    <button class="row__label" aria-expanded={openOutput} onclick={() => (openOutput = !openOutput)}><span class="tri" class:open={openOutput}></span>Output</button>
     <div class="tape-window">
       <div class="tape">
         {#if generating}<span>{tapeOld}</span><span class="tape__new">{tapeNew}</span><i class="tape__cursor"></i>
         {:else}<span>{reading ? "Waiting for the input to be read" : "Waiting for a request"}</span>{/if}
       </div>
     </div>
-    <span class="now__count">{generating && s.tok_s != null ? `${fmt(s.tok_s, 1)} t/s` : "–"}</span>
+    <span class="row__end"></span>
   </div>
-  {#if openDecode}
-    <pre class="now__text" bind:this={decodePanel}>{generating ? shown : "Waiting for a request"}</pre>
+  {#if openOutput}
+    <pre class="text" bind:this={outputPanel}>{generating ? shown : "Waiting for a request"}</pre>
   {/if}
-</section>
+</Panel>
 
 <style>
-  .now { padding: 0; border: 0; font-size: 12px; }
-  .now__head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 7px 10px; }
-  .now__label { font-weight: var(--st-fw-medium); }
-  .now__detail { font-size: 11px; }
-  .now__status { margin-left: auto; }
-  .now__row { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 6px 10px;
-              min-height: 36px; border-top: 1px solid var(--st-line-soft); }
-  .now__expand { background: none; border: 0; padding: 0; text-align: left; font: 11px var(--st-font); color: var(--st-ink-muted);
-                 cursor: pointer; white-space: nowrap; }
-  .now__expand:hover { color: var(--st-ink); }
-  .now__count { font-size: 11px; min-width: 68px; text-align: right; white-space: nowrap; }
-  .prefill { height: 3px; background: var(--st-surface-2); overflow: hidden; }
-  .prefill i { display: block; height: 100%; width: 0; background: var(--st-info); transition: width 180ms linear; }
-  .prefill.indeterminate i { width: 35% !important; animation: read 1.2s linear infinite; }
-  .tape-window { position: relative; min-width: 0; overflow: hidden; height: 22px;
-                 mask-image: linear-gradient(to right, transparent, black 18%, black); }
-  .tape { position: absolute; right: 0; top: 0; width: max-content; white-space: pre; font: 13px/22px var(--st-font-mono);
-          color: var(--st-ink-muted); }
-  .tape__new { color: var(--st-ink); }
-  .tape__cursor { display: inline-block; width: 2px; height: 15px; background: var(--st-accent); vertical-align: middle; margin-left: 4px;
-                  animation: cursor .8s ease-in-out infinite alternate; }
-  .now__text { box-sizing: border-box; margin: 0; padding: 10px 12px; height: 164px; overflow: auto; white-space: pre-wrap;
-               overflow-wrap: anywhere; font: 12px/1.6 var(--st-font-mono); border-top: 1px solid var(--st-line-soft);
-               background: var(--st-bg); color: var(--st-ink); }
-  @keyframes read { from { transform: translateX(-100%); } to { transform: translateX(390%); } }
-  @keyframes cursor { to { opacity: .35; } }
-  @media (max-width: 640px) {
-    .now__row { grid-template-columns: 56px minmax(0, 1fr) auto; gap: 6px; padding: 6px 8px; }
-    .now__count { min-width: 0; }
-  }
+  .progress { height: 2px; background: var(--well); overflow: hidden; }
+  .progress i { display: block; height: 100%; background: var(--accent); transition: width 180ms linear; }
+  .progress i.reading { background: var(--value); }
+  .progress.indeterminate i { width: 30% !important; background: var(--value); animation: slide 1.2s linear infinite; }
+  .row { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; align-items: center; gap: 8px; height: 28px; padding: 0 10px 0 6px; }
+  .row + .row, .text + .row { border-top: 1px solid var(--gap); }
+  .row__label { display: flex; align-items: center; gap: 6px; height: 100%; padding: 0; border: 0; background: none; color: var(--dim);
+                font-size: var(--fs-s); cursor: pointer; }
+  .row__label:hover { color: var(--text); }
+  .tri { width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 5px solid currentColor;
+         transition: transform 120ms; }
+  .tri.open { transform: rotate(90deg); }
+  .row__body { font-size: var(--fs-s); }
+  .row__end { font-size: var(--fs-s); color: var(--dim); text-align: right; white-space: nowrap; }
+  .tape-window { position: relative; min-width: 0; height: 20px; overflow: hidden;
+                 mask-image: linear-gradient(to right, transparent, black 15%, black); }
+  .tape { position: absolute; right: 0; top: 0; width: max-content; white-space: pre; font: var(--fs-m)/20px var(--mono); color: var(--dim); }
+  .tape__new { color: var(--text); }
+  .tape__cursor { display: inline-block; width: 2px; height: 13px; margin-left: 3px; vertical-align: middle; background: var(--accent);
+                  animation: blink .8s ease-in-out infinite alternate; }
+  .text { margin: 0; height: 160px; overflow: auto; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere;
+          font: var(--fs-m)/1.55 var(--mono); background: var(--well); }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  @keyframes blink { to { opacity: .3; } }
+  @media (max-width: 640px) { .row { grid-template-columns: 60px minmax(0, 1fr) auto; padding-right: 8px; } }
 </style>

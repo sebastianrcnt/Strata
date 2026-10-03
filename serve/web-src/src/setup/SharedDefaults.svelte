@@ -5,6 +5,9 @@
   import {toast} from "../lib/ui.svelte.js";
   import {DEFAULTS} from "../lib/chat.svelte.js";
   import {fmt} from "../lib/format.js";
+  import Panel from "../ui/Panel.svelte";
+  import Button from "../ui/Button.svelte";
+  import Badge from "../ui/Badge.svelte";
   import SamplingFields from "../components/SamplingFields.svelte";
 
   let shared = $state(null);            // {shared, defaults} from the server; null until read
@@ -55,36 +58,29 @@
   const summary = $derived(Object.entries(shared?.defaults || {}).map(([k, v]) => `${LABELS[k] || k} ${typeof v === "number" ? fmt(v, v % 1 ? 2 : 0) : v}`).join(" · "));
 </script>
 
-<div class="st-card card">
-  <div class="head">
-    <span class="card-title">Defaults for other apps</span>
-    {#if shared}<span class="st-badge {shared.shared ? 'st-badge--queued' : ''}">{shared.shared ? "On" : "Off"}</span>{/if}
-  </div>
+<Panel title="Defaults for other apps" lamp={shared?.shared ? "on" : ""}>
+  {#snippet tools()}{#if shared}<Badge tone={shared.shared ? "warn" : "neutral"}>{shared.shared ? "On" : "Off"}</Badge>{/if}{/snippet}
   <p class="muted">Sampling that every API client (omp, Pi, scripts, benchmarks) gets for anything it does not set itself.
     Changing this changes their results: leave it off while measuring.</p>
   {#if shared === null}
-    <p class="muted small">Not available on this server.</p>
+    <p class="muted">Not available on this server.</p>
   {:else if !editing}
-    {#if shared.shared}<p class="current">{summary}</p>{/if}
+    {#if shared.shared}<p>{summary}</p>{/if}
     <div class="actions">
-      <button class="st-btn st-btn--secondary" onclick={edit}>{shared.shared ? "Change" : "Set defaults…"}</button>
-      {#if shared.shared}<button class="st-btn st-btn--secondary" onclick={() => save(null)}>Turn off</button>{/if}
+      <Button onclick={edit}>{shared.shared ? "Change" : "Set defaults…"}</Button>
+      {#if shared.shared}<Button onclick={() => save(null)}>Turn off</Button>{/if}
     </div>
   {:else}
     <div class="fields"><SamplingFields bind:s={draft} projection={projectionLoaded()} id="shared" /></div>
     <div class="actions">
-      <button class="st-btn st-btn--secondary" onclick={() => (editing = false)}>Cancel</button>
-      <button class="st-btn st-btn--primary" onclick={() => save(toServer(draft))}>Apply to every app</button>
+      <Button onclick={() => (editing = false)}>Cancel</Button>
+      <Button variant="primary" onclick={() => save(toServer(draft))}>Apply to every app</Button>
     </div>
   {/if}
-</div>
+</Panel>
 
 <style>
-  .card { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px; border: 0; }
-  .head { display: flex; align-items: center; gap: 8px; }
-  p { margin: 0; font-size: 12px; }
-  .current { font-size: 12px; color: var(--st-ink-soft); }
-  .fields { display: flex; flex-direction: column; gap: 16px; max-width: 420px; }
-  .actions { display: flex; gap: 8px; }
-  .actions .st-btn { height: 30px; padding: 0 12px; }
+  p { margin: 0 0 8px; }
+  .fields { display: flex; flex-direction: column; gap: 14px; max-width: 420px; margin: 4px 0 12px; }
+  .actions { display: flex; gap: 4px; }
 </style>

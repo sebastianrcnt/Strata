@@ -24,11 +24,11 @@
 </div>
 
 <style>
-  .monitor { display: flex; flex-direction: column; gap: 1px; padding: 1px; background: var(--st-line); min-height: 100%;
-             align-content: start; }
-  .row { display: grid; gap: 1px; }
-  .row--requests { grid-template-columns: 220px minmax(0, 1fr); }
-  .row--cards { grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); flex: 1; align-items: start; }
+  .monitor { display: flex; flex-direction: column; gap: var(--pgap); padding: var(--pgap); }
+  .monitor > :global(*) { flex: none; }
+  .row { display: grid; gap: var(--pgap); align-items: start; }
+  .row--requests { grid-template-columns: 210px minmax(0, 1fr); align-items: stretch; }
+  .row--cards { grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); }
   .row--cards:empty { display: none; }
   @media (max-width: 800px) { .row--requests { grid-template-columns: 1fr; } }
 </style>

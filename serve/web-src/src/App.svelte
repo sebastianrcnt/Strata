@@ -1,4 +1,5 @@
 <script>
+  import {Tabs, Tooltip} from "bits-ui";
   import {ui, showTab} from "./lib/ui.svelte.js";
   import {server, start} from "./lib/server.svelte.js";
   import Header from "./components/Header.svelte";
@@ -11,33 +12,32 @@
   // the server's "web_chat": false hides the Chat tab (the page then opens on the Monitor)
   const chatOn = $derived(server.health.web_chat !== false);
   const tabs = $derived([
-    ...(chatOn ? [{id: "chat", label: "Chat", icon: "chat"}] : []),
-    {id: "monitor", label: "Monitor", icon: "activity"},
-    {id: "about", label: "Setup", icon: "info"},
+    ...(chatOn ? [{id: "chat", label: "Chat"}] : []),
+    {id: "monitor", label: "Monitor"},
+    {id: "about", label: "Setup"},
   ]);
   $effect(() => { if (server.healthLoaded) showTab(location.hash.slice(1), chatOn); });
-  const onTab = (id) => showTab(id, chatOn);
 </script>
 
 <svelte:window onhashchange={() => showTab(location.hash.slice(1), chatOn)} />
 
-<Header {tabs} {onTab} />
-<main>
-  {#if server.healthLoaded}
-    {#if chatOn}
-      <div class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat" hidden={ui.tab !== "chat"}>
-        <ChatView active={ui.tab === "chat"} />
-      </div>
+<Tooltip.Provider delayDuration={350}>
+  <Tabs.Root value={ui.tab} onValueChange={(v) => showTab(v, chatOn)} class="app">
+    <Header {tabs} />
+    {#if server.healthLoaded}
+      {#if chatOn}
+        <Tabs.Content value="chat" class="view view--chat"><ChatView active={ui.tab === "chat"} /></Tabs.Content>
+      {/if}
+      <Tabs.Content value="monitor" class="view view--scroll">{#if ui.tab === "monitor"}<MonitorView />{/if}</Tabs.Content>
+      <Tabs.Content value="about" class="view view--scroll">{#if ui.tab === "about"}<SetupView />{/if}</Tabs.Content>
     {/if}
-    {#if ui.tab === "monitor"}
-      <div class="view view--scroll" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor">
-        <MonitorView />
-      </div>
-    {:else if ui.tab === "about"}
-      <div class="view view--scroll" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about">
-        <SetupView />
-      </div>
-    {/if}
-  {/if}
-</main>
+  </Tabs.Root>
+</Tooltip.Provider>
 <Toasts />
+
+<style>
+  :global(.app) { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  :global(.view) { flex: 1; min-height: 0; display: flex; flex-direction: column; outline: none; }
+  :global(.view--scroll) { overflow-y: auto; }
+  :global(.view--chat) { background: var(--panel); }
+</style>

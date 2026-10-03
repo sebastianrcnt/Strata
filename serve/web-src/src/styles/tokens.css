@@ -1,0 +1,52 @@
+/* Strata console tokens. Neutral greys separate the panels by value, not by lines; two accents carry meaning:
+   orange = running / on, cyan = a value, a selection, an active choice. Red only for errors.
+   Type: three sizes (11 / 12 / 15 px), two weights (400 / 600). One corner radius. */
+:root {
+  color-scheme: dark;
+  --gap: #161616;          /* between panels */
+  --panel: #2a2a2a;        /* panel body */
+  --head: #353535;         /* panel title bar, table header */
+  --cell: #313131;         /* raised cells, buttons */
+  --cell-hover: #3b3b3b;
+  --well: #1e1e1e;         /* inputs, sunken fields */
+  --chart: #18343a;        /* chart backgrounds */
+  --chart-grid: rgba(255, 255, 255, .07);
+  --line: #404040;         /* the rare outline (inputs) */
+  --text: #dcdcdc;
+  --dim: #9c9c9c;
+  --off: #686868;
+  --accent: #ff9d2e;  --accent-ink: #1a1a1a;  --accent-tint: rgba(255, 157, 46, .16);
+  --value: #3fc6e0;   --value-ink: #0c262b;   --value-tint: rgba(63, 198, 224, .17);
+  --danger: #ff6159;  --danger-tint: rgba(255, 97, 89, .16);
+  --scrim: rgba(0, 0, 0, .5);
+  --shadow: 0 8px 28px rgba(0, 0, 0, .5);
+
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  --fs-s: 11px;  --fs-m: 12px;  --fs-l: 15px;
+  --fw: 400;     --fw-b: 600;
+  --r: 3px;
+  --pgap: 3px;   /* the gap between panels */
+  --head-h: 26px;
+  --ctl-h: 22px; /* buttons, selects, segmented controls */
+}
+[data-theme="light"] {
+  color-scheme: light;
+  --gap: #a8a8a8;
+  --panel: #dedede;
+  --head: #cecece;
+  --cell: #d6d6d6;
+  --cell-hover: #c9c9c9;
+  --well: #f3f3f3;
+  --chart: #d2e6ea;
+  --chart-grid: rgba(0, 0, 0, .08);
+  --line: #b4b4b4;
+  --text: #1c1c1c;
+  --dim: #555555;
+  --off: #8c8c8c;
+  --accent: #dd7700;  --accent-ink: #ffffff;  --accent-tint: rgba(221, 119, 0, .15);
+  --value: #00809a;   --value-ink: #ffffff;   --value-tint: rgba(0, 128, 154, .14);
+  --danger: #cc2f28;  --danger-tint: rgba(204, 47, 40, .12);
+  --scrim: rgba(0, 0, 0, .25);
+  --shadow: 0 8px 28px rgba(0, 0, 0, .18);
+}

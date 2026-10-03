@@ -1,8 +1,10 @@
 <script>
   import {server, auth, setKey} from "../lib/server.svelte.js";
-  import {ui, flipTheme} from "../lib/ui.svelte.js";
+  import {ui, setTheme} from "../lib/ui.svelte.js";
   import {fmt, gb} from "../lib/format.js";
-  import Facts from "../components/Facts.svelte";
+  import Panel from "../ui/Panel.svelte";
+  import Facts from "../ui/Facts.svelte";
+  import Check from "../ui/Check.svelte";
   import SharedDefaults from "./SharedDefaults.svelte";
 
   // INFO cvec=project:4-44[:singleL] | add:A-B | 0
@@ -22,8 +24,7 @@
 </script>
 
 <div class="setup">
-  <div class="st-card card">
-    <span class="card-title">Model and engine</span>
+  <Panel title="Model and engine" lamp={server.health.loaded ? "on" : ""}>
     <Facts rows={[
       ["Model", eng.model],
       ["Engine", eng.version ? `v${eng.version}` : "built from source"],
@@ -34,40 +35,38 @@
       ["Images", eng.images ? "on" : "off"],
       ["Experimental speed projection", projectionText(eng.cvec)],
     ]} />
-  </div>
-  <div class="st-card card">
-    <span class="card-title">This PC</span>
+  </Panel>
+  <Panel title="This PC" lamp={null}>
     <Facts rows={[
       ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"],
       ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
       ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
     ]} />
-  </div>
-  <div class="st-card card">
-    <span class="card-title">Connect your tools</span>
+  </Panel>
+  <Panel title="Connect your tools" lamp={null}>
     <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
     <Facts rows={[["OpenAI base URL", `${base}/v1`, true], ["Anthropic base URL", base, true], ["Model name", eng.model || server.health.model, true]]} />
-  </div>
+  </Panel>
   <SharedDefaults />
-  <div class="st-card card">
-    <span class="card-title">This browser</span>
-    <div class="st-field">
-      <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
-      <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed"
-             class:needed={auth.needed} bind:value={key} onchange={() => setKey(key)}>
+  <Panel title="This browser" lamp={null}>
+    <div class="field">
+      <label for="api-key">API key <span class="muted small">only if the server was started with one</span></label>
+      <input class="input" class:needed={auth.needed} id="api-key" type="password" autocomplete="off" placeholder="not needed"
+             bind:value={key} onchange={() => setKey(key)}>
     </div>
-    <div class="toggle-row"><span>Dark theme</span>
-      <button class="st-toggle" role="switch" aria-checked={ui.theme === "dark"} aria-label="Dark theme" onclick={flipTheme}></button></div>
+    <Check id="dark-theme" checked={ui.theme === "dark"} onchange={(v) => setTheme(v ? "dark" : "light", true)} label="Dark theme" />
     <p class="muted small">Chats, settings and the key are kept in this browser only.
       <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a></p>
-  </div>
+  </Panel>
 </div>
 
 <style>
-  .setup { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; padding: 1px; background: var(--st-line);
-           align-content: start; min-height: 100%; }
-  .card { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px; border: 0; }
-  .card :global(p) { margin: 0; font-size: 12px; }
-  .needed { border-color: var(--st-warn); }
+  .setup { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--pgap); padding: var(--pgap); align-items: start; }
+  p { margin: 0 0 8px; }
+  .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+  .input { height: var(--ctl-h); padding: 0 7px; border: 0; border-radius: var(--r); background: var(--well); box-shadow: inset 0 0 0 1px var(--line); }
+  .input:focus { outline: none; box-shadow: inset 0 0 0 1.5px var(--value); }
+  .input.needed { box-shadow: inset 0 0 0 1.5px var(--accent); }
+  p.small { margin: 12px 0 0; }
   @media (max-width: 800px) { .setup { grid-template-columns: 1fr; } }
 </style>

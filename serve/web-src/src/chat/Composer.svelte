@@ -2,7 +2,8 @@
   import {tick} from "svelte";
   import {chat, send, stop, newChat, exportChat, addFiles} from "../lib/chat.svelte.js";
   import {server} from "../lib/server.svelte.js";
-  import Icon from "../components/Icon.svelte";
+  import Button from "../ui/Button.svelte";
+  import Icon from "../ui/Icon.svelte";
 
   let {active, onSettings} = $props();
   let text = $state(""), input = $state(), fileInput = $state(), dragging = $state(false);
@@ -43,47 +44,48 @@
                ondragleave={(e) => { if (!e.relatedTarget) dragging = false; }}
                ondrop={(e) => { if (active && hasFiles(e)) drop(e); }} />
 
-<div class="composer-wrap">
-  <form class="st-composer" class:dragging onsubmit={submit}>
+<div class="wrap">
+  <form class="composer" class:dragging onsubmit={submit}>
     {#if chat.attachments.length}
       <div class="attachments">
         {#each chat.attachments as a, i}
-          <span class="chip"><Icon name={a.kind === "file" ? "attach" : "image"} size="sm" />{a.name}
-            <button type="button" class="st-btn st-btn--icon" aria-label="Remove {a.name}" onclick={() => chat.attachments.splice(i, 1)}><Icon name="trash" /></button></span>
+          <span class="chip"><Icon name={a.kind === "file" ? "attach" : "image"} small />{a.name}
+            <button type="button" class="iconbtn" aria-label="Remove {a.name}" onclick={() => chat.attachments.splice(i, 1)}><Icon name="close" small /></button></span>
         {/each}
       </div>
     {/if}
     <textarea bind:this={input} bind:value={text} rows="2" placeholder="Ask anything…" aria-label="Message"
               oninput={autosize} onkeydown={keydown} onpaste={paste}></textarea>
-    <div class="st-composer__bar">
-      <button type="button" class="st-btn st-btn--icon" aria-label="Attach a file" onclick={() => fileInput.click()}
-              title={server.health.images ? "Attach a text file or a picture (or drop it here)" : "Attach a text file (or drop it here)"}>
-        <Icon name="attach" /></button>
+    <div class="bar">
+      <Button variant="ghost" icon="attach" aria-label="Attach a file" onclick={() => fileInput.click()}
+              title={server.health.images ? "Attach a text file or a picture (or drop it here)" : "Attach a text file (or drop it here)"} />
       <input type="file" multiple hidden bind:this={fileInput} onchange={() => { addFiles(fileInput.files); fileInput.value = ""; }}>
-      <button type="button" class="st-btn st-btn--icon" title="New chat" aria-label="New chat" onclick={newChat}><Icon name="new-chat" /></button>
-      <button type="button" class="st-btn st-btn--icon" title="Save this chat as Markdown" aria-label="Save this chat" onclick={exportChat}><Icon name="download" /></button>
-      <button type="button" class="st-btn st-btn--icon" title="Sampling and thinking" aria-label="Sampling and thinking" onclick={onSettings}><Icon name="settings" /></button>
+      <Button variant="ghost" icon="new-chat" title="New chat" aria-label="New chat" onclick={newChat} />
+      <Button variant="ghost" icon="download" title="Save this chat as Markdown" aria-label="Save this chat" onclick={exportChat} />
+      <Button variant="ghost" icon="settings" title="Chat settings" aria-label="Chat settings" onclick={onSettings} />
       <span class="spacer"></span>
       {#if chat.busy}
-        <button type="button" class="st-btn st-btn--secondary" onclick={stop}><Icon name="stop" size="sm" />Stop</button>
+        <Button icon="stop" onclick={stop}>Stop</Button>
       {:else}
         <span class="hint">Shift+Enter: new line</span>
       {/if}
-      <button type="submit" class="st-btn st-btn--primary send" aria-label="Send" disabled={!!chat.busy || (!text.trim() && !chat.attachments.length)}>
-        <Icon name="send" /></button>
+      <Button type="submit" variant="primary" icon="send" aria-label="Send" disabled={!!chat.busy || (!text.trim() && !chat.attachments.length)} />
     </div>
   </form>
 </div>
 
 <style>
-  .composer-wrap { flex: none; padding: 0 var(--st-s-6) var(--st-s-6); }
-  .st-composer { max-width: 860px; margin: 0 auto; }
-  .st-composer textarea { max-height: 40vh; font-size: 14px; }
-  .st-composer.dragging { outline: 2px dashed var(--st-accent); outline-offset: 3px; }
-  .send { width: 42px; padding: 0; box-shadow: none; }
-  .hint { font-size: var(--st-fs-xs); color: var(--st-ink-muted); margin-right: var(--st-s-2); }
-  .attachments { display: flex; flex-wrap: wrap; gap: var(--st-s-2); padding: 2px 4px 0; }
-  .st-composer__bar .st-btn--secondary { height: 34px; }
+  .wrap { flex: none; padding: 0 20px 16px; }
+  .composer { max-width: 820px; margin: 0 auto; display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: var(--r);
+              background: var(--well); box-shadow: inset 0 0 0 1px var(--line); }
+  .composer:focus-within { box-shadow: inset 0 0 0 1.5px var(--value); }
+  .composer.dragging { box-shadow: inset 0 0 0 1.5px var(--accent); }
+  textarea { min-height: 40px; max-height: 40vh; padding: 4px 6px; border: 0; outline: 0; resize: none; background: transparent; font-size: 13px; line-height: 1.5; }
+  .bar { display: flex; align-items: center; gap: 2px; }
+  .spacer { flex: 1; }
+  .hint { margin-right: 6px; font-size: var(--fs-s); color: var(--off); }
+  .attachments { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px; }
+  .attachments .iconbtn { width: 16px; height: 16px; }
   @media (hover: none) { .hint { display: none; } }
-  @media (max-width: 640px) { .composer-wrap { padding: 0 var(--st-s-3) var(--st-s-3); } }
+  @media (max-width: 640px) { .wrap { padding: 0 8px 8px; } }
 </style>

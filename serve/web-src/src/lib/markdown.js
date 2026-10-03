@@ -2,7 +2,7 @@
 // never inject markup. Code blocks get a copy button (handled by a click listener on the answer).
 export const SPRITE = "web/sprite.svg";
 export const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-const icon = (name) => `<svg class="st-icon" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
+const icon = (name) => `<svg class="icon" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
 
 function inline(s) {
   const codes = [];
@@ -14,8 +14,8 @@ function inline(s) {
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
 function codeBlock(lang, code) {
-  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span>` +
-    `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></div>` +
+  return `<div class="code"><div class="code__head"><span>${esc(lang || "code")}</span>` +
+    `<button class="iconbtn" data-code-copy aria-label="Copy code">${icon("copy")}</button></div>` +
     `<pre><code>${esc(code)}</code></pre></div>`;
 }
 function blocks(text) {
