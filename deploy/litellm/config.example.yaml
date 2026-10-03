@@ -1,7 +1,7 @@
 model_list:
   - model_name: claude-orca
     litellm_params:
-      model: anthropic/qwen38-flash-next-orca-bf16-ista-allocation
+      model: anthropic/orca-local
       api_base: http://127.0.0.1:8081
       api_key: os.environ/STRATA_API_KEY
       drop_params: true
