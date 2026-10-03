@@ -567,12 +567,16 @@ class StrataEngine:
 
     def persist(self) -> int:
         """PERSIST: write the conversations to --conversation-dir now.  The caller holds the service's fifo."""
+        if getattr(self, "vision_memory_failed", False) or getattr(self, "vision_protocol_failed", False):
+            raise EngineDied("cannot persist through an uncertain vision handoff; explicitly reload the engine")
         self.proc.stdin.write("PERSIST\n")
         self.proc.stdin.flush()
         while True:
             line = self.lines.get(timeout=600)
             if line is None:
                 raise EngineDied("the engine stopped while saving conversations")
+            if line.startswith("ERR "):
+                raise EngineDied("the engine refused to save conversations: " + line[4:].strip())
             if line.startswith("PERSISTED"):
                 return int(line.split()[1])
 
@@ -598,21 +602,59 @@ class Vision:
             raise ValueError("vision expert_swap requires gpu=true and headroom_mib=1..65536")
         self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.proc = None
+        self.lines, self.pump = None, None
+        self.start_timeout_s = float(cfg.get("start_timeout_s", 120))
+        self.encode_timeout_s = float(cfg.get("encode_timeout_s", 180))
+        if not 0 < self.start_timeout_s <= 600 or not 0 < self.encode_timeout_s <= 600:
+            raise ValueError("vision startup and encoding timeouts must be between 0 and 600 seconds")
         self.stopped = True
         if not self.expert_swap:
             self._start()
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
 
-    def _start(self):
+    def _start(self, cancel=None):
         args, log, env = self.spawn
-        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
-                                     text=True, encoding="utf-8", bufsize=1, env=env)
+        try:
+            self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
+                                         text=True, encoding="utf-8", bufsize=1, env=env)
+        except OSError as e:
+            raise EngineDied(f"the vision encoder could not start: {e}") from e
         contain(self.proc)
-        line = self.proc.stdout.readline()
-        if not line.startswith("READY"):
-            raise RuntimeError("the vision encoder did not start: " + line.strip())
+        proc, lines = self.proc, queue.Queue()
+        self.lines = lines
+        def pump():
+            try:
+                for line in proc.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+        self.pump = threading.Thread(target=pump, daemon=True)
+        self.pump.start()
+        try:
+            line = self._read_line(cancel, self.start_timeout_s, "starting")
+            if not line.startswith("READY"):
+                raise EngineDied("the vision encoder did not start: " + line.strip())
+        except BaseException:
+            self.close()
+            raise
         self.stopped = False
+
+    def _read_line(self, cancel, timeout, phase):
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise ValueError("image request cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EngineDied(f"vision encoder timed out while {phase} ({timeout:g} seconds)")
+            try:
+                line = self.lines.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+            if line is None:
+                raise EngineDied(f"vision encoder exited while {phase}")
+            return line
 
     def alive(self) -> bool:
         return not self.stopped and self.proc is not None and self.proc.poll() is None
@@ -676,12 +718,14 @@ class Vision:
     def encode(self, source: str) -> tuple[Path, int]:
         return self.encode_batch([source])[0]
 
-    def encode_batch(self, sources, engine=None) -> list[tuple[Path, int]]:
+    def encode_batch(self, sources, engine=None, cancel=None) -> list[tuple[Path, int]]:
         """One handoff per image batch, none when every normalized image is already cached."""
         if len(sources) > 64:
             raise ValueError("one image batch supports at most 64 images")
         prepared = []
         for source in sources:
+            if cancel is not None and cancel.is_set():
+                raise ValueError("image request cancelled")
             data = self.normalize(self.load(source))
             prepared.append((hashlib.sha256(data).hexdigest()[:32], data))
         with self.lock:
@@ -694,20 +738,38 @@ class Vision:
                     raise ValueError("GPU vision lending requires the engine and the request FIFO")
                 # Even a partial release failure must run the recovery command.
                 try:
+                    timing = {"images": len(prepared), "uncached_images": sum(key not in self.cache for key, _ in prepared)}
+                    t = time.perf_counter()
                     engine.vision_memory(self.headroom_mib)
-                    self._start()
-                    return [self._encode_data(key, data) for key, data in prepared]
+                    timing["release_s"] = round(time.perf_counter() - t, 4)
+                    t = time.perf_counter()
+                    self._start(cancel)
+                    timing["load_s"] = round(time.perf_counter() - t, 4)
+                    t = time.perf_counter()
+                    encoded = [self._encode_data(key, data, cancel) for key, data in prepared]
+                    timing["encode_s"] = round(time.perf_counter() - t, 4)
+                    return encoded
                 finally:
+                    t = time.perf_counter()
                     try:
                         self.unload()
                     except Exception as e:
                         # Never reallocate while an unreaped encoder may still own the lent memory.
                         engine.vision_memory_failed = True
                         raise EngineDied(f"vision encoder could not release its GPU memory: {e}") from e
+                    timing["unload_s"] = round(time.perf_counter() - t, 4)
+                    t = time.perf_counter()
                     engine.vision_memory()
-            return [self._encode_data(key, data) for key, data in prepared]
+                    timing["restore_s"] = round(time.perf_counter() - t, 4)
+                    self.last_timings = timing
+                    print("[strata] vision handoff: " + json.dumps(timing), flush=True)
+            try:
+                return [self._encode_data(key, data, cancel) for key, data in prepared]
+            except EngineDied:
+                self.unload()
+                raise
 
-    def _encode_data(self, key, data):
+    def _encode_data(self, key, data, cancel=None):
         if key in self.cache:
             return self.cache[key]
         img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
@@ -715,7 +777,7 @@ class Vision:
         try:
             self.proc.stdin.write(f"ENC {img} {out}\n")
             self.proc.stdin.flush()
-            line = self.proc.stdout.readline().strip()
+            line = self._read_line(cancel, self.encode_timeout_s, "encoding").strip()
         finally:
             img.unlink(missing_ok=True)
         if not line.startswith("OK"):
@@ -736,16 +798,19 @@ class Vision:
             if proc.poll() is None:
                 proc.stdin.write("QUIT\n")
                 proc.stdin.flush()
-                proc.wait(timeout=10)
+                proc.wait(timeout=1 if self.expert_swap else 10)
         except (OSError, ValueError, subprocess.TimeoutExpired):
             proc.kill()
             proc.wait(timeout=20)  # must be reaped before the engine reallocates its expert memory
         finally:
             if proc.poll() is not None:
+                if self.pump is not None:
+                    self.pump.join(timeout=2)
                 proc.stdin.close()
                 proc.stdout.close()
                 self.proc = None
                 self.stopped = True
+                self.pump = None
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -1319,7 +1384,7 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
@@ -1339,7 +1404,7 @@ class Service:
             with self.fifo:
                 if getattr(self.vision, "expert_swap", False):
                     self.ensure_loaded()
-                    encoded = self.vision.encode_batch(images, self.engine)
+                    encoded = self.vision.encode_batch(images, self.engine, cancel)
                 else:
                     encoded = [self.vision.encode(src) for src in images]
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
@@ -2170,7 +2235,10 @@ def make_handler(svc: Service):
                 self._json(409 if r == "busy" else 200, {"status": r})
                 return
             if path == "/conversations/save":                # write the KV conversations to disk now
-                self._json(200, svc.persist())
+                try:
+                    self._json(200, svc.persist())
+                except EngineDied as e:
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
@@ -2363,10 +2431,10 @@ def make_handler(svc: Service):
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
-            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # includes image preparation
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
@@ -2415,10 +2483,10 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
-            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # includes image preparation
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):

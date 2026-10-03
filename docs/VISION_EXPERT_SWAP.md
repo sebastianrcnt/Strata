@@ -41,3 +41,10 @@ A timeout or broken control pipe blocks both generation and all future handoff c
 reload. Late replies are never reused as acknowledgments for a new handoff. An explicit engine ERR response permits
 the normal restoration attempt. A separately specified vision cuda_device must be a non-negative integer matching
 an explicitly configured engine GPU; omitting it lets both children inherit the same CUDA device visibility.
+
+Encoder startup and response reads are bounded and cancellation-aware: start_timeout_s defaults to 120 seconds,
+encode_timeout_s to 180 seconds (each configurable up to 600). The HTTP disconnect watcher is active during image
+preparation. Startup EOF/ERR/timeouts become handled HTTP service errors after encoder reaping and expert rollback.
+Live-child tests cover an actual HTTP disconnect while the encoder is silent, for both API dialects. A failed or
+uncertain handoff makes conversation persistence fail immediately; backend ERR replies are not ignored.
+Successful handoffs log separate release/load/encode/unload/restore seconds for measurement.

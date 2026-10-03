@@ -1,5 +1,12 @@
 """GPU handoff lifecycle tests without starting an encoder, engine or CUDA context."""
 import io
+import base64
+import json
+import socket
+import sys
+import time
+import urllib.request
+import urllib.error
 import queue
 import tempfile
 import threading
@@ -8,7 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from serve.server import EngineDied, StrataEngine, Vision, Service, enable_vision_swap
+from serve.server import EngineDied, StrataEngine, Vision, Service, enable_vision_swap, ByteTokenizer, MockEngine, serve
+from serve.frontend import ChatTemplate
 
 
 class HandoffEngine:
@@ -32,7 +40,7 @@ class BatchVision(Vision):
         super().__init__({"exe": "never-spawn", "mmproj": "unused", "model": "unused",
                           "gpu": True, "expert_swap": True, "headroom_mib": 2048})
 
-    def _start(self):
+    def _start(self, cancel=None):
         self.events.append(("start",))
         self.stopped = False
         if self.failure == "start":
@@ -42,7 +50,7 @@ class BatchVision(Vision):
         self.events.append(("unload",))
         self.stopped = True
 
-    def _encode_data(self, key, data):
+    def _encode_data(self, key, data, cancel=None):
         if key not in self.cache:
             self.events.append(("encode", data.decode()))
             if self.failure == "encode":
@@ -203,6 +211,108 @@ class VisionSwap(unittest.TestCase):
                     Vision({"exe": "unused", "mmproj": "unused", "model": "unused",
                             "expert_swap": True, **config})
                 spawn.assert_not_called()
+
+
+class LiveChildEngine(MockEngine):
+    def __init__(self, events):
+        super().__init__(ByteTokenizer(), "ok", max_context=4096)
+        self.events = events
+        self.restored = threading.Event()
+        self.released = threading.Event()
+
+    def vision_memory(self, mib=None):
+        self.events.append(("release", mib) if mib is not None else ("restore",))
+        (self.released if mib is not None else self.restored).set()
+
+
+class VisionHTTP(unittest.TestCase):
+    """Real sockets and live subprocesses; no CUDA/model required."""
+    def launch(self, mode):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        script = root / "encoder"
+        marker = root / "encoding"
+        if mode == "startup-hang":
+            code = "time.sleep(60)"
+        elif mode == "startup-error":
+            code = 'print("ERR incompatible projector", flush=True)'
+        else:
+            code = 'print("READY 2560", flush=True)\nfor line in sys.stdin:\n if line.startswith("ENC "):\n  Path(%r).write_text("encoding")\n  time.sleep(60)\n elif line.startswith("QUIT"):\n  break' % str(marker)
+        script.write_text("#!" + sys.executable + "\nimport sys,time\nfrom pathlib import Path\n" + code + "\n")
+        script.chmod(0o755)
+        v = Vision({"exe": str(script), "mmproj": "unused", "model": "unused", "gpu": True,
+                    "expert_swap": True, "start_timeout_s": 0.3 if mode != "encode-hang" else 5,
+                    "encode_timeout_s": 0.3 if mode == "encode-timeout" else 60})
+        events = []
+        e = LiveChildEngine(events)
+        svc = Service(e, e.tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"), vision=v)
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(v.close)
+        self.addCleanup(lambda: __import__("shutil").rmtree(v.dir, ignore_errors=True))
+        return v, e, svc, httpd.server_address[1], marker
+
+    def body(self, api):
+        image = base64.b64encode(b"\x89PNG\r\n\x1a\nfake-test-image").decode()
+        if api == "openai":
+            return "/v1/chat/completions", {"model": "x", "max_tokens": 10,
+                "messages": [{"role": "user", "content": [{"type": "image_url",
+                              "image_url": {"url": "data:image/png;base64," + image}}]}]}
+        return "/v1/messages", {"model": "x", "max_tokens": 10,
+            "messages": [{"role": "user", "content": [{"type": "image", "source":
+                          {"type": "base64", "media_type": "image/png", "data": image}}]}]}
+
+    def test_http_disconnect_while_encoder_is_silent_restores_fifo(self):
+        for api in ("openai", "anthropic"):
+            with self.subTest(api=api):
+                v, e, svc, port, marker = self.launch("encode-hang")
+                path, body = self.body(api)
+                data = json.dumps(body).encode()
+                sock = socket.create_connection(("127.0.0.1", port))
+                sock.sendall((f"POST {path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+                              f"Content-Length: {len(data)}\r\n\r\n").encode() + data)
+                end = time.monotonic() + 3
+                while not marker.exists() and time.monotonic() < end:
+                    time.sleep(0.01)
+                self.assertTrue(marker.exists(), "request must reach the live child's encode read before disconnect")
+                sock.close()
+                self.assertTrue(e.restored.wait(4), "client hang-up must reap encoder and restore promptly")
+                self.assertIsNone(v.proc)
+                self.assertTrue(svc.fifo.acquire(timeout=1))
+                svc.fifo.release()
+                self.assertEqual(e.events, [("release", 2048), ("restore",)])
+
+    def test_startup_errors_and_timeouts_are_http_errors_with_restoration(self):
+        for mode in ("startup-error", "startup-hang", "encode-timeout"):
+            with self.subTest(mode=mode):
+                v, e, _, port, _ = self.launch(mode)
+                path, body = self.body("openai")
+                req = urllib.request.Request(f"http://127.0.0.1:{port}" + path,
+                    data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertEqual(error.exception.code, 503)
+                response = json.load(error.exception)
+                self.assertEqual(response["error"]["type"], "server_error")
+                self.assertTrue(e.restored.wait(1))
+                self.assertIsNone(v.proc)
+
+    def test_persist_poison_guard_and_err_reply_are_immediate(self):
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc = SimpleNamespace(stdin=io.StringIO())
+        e.vision_memory_failed = True
+        with self.assertRaises(EngineDied):
+            e.persist()
+        self.assertEqual(e.proc.stdin.getvalue(), "")
+        e.vision_memory_failed = False
+        e.lines = queue.Queue()
+        e.lines.put("ERR expert memory is lent to vision\n")
+        before = time.monotonic()
+        with self.assertRaises(EngineDied):
+            e.persist()
+        self.assertLess(time.monotonic() - before, 0.1)
 
 
 if __name__ == "__main__":
