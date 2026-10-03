@@ -1072,6 +1072,16 @@ class WebApp(unittest.TestCase):
                 self.assertEqual(code, 200)
                 self.assertIn(want, ctype)
 
+    def test_web_chat_switch_is_in_health(self):
+        # "web_chat": false hides the page's Chat tab; the page reads it from /health (the API itself is unchanged)
+        try:
+            for on in (True, False):
+                self.svc.web_chat = on
+                with self.subTest(web_chat=on):
+                    self.assertIs(json.loads(self.get("/health")[2])["web_chat"], on)
+        finally:
+            self.svc.web_chat = True
+
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
                      "/fonts/missing.woff2", "/fonts/x.ttf"):

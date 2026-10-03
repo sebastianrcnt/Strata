@@ -589,7 +589,7 @@ with an `mcpServers` block; add it to the `serve/server.py` line of your run scr
   transport is not supported). `"disabled": true` leaves an entry out.
 - The servers start with Strata, in the background; the server window says what each one offers
   (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
-  without them. The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by
+  without them. The Monitor tab lists them, and the chat's settings have **Use tools from MCP servers** (on by
   default). A server that stops later is started again at its next call.
 - In the chat each call shows as a small block (tool, arguments, result); the model reads the result and goes on,
   up to `max_rounds` calls in a row per answer. A tool that fails or takes longer than `timeout_s` (default 60 s)
@@ -771,10 +771,10 @@ Qwen3.8-Flash-Next, not Swift 1.5. It writes these engine flags (llama.cpp's) in
 ```
 
 The engine log then says `control vector mode = project, dir = per-layer, layers 4..44 (41 steered)`, and the web
-app's About tab lists it. (`--cvec-mode add` is llama.cpp's stock additive mode, for additive vectors.)
+app's Setup tab lists it. (`--cvec-mode add` is llama.cpp's stock additive mode, for additive vectors.)
 
-**Per request.** A loaded vector is on for every request unless it says otherwise: the web app's Sampling drawer has
-a switch, and the API takes `"experimental_speed_projection": false` in the request body (OpenAI and Anthropic; a
+**Per request.** A loaded vector is on for every request unless it says otherwise: the web app's chat settings and
+Setup > Defaults for other apps have a switch, and the API takes `"experimental_speed_projection": false` in the request body (OpenAI and Anthropic; a
 config default goes in `"sampling": {"experimental_speed_projection": false}`). Switching drops the conversation
 cache once, since the model state was computed the other way. Switched off, the output is token-for-token the stock
 model's.
@@ -887,6 +887,13 @@ tools/MCP are refused explicitly. Without `response_format`, ordinary text and t
 Structured SSE buffers the answer while sending keep-alive comments. It emits content only after validation,
 then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without invalid content deltas.
 `/v1/status.structured_output` advertises the formats, validation method and buffered streaming behavior.
+
+### The web app
+
+The page at `/` has Chat, Monitor and Setup tabs. `"web_chat": false` in `strata-<model>.json` (or
+`serve/server.py --no-web-chat`) hides the Chat tab and opens the page on the Monitor; the API is unchanged, and
+Setup keeps **Defaults for other apps** (the server-wide sampling defaults, `GET`/`POST /settings`). Its source is
+`serve/web-src` (Svelte, built with Bun and Vite into `serve/web`; see `serve/web-src/README.md`).
 
 ### API request monitor
 

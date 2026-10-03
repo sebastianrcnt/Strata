@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Strata</title>
-<link rel="icon" href="web/favicon.svg" type="image/svg+xml" >
-<link rel="stylesheet" href="web/tokens.css" >
-<link rel="stylesheet" href="web/components.css" >
+<link rel="icon" href="web/favicon.svg" type="image/svg+xml" vite-ignore>
+<link rel="stylesheet" href="web/tokens.css" vite-ignore>
+<link rel="stylesheet" href="web/components.css" vite-ignore>
 <script>
   // the theme before the first paint: the saved choice, else the system's
   try {
@@ -14,8 +14,7 @@
       (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
   } catch (e) {}
 </script>
-  <script type="module" crossorigin src="web/app.js"></script>
-  <link rel="stylesheet" crossorigin href="web/app.css">
+<script type="module" src="./src/main.js"></script>
 </head>
 <body>
 <div id="app"></div>
