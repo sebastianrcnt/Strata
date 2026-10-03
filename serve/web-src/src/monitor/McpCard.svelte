@@ -12,7 +12,7 @@
 
 {#if servers.length}
   <Panel title="MCP servers" lamp={servers.some((s) => s.status === "failed") ? "error" : ready.length ? "value" : ""}>
-    {#snippet tools()}<span>{fmt(server.mcp.tools)} tools · {ready.length} of {servers.length} connected</span>{/snippet}
+    <p class="sum">{fmt(server.mcp.tools)} tools · {ready.length} of {servers.length} servers connected</p>
     {#each servers as s (s.name)}
       {@const st = STATE[s.status] || ["neutral", s.status]}
       <div class="server">
@@ -33,5 +33,6 @@
   .server__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   strong { font-weight: var(--fw-b); }
   .tools { display: flex; flex-wrap: wrap; gap: 4px; }
+  .sum { margin: 0 0 8px; font-size: var(--fs-s); color: var(--dim); }
   .note { margin: 8px 0 0; font-size: var(--fs-s); color: var(--dim); }
 </style>

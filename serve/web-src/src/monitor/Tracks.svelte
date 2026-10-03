@@ -87,7 +87,7 @@
       <div class="label" class:folded={isFolded}>
         <button class="fold" aria-expanded={!isFolded} onclick={() => fold(r.key)}><span class="tri" class:open={!isFolded}></span>{r.label}</button>
         {#if r.tip}<Tip text={r.tip}><span class="q" aria-label="What is {r.label}?">?</span></Tip>{/if}
-        <Value value={r.value} unit={r.unit} active={r.active} />
+        <span class="val"><Value value={r.value} unit={r.unit} active={r.active} /></span>
         {#if !isFolded && r.sub}<span class="sub">{r.sub}</span>{/if}
       </div>
       <Spark values={r.series} max={r.max} range={monitor.range} label={r.label} unit={r.sparkUnit || r.unit} folded={isFolded} />
@@ -103,7 +103,7 @@
   .label { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-content: start; align-items: center; gap: 2px 6px;
            height: 58px; padding: 4px 10px 4px 3px; background: var(--panel); }
   .label.folded { height: 24px; align-content: center; padding-top: 0; padding-bottom: 0; }
-  .label :global(.value) { justify-self: end; }
+  .val { grid-column: 3; justify-self: end; }
   .fold { display: flex; align-items: center; gap: 6px; min-width: 0; height: 20px; padding: 0 4px; border: 0; border-radius: var(--r);
           background: none; color: var(--dim); font-size: var(--fs-m); white-space: nowrap; cursor: pointer; }
   .fold:hover { background: var(--cell); color: var(--text); }
