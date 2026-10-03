@@ -895,13 +895,13 @@ The page at `/` has Chat, Monitor, Memory and Setup tabs. `"web_chat": false` in
 Setup keeps **Defaults for other apps** (the server-wide sampling defaults, `GET`/`POST /settings`). Its source is
 `serve/web-src` (Svelte, built with Bun and Vite into `serve/web`; see `serve/web-src/README.md`).
 
-**Memory** draws where the experts live: the model file on the SSD, the RAM arena (every expert), the VRAM cache
-(`expert_slots`), with the measured disk and PCIe traffic between them and, per request, the share of the expert
-work done from the cache, over PCIe (`pcie_frac` of the misses) and on the CPU. Its map has one cell per expert
-(48 layers x 512): the cached ones are the first `expert_slots` pairs of `data/expert-profile.bin`, which the build
-copies into `serve/web/expert-profile.js`. That is the placement at start: the adaptive tier's later swaps and the
-routed experts are not reported by the engine, so the lights of the sweep while the model works are drawn at the
-measured hit rate, not from the real routing.
+**Memory** shows how well the VRAM expert cache works: the share of the experts it holds (`expert_slots` of
+48 x 512) against the share of the lookups it answers (each request's `hit_rate`, and the token-weighted mean over the
+requests the server keeps), the misses split into PCIe copies and CPU work by `pcie_frac`, the hit rate per request over
+the line a random pick of the same size would reach, and how the cache is spread over the layers. That spread is the
+fill at start, from `data/expert-profile.bin` (the build copies it into `serve/web/expert-profile.js`); the engine's
+later swaps are not reported. Below: the VRAM cache, the RAM arena (every expert) and the PLE n-gram table on the
+SSD (read row by row, `--ple-io direct`), with the PCIe and disk traffic now.
 
 ### API request monitor
 
