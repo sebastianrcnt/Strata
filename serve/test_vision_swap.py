@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from serve.server import EngineDied, StrataEngine, Vision, Service
+from serve.server import EngineDied, StrataEngine, Vision, Service, enable_vision_swap
 
 
 class HandoffEngine:
@@ -148,6 +148,52 @@ class VisionSwap(unittest.TestCase):
         with self.assertRaises(ValueError):
             e.vision_memory(2048)
         self.assertEqual(e.proc.stdin.getvalue(), "")
+
+    def test_release_timeout_poison_is_not_reset_by_late_reply(self):
+        e = self.engine("")
+        e.lines = mock.Mock()
+        e.lines.get.side_effect = queue.Empty()
+        with self.assertRaises(EngineDied):
+            e.vision_memory(2048)
+        self.assertTrue(e.vision_memory_failed)
+        self.assertTrue(e.vision_protocol_failed)
+        written = e.proc.stdin.getvalue()
+        e.lines.get.side_effect = None
+        e.lines.get.return_value = "VISION_RESTORED ok\\n"
+        with self.assertRaises(EngineDied):
+            e.vision_memory()
+        with self.assertRaises(EngineDied):
+            e.vision_memory(2048)
+        self.assertEqual(e.proc.stdin.getvalue(), written)
+        with self.assertRaises(EngineDied):
+            list(e.generate([1], 1, {}, threading.Event()))
+
+    def test_explicit_release_error_does_not_poison_protocol(self):
+        e = self.engine("ERR partial release\\n")
+        with self.assertRaises(ValueError):
+            e.vision_memory(2048)
+        self.assertFalse(getattr(e, "vision_protocol_failed", False))
+        e.lines.put("VISION_RESTORED ok\\n")
+        e.vision_memory()
+        self.assertFalse(e.vision_memory_failed)
+
+    def test_swap_device_validation(self):
+        cfg = {"gpu": [0], "vision": {"expert_swap": True, "cuda_device": 0}}
+        for device in (-1, True, 0.5, "0.5", "not-a-device", 8):
+            with self.subTest(device=device):
+                with self.assertRaises(ValueError):
+                    enable_vision_swap({**cfg, "vision": {**cfg["vision"], "cuda_device": device}}, {})
+        for overrides in ({"gpu": [0, 1]}, {"gpu": [-1]}, {"backend": "hip"}, {"gpu": None}):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    enable_vision_swap({**cfg, **overrides}, {})
+        with self.assertRaises(ValueError):
+            enable_vision_swap(cfg, {"CUDA_VISIBLE_DEVICES": "1"})
+        env = {}
+        self.assertTrue(enable_vision_swap({"gpu": [2], "vision": {"expert_swap": True, "cuda_device": "2"}}, env))
+        self.assertEqual(env["STRATA_EXPERT_VMM"], "1")
+        self.assertTrue(enable_vision_swap({"vision": {"expert_swap": True}}, {})) # same inherited visibility
+        self.assertFalse(enable_vision_swap({}, {}))
 
     def test_invalid_swap_config_is_rejected_without_spawning(self):
         for config in ({"gpu": False}, {"gpu": True, "headroom_mib": 0},

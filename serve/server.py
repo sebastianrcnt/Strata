@@ -229,6 +229,7 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.vision_memory_failed = False
+        self.vision_protocol_failed = False
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
@@ -534,6 +535,8 @@ class StrataEngine:
 
     def vision_memory(self, release_mib: int | None = None):
         """Idle-only control; Service.fifo must be held. Never infer after a failed restoration."""
+        if getattr(self, "vision_protocol_failed", False):
+            raise EngineDied("vision handoff reply is uncertain; explicitly reload the engine before retrying")
         if not self.info.get("vision_lending"):
             raise ValueError("GPU expert lending needs an engine built with VMM and STRATA_EXPERT_VMM=1")
         command = f"VISION_RELEASE {release_mib}" if release_mib is not None else "VISION_RESTORE"
@@ -551,7 +554,12 @@ class StrataEngine:
                     return
                 if line.startswith("ERR "):
                     raise ValueError(line[4:].strip())
-        except (OSError, queue.Empty, ValueError, EngineDied) as e:
+        except (OSError, queue.Empty, EngineDied) as e:
+            # A delayed reply cannot be associated with a future handoff safely. Do not send a restore
+            # or reuse the pipe: the release may still complete later. Only an explicit reload resets it.
+            self.vision_protocol_failed = self.vision_memory_failed = True
+            raise EngineDied(f"vision handoff timed out or lost its transport; explicitly reload the engine: {e}") from e
+        except ValueError as e:
             if release_mib is None:
                 self.vision_memory_failed = True
                 raise EngineDied(f"expert restoration failed; generation is disabled: {e}") from e
@@ -776,6 +784,28 @@ def hip_visible(cfg: dict) -> list[int]:
         except ValueError:
             pass
     return gpu_list(cfg)
+
+
+def enable_vision_swap(cfg: dict, env: dict) -> bool:
+    """Validate single-device ownership before starting either child; no GPU context is created."""
+    if (cfg.get("vision") or {}).get("expert_swap") is not True:
+        return False
+    devices = gpu_list(cfg)
+    if cfg.get("backend") == "hip" or len(devices) > 1 or any(i < 0 for i in devices):
+        raise ValueError("vision expert_swap requires a single non-negative CUDA GPU index")
+    vdev = (cfg.get("vision") or {}).get("cuda_device")
+    if vdev is not None:
+        # Do not truncate floats or accept bools. An explicit encoder override needs an explicit
+        # engine index too: otherwise an inherited CUDA_VISIBLE_DEVICES could select another GPU.
+        if isinstance(vdev, bool) or not isinstance(vdev, (int, str)) or not str(vdev).isdigit():
+            raise ValueError("vision cuda_device must be a non-negative integer GPU index")
+        if not devices or int(vdev) != devices[0]:
+            raise ValueError("vision expert_swap cuda_device must match the explicitly configured engine GPU")
+        actual = env.get("CUDA_VISIBLE_DEVICES")
+        if actual is not None and actual != str(devices[0]):
+            raise ValueError("vision cuda_device override conflicts with the engine's CUDA_VISIBLE_DEVICES")
+    env["STRATA_EXPERT_VMM"] = "1"
+    return True
 
 
 def child_env(cfg: dict) -> dict:
@@ -2669,13 +2699,10 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
-        swap = (cfg.get("vision") or {}).get("expert_swap") is True
-        if swap:
-            vdev = (cfg.get("vision") or {}).get("cuda_device")
-            if cfg.get("backend") == "hip" or len(gpu_list(cfg)) > 1 or \
-                    vdev is not None and int(vdev) != (gpu_list(cfg) or [0])[0]:
-                ap.error("vision expert_swap currently requires the engine's single CUDA GPU")
-            env["STRATA_EXPERT_VMM"] = "1"
+        try:
+            swap = enable_vision_swap(cfg, env)
+        except (ValueError, TypeError) as e:
+            ap.error(str(e))
         if lazy and cfg.get("vision") and not swap:
             ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):

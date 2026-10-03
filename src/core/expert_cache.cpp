@@ -257,6 +257,19 @@ bool ExpertCache::open_vmm(size_t bytes, std::string& err) {
                    "granularity", err)) return false;
     vmm_chunk_ = ((64ULL << 20) + granule - 1) / granule * granule;
     vmm_bytes_ = (bytes + vmm_chunk_ - 1) / vmm_chunk_ * vmm_chunk_;
+    // open() checked the logical blob bytes. Physical VMM chunks are rounded up, and that extra
+    // chunk must fit too. Refuse before reserving an address or allocating any physical handle.
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b < vmm_bytes_) {
+        char buf[320];
+        std::snprintf(buf, sizeof buf,
+                      "ExpertCache VMM: %zu MiB logical bytes require %zu MiB after chunk rounding, "
+                      "but only %zu MiB of VRAM is free. Lower --expert-cache.",
+                      bytes >> 20, vmm_bytes_ >> 20, free_b >> 20);
+        err = buf;
+        vmm_bytes_ = vmm_chunk_ = 0;
+        return false;
+    }
     CUdeviceptr address = 0;
     if (!driver_ok(cuMemAddressReserve(&address, vmm_bytes_, granule, 0, 0), "reserve address", err)) {
         vmm_bytes_ = 0;

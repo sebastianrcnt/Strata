@@ -36,3 +36,8 @@ validation should cover cached/uncached and multiple images, invalid images, cli
 and image requests, MTP, adaptive caching, conversation reuse, and output comparison before/after handoff.
 
 No production service is restarted or production configuration changed by this feature branch.
+
+A timeout or broken control pipe blocks both generation and all future handoff commands until an explicit engine
+reload. Late replies are never reused as acknowledgments for a new handoff. An explicit engine ERR response permits
+the normal restoration attempt. A separately specified vision cuda_device must be a non-negative integer matching
+an explicitly configured engine GPU; omitting it lets both children inherit the same CUDA device visibility.
