@@ -895,13 +895,16 @@ The page at `/` has Chat, Monitor, Memory and Setup tabs. `"web_chat": false` in
 Setup keeps **Defaults for other apps** (the server-wide sampling defaults, `GET`/`POST /settings`). Its source is
 `serve/web-src` (Svelte, built with Bun and Vite into `serve/web`; see `serve/web-src/README.md`).
 
-**Memory** shows how well the VRAM expert cache works: the share of the experts it holds (`expert_slots` of
-48 x 512) against the share of the lookups it answers (each request's `hit_rate`, and the token-weighted mean over the
-requests the server keeps), the misses split into PCIe copies and CPU work by `pcie_frac`, the hit rate per request over
-the line a random pick of the same size would reach, and how the cache is spread over the layers. That spread is the
-fill at start, from `data/expert-profile.bin` (the build copies it into `serve/web/expert-profile.js`); the engine's
-later swaps are not reported. Below: the VRAM cache, the RAM arena (every expert) and the PLE n-gram table on the
-SSD (read row by row, `--ple-io direct`), with the PCIe and disk traffic now.
+**Memory** shows how well the VRAM expert cache works. The engine counts, per (layer, expert), the routed lookups
+the VRAM cache served, those computed on a GPU from outside it (over PCIe or on another card) and those the CPU
+computed, in memory only, and after every request reports them with what the cache holds now (a `USAGE` line beside
+`CACHE`); `GET /experts` serves the last two reports, so the page shows the counts since the engine started or for the
+last request. From them: the cache's share of the experts against the share of the lookups it answers, how few
+experts take 90% of the lookups, the hit rate per layer, a map of all 48 x 512 experts (held / used / missed) and
+the most used experts outside VRAM. With an engine that does not report them the page falls back to the expert
+profile (`data/expert-profile.bin`, built into `serve/web/expert-profile.js`) and the per-request `hit_rate`. Below:
+the VRAM cache, the RAM arena (every expert) and the PLE n-gram table on the SSD (read row by row, `--ple-io
+direct`), with the PCIe and disk traffic now.
 
 ### API request monitor
 

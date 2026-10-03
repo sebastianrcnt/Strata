@@ -71,7 +71,7 @@ export function usageReport(slots = 8980, scale = 1) {
   const L = h[1], E = h[2], n = L * E, pairs = new Uint16Array(bin.buffer.slice(bin.byteOffset + 24, bin.byteOffset + 24 + h[4] * 4));
   const b = new Uint8Array(n * 12 + Math.ceil(n / 8)), u = new Uint32Array(b.buffer, 0, n * 3);
   for (let r = 0; r < pairs.length / 2; r++) {
-    const i = pairs[2 * r] * E + pairs[2 * r + 1], c = Math.floor((scale * 4e5) / (r + 50));
+    const i = pairs[2 * r] * E + pairs[2 * r + 1], c = Math.floor((scale * 2e7) / (r + 50) ** 1.5);
     if (r < slots) { u[i] = c; b[n * 12 + (i >> 3)] |= 1 << (i & 7); }
     else if (r % 5 === 0) u[n + i] = c;
     else u[2 * n + i] = c;

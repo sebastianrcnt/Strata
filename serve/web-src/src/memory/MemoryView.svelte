@@ -222,7 +222,8 @@
   .usage { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 14px; }
   .usage__list { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-s); min-width: 0; }
   .usage__list h3 { margin: 0 0 4px; font-size: var(--fs-s); font-weight: var(--fw-b); color: var(--dim); }
-  .row { display: grid; grid-template-columns: minmax(0, 1fr) auto 56px; gap: 8px; padding: 3px 6px; background: var(--well); border-radius: 2px; }
+  .row { display: grid; grid-template-columns: minmax(0, 1fr) auto 64px; gap: 8px; padding: 3px 6px; background: var(--well); border-radius: 2px;
+         white-space: nowrap; }
   .row span:nth-child(2) { color: var(--accent); text-align: right; font-variant-numeric: tabular-nums; }
   .row span:nth-child(3) { text-align: right; }
   .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px; padding-left: 26px; font-size: var(--fs-s); color: var(--dim); }
