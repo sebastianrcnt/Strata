@@ -13,6 +13,10 @@ a:hover { text-decoration: underline; }
 * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 
 .muted { color: var(--dim); }
+/* "still writing": a block after the text, on and off like a terminal's (the chat's answer, the Monitor's tape) */
+.cursor::after { content: ""; display: inline-block; width: .55em; height: 1.05em; margin-left: 2px; vertical-align: -.18em;
+                 border-radius: 1px; background: var(--accent); animation: cursor-blink 1s steps(2) infinite; }
+@keyframes cursor-blink { 50% { opacity: 0; } }
 .small { font-size: var(--fs-s); }
 .mono { font-family: var(--mono); }
 

@@ -3,7 +3,9 @@
   import Segmented from "../ui/Segmented.svelte";
   import Check from "../ui/Check.svelte";
   let {s = $bindable(), projection = false, id = "s"} = $props();
-  const THINK = {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"};
+  // each level caps the thinking (serve/server.py reasoning_budget: the server ends it there and the answer follows)
+  const THINK = {none: "answers right away", low: "thinks up to 1K tokens", medium: "thinks up to 4K tokens",
+                 high: "thinks up to 8K tokens (default)"};
   const greedy = $derived(+s.temperature === 0);
 </script>
 

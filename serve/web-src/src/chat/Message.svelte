@@ -98,7 +98,4 @@
   .answer :global(table) { display: block; overflow-x: auto; border-collapse: collapse; margin: 0 0 10px; }
   .answer :global(:is(th, td)) { padding: 4px 8px; border-bottom: 1px solid var(--line); text-align: left; }
   .answer :global(th) { color: var(--dim); font-weight: var(--fw); }
-  .cursor::after { content: ""; display: inline-block; width: 7px; height: 1em; margin-left: 2px; vertical-align: text-bottom;
-                   background: var(--accent); animation: blink 1s steps(2) infinite; }
-  @keyframes blink { 50% { opacity: 0; } }
 </style>

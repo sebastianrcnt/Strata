@@ -68,7 +68,7 @@ test("now: the rows stay put; generating fills them, idle keeps the last request
   expect(await page.textContent(".tape")).toContain("waiting for a request");
   const idle = await height();
   srv.state.stream = {...srv.state.stream, state: "generating", request: 1, phase: "thinking", tail: "hello world", generated: 12, tok_s: 51.5};
-  await page.waitForSelector(".tape__cursor", {timeout: 3000});
+  await page.waitForSelector(".tape .cursor", {timeout: 3000});
   await sleep(600);
   expect(await page.textContent(".panel h2 >> nth=0")).toBe("Thinking");
   expect(await page.textContent(".tape")).toContain("hello world");

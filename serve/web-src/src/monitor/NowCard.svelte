@@ -39,8 +39,8 @@
 
   // ------------------------------------------------------------------ the output tape
   // The server sends the last 4,096 characters; new characters are let out over a few frames so the tape moves
-  // smoothly at 5 polls a second. Each piece let out is its own span on the tape: it comes in bright and settles to
-  // the dim of the rest (a CSS animation; the tape holds a few dozen at most).
+  // smoothly at 5 polls a second. Each piece let out is its own span on the tape: it comes in at full text brightness
+  // and settles to the dim of the rest (a CSS animation; the tape holds a few dozen at most).
   const previewUnicode = (text) => text.replace(/(?:\\u[0-9a-fA-F]{4})+/g, (part) => {
     try { return JSON.parse('"' + part + '"'); } catch (_) { return part; }
   });
@@ -94,8 +94,6 @@
   });
   $effect(() => () => cancelAnimationFrame(frame));
 
-  // the open output panel: only its newest piece fades in (it can hold thousands of pieces)
-  const before = $derived(shown.slice(0, shown.length - fresh.length));
 
   let openInput = $state(false), openOutput = $state(false);
   let outputPanel = $state();
@@ -135,7 +133,7 @@
     <button class="row__label" aria-expanded={openOutput} onclick={() => (openOutput = !openOutput)}><span class="tri" class:open={openOutput}></span>Output</button>
     <div class="tape-window">
       <div class="tape" class:settled={!generating}>
-        {#if generating}{#each pieces as p (p.id)}<span class="piece">{p.text}</span>{/each}<i class="tape__cursor"></i>
+        {#if generating}{#each pieces as p (p.id)}<span class="piece">{p.text}</span>{/each}<span class="cursor"></span>
         {:else if reading}<span>waiting for the input to be read</span>
         {:else if shown}{#each pieces as p (p.id)}<span>{p.text}</span>{/each}
         {:else}<span>waiting for a request</span>{/if}
@@ -144,7 +142,7 @@
     <span class="row__end"></span>
   </div>
   {#if openOutput}
-    <pre class="text" bind:this={outputPanel}>{#if generating}{before}{#key pieces.at(-1)?.id}<span class="piece">{fresh}</span>{/key}{:else}{!reading && shown ? shown : reading ? "Waiting for the input to be read" : "Waiting for a request"}{/if}</pre>
+    <pre class="text" bind:this={outputPanel}>{generating || (!reading && shown) ? shown : reading ? "Waiting for the input to be read" : "Waiting for a request"}</pre>
   {/if}
 </Panel>
 
@@ -166,16 +164,13 @@
                  mask-image: linear-gradient(to right, transparent, black 15%, black); }
   .tape { position: absolute; right: 0; top: 0; width: max-content; white-space: pre; font: var(--fs-m)/20px var(--mono); color: var(--dim); }
   .tape.settled { color: var(--off); }
-  /* new output comes in bright (a touch of the accent) and settles to the dim of the rest */
+  /* new output comes in at full brightness and settles to the dim of the rest: brightness only, the accents keep
+     their meanings (the orange cursor is the "still writing") */
   .piece { animation: settle 1.4s ease-out both; }
-  .text .piece { --rest: var(--text); }
   @media (prefers-reduced-motion: reduce) { .piece { animation: none; } }
-  @keyframes settle { from { color: var(--value); } 20% { color: var(--text); } to { color: var(--rest, var(--dim)); } }
-  .tape__cursor { display: inline-block; width: 2px; height: 13px; margin-left: 3px; vertical-align: middle; background: var(--accent);
-                  animation: blink .8s ease-in-out infinite alternate; }
+  @keyframes settle { from, 25% { color: var(--text); } to { color: var(--dim); } }
   .text { margin: 0; height: 160px; overflow: auto; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere;
           font: var(--fs-m)/1.55 var(--mono); background: var(--well); }
   @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
-  @keyframes blink { to { opacity: .3; } }
   @media (max-width: 640px) { .row { grid-template-columns: 60px minmax(0, 1fr) auto; padding-right: 8px; } }
 </style>
