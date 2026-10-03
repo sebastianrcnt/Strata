@@ -1,0 +1,10 @@
+services:
+  litellm:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      STRATA_API_KEY: ${STRATA_API_KEY:?Set STRATA_API_KEY}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--host", "127.0.0.1", "--port", "4000"]

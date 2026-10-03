@@ -53,3 +53,9 @@ build-vision.bat
 /.rocm-win/
 /conversations/
 /local/__pycache__/
+
+# Local inference deployment outputs and secrets
+/deploy/docker/
+/deploy/litellm/config.yaml
+/deploy/litellm/.env
+/conversations-orca-bf16-csv/

@@ -861,12 +861,24 @@ class Service:
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
 
     def reasoning_budget(self, req) -> int | None:
-        """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
-        config's.  0 (or less) means no budget, so a request can turn a configured one off.  ValueError (a 400) for
-        anything that is not a whole number."""
-        value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
+        """Explicit token budget wins; otherwise map the requested effort to a thinking cap.
+        Omitted effort keeps the configured default. Zero means no separate thinking cap.
+        """
+        req = req if isinstance(req, dict) else {}
+        value = req.get("reasoning_budget_tokens")
         if value is None:
-            value = self.reasoning_budget_tokens
+            ctk = req.get("chat_template_kwargs")
+            ctk = ctk if isinstance(ctk, dict) else {}
+            reasoning = req.get("reasoning")
+            reasoning = reasoning if isinstance(reasoning, dict) else {}
+            output_config = req.get("output_config")
+            output_config = output_config if isinstance(output_config, dict) else {}
+            effort = (ctk.get("reasoning_effort") or req.get("reasoning_effort") or reasoning.get("effort")
+                      or output_config.get("effort"))
+            effort = str(effort).strip().lower() if effort is not None else ""
+            budgets = {"minimal": 256, "low": 512, "medium": 1024,
+                       "high": 2048, "xhigh": 4096, "max": 0, "maximum": 0}
+            value = budgets.get(effort, self.reasoning_budget_tokens)
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
@@ -1966,20 +1978,28 @@ def make_handler(svc: Service):
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
-            elif path in ("/v1/models", "/models"):
+            elif path in ("/v1/models", "/models") or path.startswith("/v1/models/"):
                 if self._authorized():
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.engine.max_context},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
+                    model["capabilities"] = {"effort": {"supported": True,
+                        **{level: {"supported": True} for level in ("low", "medium", "high", "xhigh", "max")}}}
+                    model["max_input_tokens"] = svc.engine.max_context
+                    model["max_tokens"] = 32768
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
                         loaded = True
                     if svc.aliases:                       # #297: the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    self._json(200, {"object": "list", "data": data if loaded else []})
+                    if path.startswith("/v1/models/"):
+                        chosen = next((m for m in data if m["id"] == path.removeprefix("/v1/models/")), None)
+                        self._json(200 if chosen else 404, chosen or {"error": {"message": "model not found"}})
+                    else:
+                        self._json(200, {"object": "list", "data": data if loaded else []})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -2384,8 +2404,8 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+            if value not in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+                raise ValueError("reasoning_effort: none, minimal, low, medium, high, xhigh or max")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")

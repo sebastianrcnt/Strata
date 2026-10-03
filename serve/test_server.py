@@ -1535,6 +1535,33 @@ class ThinkingBudget(unittest.TestCase):
         return self.post("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "2+2?"}],
                                                   "max_tokens": 400, **extra})
 
+    def test_effort_caps_across_api_shapes(self):
+        for effort, expected in (("minimal", 256), ("low", 512), ("medium", 1024),
+                                 ("high", 2048), ("xhigh", 4096), ("max", None)):
+            for request in ({"reasoning_effort": effort}, {"output_config": {"effort": effort}},
+                            {"reasoning": {"effort": effort}},
+                            {"chat_template_kwargs": {"reasoning_effort": effort}}):
+                with self.subTest(request=request):
+                    self.assertEqual(self.svc.reasoning_budget(request), expected)
+        self.assertEqual(self.svc.reasoning_budget({"output_config": {"effort": "max"},
+                                                   "reasoning_budget_tokens": 77}), 77)
+        self.assertIsNone(self.svc.reasoning_budget({"output_config": {"effort": "low"},
+                                                    "reasoning_budget_tokens": 0}))
+
+    def test_model_effort_metadata_and_detail(self):
+        with urllib.request.urlopen(self.base + "/v1/models") as response:
+            model = json.load(response)["data"][0]
+        supported = model["capabilities"]["effort"]
+        self.assertTrue(supported["supported"])
+        self.assertEqual(set(supported) - {"supported"}, {"low", "medium", "high", "xhigh", "max"})
+        for level in set(supported) - {"supported"}:
+            self.assertTrue(supported[level]["supported"])
+        with urllib.request.urlopen(self.base + "/v1/models/" + model["id"]) as response:
+            self.assertEqual(json.load(response), model)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(self.base + "/v1/models/unknown")
+        self.assertEqual(error.exception.code, 404)
+
     def test_off_by_default(self):
         code, b = self.openai()
         self.assertEqual(code, 200, b)

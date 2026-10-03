@@ -1,0 +1,24 @@
+model_list:
+  - model_name: claude-orca
+    litellm_params:
+      model: anthropic/qwen38-flash-next-orca-bf16-ista-allocation
+      api_base: http://127.0.0.1:8081
+      api_key: os.environ/STRATA_API_KEY
+      drop_params: true
+    model_info:
+      mode: chat
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      supports_reasoning: true
+      supports_output_config: true
+      supports_adaptive_thinking: true
+      capabilities:
+        effort:
+          supported: true
+          low: {supported: true}
+          medium: {supported: true}
+          high: {supported: true}
+          xhigh: {supported: true}
+          max: {supported: true}
+litellm_settings:
+  drop_params: true
