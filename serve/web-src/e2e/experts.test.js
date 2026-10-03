@@ -1,4 +1,4 @@
-// The Memory tab against a fake server: bun run e2e
+// The Experts tab against a fake server: bun run e2e
 import {test, expect, beforeAll, afterAll} from "bun:test";
 import {fakeServer, browser, open} from "./harness.js";
 
@@ -7,16 +7,20 @@ beforeAll(async () => { srv = fakeServer(); b = await browser(); });
 afterAll(async () => { await b?.close(); srv?.stop(); });
 
 test("the cache's share of the experts against the share of the lookups it answers", async () => {
-  const {page, errors} = await open(b, srv.url, {hash: "#memory"});
+  const {page, errors} = await open(b, srv.url, {hash: "#memory"});   // the tab's old name still lands
   await page.waitForSelector(".layers .bar");
+  expect(await page.evaluate(() => location.hash)).toBe("#experts");
   const lead = await page.textContent(".lead");
   expect(lead).toContain("36.5%");                   // 8,980 expert_slots of 48 x 512 (the profile)
   expect(lead).toContain("88.9%");                   // the last request's hit rate
   expect(lead).toContain("2.4×");
   expect(await page.$$eval(".layers .bar", (b) => b.length)).toBe(48);
   expect(await page.$$eval(".chart .bar", (b) => b.length)).toBe(srv.state.metrics.requests.filter((r) => r.hit_rate != null).length);
+  const top = () => page.$eval(".layers .bars", (e) => e.getBoundingClientRect().top);
+  const before = await top();
   await page.hover(".layers .bar >> nth=28");
   expect(await page.textContent(".layers .head")).toContain("Layer 28");
+  expect(await top()).toBe(before);                  // the bars stay put under the pointer
   expect(await page.textContent(".tiers")).toContain("PLE n-gram table");
   expect(errors).toEqual([]);
 }, 30000);
@@ -25,7 +29,7 @@ test("an engine that reports its expert usage: measured shares, per layer, the m
   const {usageReport} = await import("./harness.js");
   srv.state.experts = {available: true, layers: 48, experts: 512, now: usageReport(8980, 2), before: usageReport(8980, 1), at: 1};
   try {
-    const {page, errors} = await open(b, srv.url, {hash: "#memory"});
+    const {page, errors} = await open(b, srv.url, {hash: "#experts"});
     await page.waitForSelector(".usage canvas");
     const lead = await page.textContent(".lead");
     expect(lead).toContain("36.5%");                 // the residency bits: 8,980 of 24,576

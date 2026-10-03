@@ -18,8 +18,13 @@
 
 <style>
   .layers { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-  .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: var(--fs-s); color: var(--dim); min-height: 16px; }
-  .head strong { color: var(--value); font-weight: var(--fw-b); font-size: var(--fs-m); }
+  /* one line of a fixed height, so the bars do not move when the pointer names a layer */
+  .head { display: flex; align-items: baseline; gap: 10px; height: 18px; line-height: 18px; font-size: var(--fs-s); color: var(--dim);
+          white-space: nowrap; overflow: hidden; }
+  .head > * { overflow: hidden; text-overflow: ellipsis; }
+  .head span { flex: none; }
+  .head span:only-child { flex: 1; }
+  .head strong { min-width: 0; color: var(--value); font-weight: var(--fw-b); font-size: var(--fs-m); }
   .bars { display: flex; align-items: flex-end; gap: 2px; height: 90px; padding: 4px; background: var(--chart); border-radius: 2px; }
   .bar { flex: 1; min-width: 1px; background: var(--value); opacity: .75; border-radius: 1px 1px 0 0; }
   .bar.on { opacity: 1; }

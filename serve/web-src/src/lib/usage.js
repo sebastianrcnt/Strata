@@ -24,7 +24,7 @@ export function since(now, before) {
   return {vram: d(now.vram, before.vram), gpu: d(now.gpu, before.gpu), cpu: d(now.cpu, before.cpu), held: now.held};
 }
 
-// the numbers the Memory tab shows, from one set of counts
+// the numbers the Experts tab shows, from one set of counts
 export function summarize(u, layers, experts) {
   const n = layers * experts;
   let vram = 0, gpu = 0, cpu = 0, held = 0, used = 0;

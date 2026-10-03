@@ -1,11 +1,13 @@
 // Page-level state: the tab, the theme and the toasts.
 import {store} from "./storage.js";
 
-export const TABS = ["chat", "monitor", "memory", "about"];
+export const TABS = ["chat", "monitor", "experts", "about"];
+const RENAMED = {memory: "experts"};   // old links still land
 export const ui = $state({tab: "monitor", theme: document.documentElement.dataset.theme || "dark", toasts: []});
 
 // ------------------------------------------------------------------ tabs (the URL hash keeps the tab across reloads)
 export function showTab(name, chatOn) {
+  name = RENAMED[name] || name;
   const tab = TABS.includes(name) && (name !== "chat" || chatOn) ? name : chatOn ? "chat" : "monitor";
   ui.tab = tab;
   const hash = tab === (chatOn ? "chat" : "monitor") ? "" : `#${tab}`;

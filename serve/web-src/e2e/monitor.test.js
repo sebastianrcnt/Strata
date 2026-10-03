@@ -8,11 +8,11 @@ afterAll(async () => { await b?.close(); srv?.stop(); });
 
 test("web_chat false: no Chat tab, #chat lands on the Monitor, arrow keys move between tabs", async () => {
   const {page, errors} = await open(b, srv.url, {hash: "#chat"});
-  expect(await page.$$eval("[role=tab]", (t) => t.map((x) => x.textContent))).toEqual(["Monitor", "Memory", "Setup"]);
+  expect(await page.$$eval("[role=tab]", (t) => t.map((x) => x.textContent))).toEqual(["Monitor", "Experts", "Setup"]);
   expect(await page.$eval("[role=tab][data-state=active]", (t) => t.textContent)).toBe("Monitor");
   await page.focus("#tab-btn-monitor");
   await page.keyboard.press("ArrowRight");
-  expect(await page.$eval("[role=tab][data-state=active]", (t) => t.textContent)).toBe("Memory");
+  expect(await page.$eval("[role=tab][data-state=active]", (t) => t.textContent)).toBe("Experts");
   expect(errors).toEqual([]);
 }, 30000);
 
@@ -72,6 +72,7 @@ test("now: the rows stay put; generating fills them, idle keeps the last request
   await sleep(600);
   expect(await page.textContent(".panel h2 >> nth=0")).toBe("Thinking");
   expect(await page.textContent(".tape")).toContain("hello world");
+  expect(await page.$$eval(".tape .piece", (x) => x.length)).toBeGreaterThan(0);   // each piece settles on its own
   expect(await page.textContent(".bar__status, header.bar")).toContain("51.5");
   expect(await height()).toBe(idle);
   srv.state.stream = {...srv.state.stream, state: "idle", request: null, tail: ""};

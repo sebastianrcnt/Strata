@@ -1,5 +1,5 @@
 <script>
-  // The Memory tab: how well the VRAM expert cache works, and where the model's parts live. With an engine that reports
+  // The Experts tab: how well the VRAM expert cache works, and where the model's parts live. With an engine that reports
   // its expert usage (GET /experts) every number is measured: lookups per expert by where they ran, and what the
   // cache holds now. Without it the cache's share and spread come from the expert profile (web/expert-profile.js,
   // built from data/expert-profile.bin) and the hit rates from the requests in /metrics.
@@ -19,9 +19,9 @@
   let requests = $state.raw([]);   // every request the server keeps (the 1-a-second poll carries only the last 12)
   let usage = $state.raw(null);    // {layers, experts, now, before} decoded, or null: the engine does not report it
   let usageAt = 0;
-  let scope = $state(store.get("memory.scope", "start"));
-  let layout = $state(store.get("memory.layout", "id"));
-  $effect(() => { store.set("memory.scope", scope); store.set("memory.layout", layout); });
+  let scope = $state(store.get("experts.scope", "start"));
+  let layout = $state(store.get("experts.layout", "id"));
+  $effect(() => { store.set("experts.scope", scope); store.set("experts.layout", layout); });
 
   async function load() {
     try {
@@ -75,7 +75,7 @@
   });
 </script>
 
-<div class="memory">
+<div class="experts">
   <Panel title="Expert cache" lamp={d.hit != null ? "value" : ""}>
     {#snippet tools()}
       {#if usage}<Segmented bind:value={scope} label="Counted over" options={[["start", "Since start"], ["last", "Last request"]]} />{/if}
@@ -189,8 +189,8 @@
 </div>
 
 <style>
-  .memory { display: flex; flex-direction: column; gap: var(--pgap); padding: var(--pgap); }
-  .memory > :global(*) { flex: none; }
+  .experts { display: flex; flex-direction: column; gap: var(--pgap); padding: var(--pgap); }
+  .experts > :global(*) { flex: none; }
   .lead { margin: 2px 0 12px; font-size: var(--fs-l); color: var(--dim); line-height: 1.4; }
   .lead b { color: var(--text); font-weight: var(--fw-b); }
   .lead b.v, .cmp__v.v { color: var(--value); }

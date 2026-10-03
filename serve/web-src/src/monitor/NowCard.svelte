@@ -39,11 +39,24 @@
 
   // ------------------------------------------------------------------ the output tape
   // The server sends the last 4,096 characters; new characters are let out over a few frames so the tape moves
-  // smoothly at 5 polls a second.
+  // smoothly at 5 polls a second. Each piece let out is its own span on the tape: it comes in bright and settles to
+  // the dim of the rest (a CSS animation; the tape holds a few dozen at most).
   const previewUnicode = (text) => text.replace(/(?:\\u[0-9a-fA-F]{4})+/g, (part) => {
     try { return JSON.parse('"' + part + '"'); } catch (_) { return part; }
   });
   let shown = $state(""), fresh = $state("");
+  let pieces = $state([]), pieceId = 0;   // the tape: [{id, text}], whitespace flattened, the last TAPE characters
+  const TAPE = 200;
+  function addPiece(raw) {
+    const last = pieces[pieces.length - 1];
+    let text = raw.replace(/\s+/g, " ");
+    if (last && last.text.endsWith(" ") && text.startsWith(" ")) text = text.slice(1);
+    if (!text) return;
+    const next = [...pieces, {id: ++pieceId, text}];
+    let len = 0, i = next.length;
+    while (i > 0 && len < TAPE) len += next[--i].text.length;
+    pieces = next.slice(i);
+  }
   let request = null, tail = "", pending = "", frame = 0, tick = 0;
   function animate(now) {
     frame = 0;
@@ -53,6 +66,7 @@
     const n = Math.min(chars.length, Math.max(1, Math.ceil(chars.length * dt / 180)));
     fresh = chars.slice(0, n).join("");
     pending = chars.slice(n).join("");
+    addPiece(fresh);
     shown = (shown + fresh).slice(-4096);
     if (pending) frame = requestAnimationFrame(animate); else tick = 0;
   }
@@ -60,13 +74,13 @@
     const st = s;
     if (st.state !== "reading" && st.state !== "generating") {   // between requests: keep the last tape, settled
       cancelAnimationFrame(frame);
-      if (pending) shown = (shown + pending).slice(-4096);
+      if (pending) { shown = (shown + pending).slice(-4096); addPiece(pending); }
       frame = 0; tick = 0; tail = ""; pending = ""; fresh = "";
       return;
     }
     if (st.request !== request) {                                  // a new request: a new tape
       cancelAnimationFrame(frame);
-      frame = 0; tick = 0; tail = ""; pending = ""; shown = ""; fresh = ""; request = st.request;
+      frame = 0; tick = 0; tail = ""; pending = ""; shown = ""; fresh = ""; pieces = []; request = st.request;
       if (st.state === "reading") prompt = "";
     }
     if (st.state !== "generating") return;
@@ -80,9 +94,8 @@
   });
   $effect(() => () => cancelAnimationFrame(frame));
 
-  const flat = (x) => x.replace(/\s+/g, " ");
-  const tapeNew = $derived(flat(fresh).slice(-80));
-  const tapeOld = $derived.by(() => { const v = flat(shown).slice(-160); return v.slice(0, Math.max(0, v.length - tapeNew.length)); });
+  // the open output panel: only its newest piece fades in (it can hold thousands of pieces)
+  const before = $derived(shown.slice(0, shown.length - fresh.length));
 
   let openInput = $state(false), openOutput = $state(false);
   let outputPanel = $state();
@@ -122,16 +135,16 @@
     <button class="row__label" aria-expanded={openOutput} onclick={() => (openOutput = !openOutput)}><span class="tri" class:open={openOutput}></span>Output</button>
     <div class="tape-window">
       <div class="tape" class:settled={!generating}>
-        {#if generating}<span>{tapeOld}</span><span class="tape__new">{tapeNew}</span><i class="tape__cursor"></i>
+        {#if generating}{#each pieces as p (p.id)}<span class="piece">{p.text}</span>{/each}<i class="tape__cursor"></i>
         {:else if reading}<span>waiting for the input to be read</span>
-        {:else if shown}<span>{tapeOld}{tapeNew}</span>
+        {:else if shown}{#each pieces as p (p.id)}<span>{p.text}</span>{/each}
         {:else}<span>waiting for a request</span>{/if}
       </div>
     </div>
     <span class="row__end"></span>
   </div>
   {#if openOutput}
-    <pre class="text" bind:this={outputPanel}>{generating || (!reading && shown) ? shown : reading ? "Waiting for the input to be read" : "Waiting for a request"}</pre>
+    <pre class="text" bind:this={outputPanel}>{#if generating}{before}{#key pieces.at(-1)?.id}<span class="piece">{fresh}</span>{/key}{:else}{!reading && shown ? shown : reading ? "Waiting for the input to be read" : "Waiting for a request"}{/if}</pre>
   {/if}
 </Panel>
 
@@ -152,8 +165,12 @@
   .tape-window { position: relative; min-width: 0; height: 20px; overflow: hidden;
                  mask-image: linear-gradient(to right, transparent, black 15%, black); }
   .tape { position: absolute; right: 0; top: 0; width: max-content; white-space: pre; font: var(--fs-m)/20px var(--mono); color: var(--dim); }
-  .tape__new { color: var(--text); }
-  .tape.settled, .tape.settled .tape__new { color: var(--off); }
+  .tape.settled { color: var(--off); }
+  /* new output comes in bright (a touch of the accent) and settles to the dim of the rest */
+  .piece { animation: settle 1.4s ease-out both; }
+  .text .piece { --rest: var(--text); }
+  @media (prefers-reduced-motion: reduce) { .piece { animation: none; } }
+  @keyframes settle { from { color: var(--value); } 20% { color: var(--text); } to { color: var(--rest, var(--dim)); } }
   .tape__cursor { display: inline-block; width: 2px; height: 13px; margin-left: 3px; vertical-align: middle; background: var(--accent);
                   animation: blink .8s ease-in-out infinite alternate; }
   .text { margin: 0; height: 160px; overflow: auto; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere;

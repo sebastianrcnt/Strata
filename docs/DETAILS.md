@@ -890,12 +890,12 @@ then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without
 
 ### The web app
 
-The page at `/` has Chat, Monitor, Memory and Setup tabs. `"web_chat": false` in `strata-<model>.json` (or
+The page at `/` has Chat, Monitor, Experts and Setup tabs. `"web_chat": false` in `strata-<model>.json` (or
 `serve/server.py --no-web-chat`) hides the Chat tab and opens the page on the Monitor; the API is unchanged, and
 Setup keeps **Defaults for other apps** (the server-wide sampling defaults, `GET`/`POST /settings`). Its source is
 `serve/web-src` (Svelte, built with Bun and Vite into `serve/web`; see `serve/web-src/README.md`).
 
-**Memory** shows how well the VRAM expert cache works. The engine counts, per (layer, expert), the routed lookups
+**Experts** shows how well the VRAM expert cache works. The engine counts, per (layer, expert), the routed lookups
 the VRAM cache served, those computed on a GPU from outside it (over PCIe or on another card) and those the CPU
 computed, in memory only, and after every request reports them with what the cache holds now (a `USAGE` line beside
 `CACHE`); `GET /experts` serves the last two reports, so the page shows the counts since the engine started or for the

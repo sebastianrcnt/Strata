@@ -36,7 +36,7 @@
       ["Output tokens", fmt(r.output_tokens) + (r.engine_generated != null && r.engine_generated !== r.output_tokens ? ` (engine generated ${fmt(r.engine_generated)})` : "")],
       ["Decode", `${fmt(r.decode_tok_s, 1)} tok/s${r.decode_ms != null ? ` over ${fmt(r.decode_ms / 1000, 1)} s` : ""}`],
       ["MTP drafts accepted", r.drafts_offered ? `${fmt(r.drafts_accepted)} of ${fmt(r.drafts_offered)} · ${pctOf(r.drafts_accepted, r.drafts_offered)}` : null],
-      ["Expert cache hit", r.hit_rate == null ? null : `${(r.hit_rate * 100).toFixed(1)}% of the expert lookups were in VRAM while writing (the Memory tab has the rest)`],
+      ["Expert cache hit", r.hit_rate == null ? null : `${(r.hit_rate * 100).toFixed(1)}% of the expert lookups were in VRAM while writing (the Experts tab has the rest)`],
       ["Experts read from disk", r.file_blobs ? `${fmt(r.file_blobs)} (${fmt(r.file_mb, 1)} MB) · RAM ${fmt(r.ram_blobs)}` : null],
       ["Duration", `${fmt(r.duration_s, 2)} s`],
     ].filter((x) => x[1] != null);

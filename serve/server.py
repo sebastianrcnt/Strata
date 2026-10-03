@@ -233,7 +233,7 @@ class StrataEngine:
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
-        self.usage = None                # USAGE lines: the expert usage now and before the last request (Memory tab)
+        self.usage = None                # USAGE lines: the expert usage now and before the last request (Experts tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
@@ -285,7 +285,7 @@ class StrataEngine:
             if line.startswith("CACHE "):               # local: the conversation cache report (Monitor)
                 self._parse_cache(line)
                 continue
-            if line.startswith("USAGE "):               # local: the expert usage counters (Memory tab)
+            if line.startswith("USAGE "):               # local: the expert usage counters (Experts tab)
                 self._parse_usage(line)
                 continue
             lines.put(line)
@@ -2198,7 +2198,7 @@ def make_handler(svc: Service):
                                                           "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
                 return
             if path == "/experts":
-                # the expert usage counters (engines that report USAGE lines): the web app's Memory tab
+                # the expert usage counters (engines that report USAGE lines): the web app's Experts tab
                 if self._authorized():
                     usage = getattr(svc.engine, "usage", None)
                     self._json(200, {"available": True, **usage} if usage else {"available": False})

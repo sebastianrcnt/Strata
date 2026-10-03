@@ -1,4 +1,4 @@
-// The expert profile and the cache numbers for the Memory tab. data/expert-profile.bin ranks every (layer, expert)
+// The expert profile and the cache numbers for the Experts tab. data/expert-profile.bin ranks every (layer, expert)
 // pair of the model, most used first; the engine fills its VRAM expert cache with the first `expert_slots` pairs
 // when it starts (then swaps a few toward the conversation without reporting which).
 
