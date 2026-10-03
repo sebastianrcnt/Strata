@@ -1080,7 +1080,43 @@ poll();
 
 
 // A small current-only preview, also covering requests from other API clients.
-let streamRequest = null, streamTail = "";
+let streamRequest = null, streamTail = "", streamDisplay = "", streamPending = "", streamFrame = 0, streamTick = 0;
+// Decode escaped Unicode only in the monitor preview, preserving API output verbatim.
+function previewUnicode(text) {
+  return text.replace(/(?:\\u[0-9a-fA-F]{4})+/g, part => {
+    try { return JSON.parse('"' + part + '"'); } catch (_) { return part; }
+  });
+}
+document.querySelectorAll(".stream-expand").forEach(button => {
+  button.onclick = () => {
+    const expanded = button.getAttribute("aria-expanded") !== "true";
+    button.setAttribute("aria-expanded", String(expanded));
+    button.textContent = `${expanded ? "▾" : "▸"} ${button.dataset.expand === "prefill" ? "Prefill" : "Decode"}`;
+    $(button.dataset.expand === "prefill" ? "current-prefill-text" : "current-decode-text").hidden = !expanded;
+  };
+});
+function paintStream(fresh = "") {
+  const visible = streamDisplay.slice(-160).replace(/\s+/g," ");
+  const bright = fresh.replace(/\s+/g," ").slice(-80);
+  $("current-stream-old").textContent = visible.slice(0, Math.max(0, visible.length-bright.length));
+  $("current-stream-new").textContent = bright;
+  const panel = $("current-decode-text");
+  const follow = panel.scrollHeight-panel.scrollTop-panel.clientHeight < 24;
+  panel.textContent = streamDisplay;
+  if(follow) panel.scrollTop = panel.scrollHeight;
+}
+function animateStream(now) {
+  streamFrame = 0;
+  if(tab !== "monitor" || !trackLive || document.hidden) { streamTick = 0; return; }
+  const dt = Math.min(40, streamTick ? now-streamTick : 16); streamTick = now;
+  const chars = Array.from(streamPending);
+  const n = Math.min(chars.length, Math.max(1, Math.ceil(chars.length*dt/180)));
+  const fresh = chars.slice(0,n).join("");
+  streamPending = chars.slice(n).join(""); streamDisplay = (streamDisplay+fresh).slice(-4096);
+  paintStream(fresh);
+  if(streamPending) streamFrame = requestAnimationFrame(animateStream);
+  else streamTick = 0;
+}
 function renderCurrentStream(s) {
   const reading = s.state === "reading", generating = s.state === "generating";
   $("current-stream-phase").textContent = reading ? "Prefill" : generating ? (s.phase === "thinking" ? "Thinking" : s.phase === "answering" ? "Answer" : s.phase || "Decode") : "Idle";
@@ -1088,31 +1124,26 @@ function renderCurrentStream(s) {
   $("current-prefill").classList.toggle("indeterminate", reading && !known);
   $("current-prefill-bar").style.width = known ? `${Math.min(100,100*s.prompt_read/s.prompt_total)}%` : generating ? "100%" : "0%";
   $("current-prefill-count").textContent = known ? `${kfmt(s.prompt_read)} / ${kfmt(s.prompt_total)}` : reading ? (s.prompt_tokens ? `${kfmt(s.prompt_tokens)} tokens` : "Preparing") : generating ? "Done" : "–";
+  $("current-prefill-text").textContent = reading || generating ? previewUnicode(s.prompt_preview || "Preparing input…") : "Waiting for a request";
   $("current-stream-rate").textContent = generating && s.tok_s != null ? `${fmt(s.tok_s,1)} t/s` : "–";
-  const cursor = document.querySelector(".current-stream-cursor");
-  cursor.hidden = !generating;
+  document.querySelector(".current-stream-cursor").hidden = !generating;
+  if(s.request !== streamRequest || !generating) {
+    if(streamFrame) cancelAnimationFrame(streamFrame);
+    streamFrame = 0; streamTick = 0; streamTail = ""; streamDisplay = ""; streamPending = ""; streamRequest = s.request;
+    paintStream();
+  }
   if(!generating) {
-    streamRequest = s.request; streamTail = "";
     $("current-stream-old").textContent = reading ? "Waiting for prefill" : "Waiting for a request";
-    $("current-stream-new").textContent = "";
+    $("current-decode-text").textContent = $("current-stream-old").textContent;
     return;
   }
-  if(s.request !== streamRequest) { streamRequest = s.request; streamTail = ""; }
-  const tail = s.tail || "";
-  if(tail === streamTail) return;
-  let overlap = Math.min(streamTail.length,tail.length);
-  while(overlap > 0 && !tail.startsWith(streamTail.slice(-overlap))) overlap--;
-  const fresh = tail.slice(overlap).slice(-80).replace(/\s+/g," ");
-  const visible = tail.slice(-160).replace(/\s+/g," ");
-  $("current-stream-old").textContent = fresh ? visible.slice(0,Math.max(0,visible.length-fresh.length)) : visible;
-  $("current-stream-new").textContent = fresh;
-  streamTail = tail;
-  const tape = $("current-stream-tape");
-  tape.getAnimations().forEach(a=>a.cancel());
-  if(!matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    const distance = Math.min(80,$("current-stream-new").getBoundingClientRect().width);
-    tape.animate([{transform:`translateX(${distance}px)`},{transform:"translateX(0)"}],{duration:190,easing:"linear"});
+  const tail = previewUnicode(s.tail || "");
+  if(tail !== streamTail) {
+    let overlap = Math.min(streamTail.length, tail.length);
+    while(overlap > 0 && !tail.startsWith(streamTail.slice(-overlap))) overlap--;
+    streamPending = (streamPending + tail.slice(overlap)).slice(-4096); streamTail = tail;
   }
+  if(streamPending && !streamFrame) streamFrame = requestAnimationFrame(animateStream);
 }
 async function pollCurrentStream() {
   if(tab === "monitor" && trackLive && !document.hidden) {

@@ -1088,12 +1088,13 @@ class WebApp(unittest.TestCase):
             self.assertEqual(self.get("/api/current-stream")[0], 401)
             with svc.status_lock:
                 svc.status.update(busy=True, started=123, first_token=time.time(),
-                                  generated=8, phase="thinking", tail="x" * 900, prompt_tokens=42)
+                                  generated=8, phase="thinking", tail="한" * 5000, prompt_tokens=42, prompt_preview="입력 내용")
             headers = {"Authorization": "Bearer stream-key"}
             code, _, body = self.get("/api/current-stream", headers)
             self.assertEqual(code, 200)
             stream = json.loads(body)
-            self.assertEqual(stream["tail"], "x" * 600)
+            self.assertEqual(stream["tail"], "한" * 4096)
+            self.assertEqual(stream["prompt_preview"], "입력 내용")
             self.assertEqual(stream["phase"], "thinking")
             self.assertEqual(stream["request"], 123)
             self.assertNotIn("tail", json.loads(self.get("/metrics", headers)[2])["live"])
@@ -1105,6 +1106,7 @@ class WebApp(unittest.TestCase):
             idle = json.loads(self.get("/api/current-stream", headers)[2])
             self.assertEqual(idle["tail"], "")
             self.assertIsNone(idle["request"])
+            self.assertEqual(idle["prompt_preview"], "")
         finally:
             svc.api_key = key
             with svc.status_lock:

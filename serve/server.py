@@ -1125,7 +1125,8 @@ class Service:
         return {"state": "reading" if reading else "generating" if busy else "idle",
                 "request": s.get("started") if busy else None,
                 "phase": s.get("phase") if busy else None,
-                "tail": str(s.get("tail") or "")[-600:] if busy and not reading else "",
+                "tail": str(s.get("tail") or "")[-4096:] if busy and not reading else "",
+                "prompt_preview": s.get("prompt_preview", "") if busy else "",
                 "generated": s.get("generated", 0) if busy else 0,
                 "prompt_tokens": s.get("prompt_tokens") if busy else None,
                 "prompt_read": progress[0] if progress else None,
@@ -1279,7 +1280,7 @@ class Service:
                     s["phase"], s["tool"] = f"writing a tool call: {ev.call.name}", ev.call.name
                 elif ev.kind == "tool_call":
                     s["phase"] = "tool call complete"
-                s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-600:]
+                s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-4096:]
 
     def _progress(self, last_print, every=1.0):
         """A progress line in the server window every `every` seconds while a request runs."""
@@ -1328,10 +1329,11 @@ class Service:
                         self.status["queued"] -= 1
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     self.ensure_loaded()
+                    prompt_preview = self.tok.decode(ids[-1024:])[-4096:]
                     with self.status_lock:
                         self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                            generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                           max_tokens=max_new)
+                                           max_tokens=max_new, prompt_preview=prompt_preview)
                         self.last_request_at = time.time()
                         self.rate.clear()               # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
@@ -1460,6 +1462,7 @@ class Service:
                         self.status["busy"] = False
                         self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
                         self.status.pop("tool", None)
+                        self.status.pop("prompt_preview", None)
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
