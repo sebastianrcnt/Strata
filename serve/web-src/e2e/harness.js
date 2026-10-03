@@ -50,8 +50,8 @@ export async function browser() {
 }
 
 // a page that records errors; `scheme` is the system theme it pretends to have
-export async function open(b, url, {width = 1440, height = 900, scheme = "dark", hash = ""} = {}) {
-  const ctx = await b.newContext({viewport: {width, height}, colorScheme: scheme});
+export async function open(b, url, {width = 1440, height = 900, scheme = "dark", hash = "", phone = false} = {}) {
+  const ctx = await b.newContext({viewport: {width, height}, colorScheme: scheme, ...(phone ? {hasTouch: true, isMobile: true} : {})});
   const page = await ctx.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));

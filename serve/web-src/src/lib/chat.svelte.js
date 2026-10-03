@@ -5,7 +5,7 @@ import {fmt} from "./format.js";
 import {toast} from "./ui.svelte.js";
 import {server, headers, projectionLoaded} from "./server.svelte.js";
 
-export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: false};
 
 class Chat {
   settings = $state({...DEFAULTS, ...store.get("sampling", {})});
@@ -106,8 +106,18 @@ export async function send(question) {
   if (s.mcp !== false && server.mcp.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
   // the stream is gathered here and handed to the view once per frame
-  let text = "", reasoning = "", firstAt = null, thinkStart = null, usage = null, frame = 0;
-  const paint = () => { frame = 0; m.text = text; m.reasoning = reasoning; };
+  // m.live while it streams: the tokens so far (one per streamed piece) and the rate over the last two seconds
+  const sentAt = performance.now();
+  let text = "", reasoning = "", firstAt = null, thinkStart = null, usage = null, frame = 0, pieces = 0;
+  const recent = [];
+  const paint = () => {
+    frame = 0; m.text = text; m.reasoning = reasoning;
+    if (!pieces) return;
+    const now = performance.now();
+    while (recent.length > 1 && now - recent[0] > 2000) recent.shift();
+    const span = (now - recent[0]) / 1000;
+    m.live = {tokens: pieces, tok_s: recent.length > 1 && span > .25 ? (recent.length - 1) / span : null};
+  };
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
                                                    signal: controller.signal});
@@ -137,6 +147,7 @@ export async function send(question) {
         if (j.strata_mcp) { paint(); onTool(m, j.strata_mcp, text.length, reasoning.length); }
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
+        if (d.reasoning_content || d.content) { pieces++; recent.push(performance.now()); }
         if (d.reasoning_content) {
           if (!firstAt) firstAt = performance.now();
           if (!thinkStart) thinkStart = performance.now();
@@ -163,7 +174,8 @@ export async function send(question) {
   let meta = "";
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+    meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""} · first token after ${fmt((firstAt - sentAt) / 1000, 1)} s` +
+           `${m.stopped ? " · stopped" : ""}` +
            (projectionLoaded() ? (s.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
     meta = "Stopped";
@@ -173,11 +185,26 @@ export async function send(question) {
   if (ran) meta = `${meta ? `${meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
   if (m.limit) meta = `${meta} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
   m.meta = meta;
+  m.live = null;
   chat.busy = null;
   saveChat();
   return true;
 }
 export const stop = () => chat.busy?.controller.abort();
+
+// the last question again, for a new answer (its pictures only while this page still holds them)
+export function retry() {
+  if (chat.busy) return;
+  const i = chat.messages.findLastIndex((m) => m.role === "user");
+  if (i < 0) return;
+  const q = chat.messages[i];
+  const attachments = [...(q.images || []).filter((x) => x.url).map((x) => ({kind: "image", ...x})),
+                       ...(q.files || []).filter((f) => f.text != null).map((f) => ({kind: "file", ...f}))];
+  if (!q.text?.trim() && !attachments.length) return;
+  chat.messages = chat.messages.slice(0, i);
+  chat.attachments = attachments;
+  send(q.text || "");
+}
 
 export function newChat() {
   if (chat.busy) { toast("warn", "Still writing", "Stop the answer first."); return; }

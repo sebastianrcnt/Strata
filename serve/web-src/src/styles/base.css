@@ -1,6 +1,6 @@
 /* Page base, shared text helpers and the few classes that raw HTML (the chat's Markdown) needs. */
 *, *::before, *::after { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; }
+html, body { height: var(--page-h, 100%); margin: 0; }
 body { display: flex; flex-direction: column; overflow: hidden; background: var(--gap); color: var(--text);
        font: var(--fw) var(--fs-m)/1.4 var(--font); font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased; }
 #app { flex: 1; min-height: 0; display: flex; flex-direction: column; }

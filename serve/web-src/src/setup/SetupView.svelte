@@ -1,6 +1,6 @@
 <script>
   import {server, auth, setKey} from "../lib/server.svelte.js";
-  import {ui, setTheme} from "../lib/ui.svelte.js";
+  import {ui, setTheme, setChatHere} from "../lib/ui.svelte.js";
   import {fmt, gb} from "../lib/format.js";
   import Panel from "../ui/Panel.svelte";
   import Facts from "../ui/Facts.svelte";
@@ -55,6 +55,10 @@
              bind:value={key} onchange={() => setKey(key)}>
     </div>
     <Check id="dark-theme" checked={ui.theme === "dark"} onchange={(v) => setTheme(v ? "dark" : "light", true)} label="Dark theme" />
+    {#if server.health.web_chat === false}
+      <Check id="chat-here" checked={ui.chatHere} onchange={setChatHere} label="Show Chat on this device"
+             hint="the server keeps it off elsewhere; for a quick demo" />
+    {/if}
     <p class="muted small">Chats, settings and the key are kept in this browser only.
       <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a></p>
   </Panel>
@@ -68,5 +72,6 @@
   .input:focus { outline: none; box-shadow: inset 0 0 0 1.5px var(--value); }
   .input.needed { box-shadow: inset 0 0 0 1.5px var(--accent); }
   p.small { margin: 12px 0 0; }
+  .setup :global(.check + .check) { margin-top: 8px; }
   @media (max-width: 800px) { .setup { grid-template-columns: 1fr; } }
 </style>

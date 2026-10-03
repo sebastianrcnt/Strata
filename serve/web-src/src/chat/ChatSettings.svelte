@@ -1,7 +1,7 @@
 <script>
   // This chat's own thinking and sampling settings (kept in this browser), in a side sheet. Server-wide defaults
   // for other apps are in Setup.
-  import {chat, saveSettings, DEFAULTS} from "../lib/chat.svelte.js";
+  import {chat, saveSettings, exportChat, DEFAULTS} from "../lib/chat.svelte.js";
   import {server, projectionLoaded} from "../lib/server.svelte.js";
   import {toast} from "../lib/ui.svelte.js";
   import {fmt} from "../lib/format.js";
@@ -35,6 +35,7 @@
     <Check id="chat-mcp" checked={draft.mcp !== false} onchange={(v) => (draft.mcp = v)} label="Use tools from MCP servers"
            hint={tools ? `${fmt(tools)} tools from ${readyNames.join(", ")}; the model calls them when it decides to` : "no server is connected yet (see the Monitor)"} />
   {/if}
+  <Button icon="download" onclick={exportChat} disabled={!chat.messages.length}>Save this chat as Markdown</Button>
   <p class="muted small">Only this page's chat uses these. Defaults for other apps (omp, Pi, scripts) are under Setup.</p>
   <div class="actions">
     <Button onclick={() => (draft = {...DEFAULTS})}>Reset</Button>

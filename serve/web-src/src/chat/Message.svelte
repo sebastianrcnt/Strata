@@ -1,18 +1,26 @@
 <script>
-  import {chat} from "../lib/chat.svelte.js";
+  import {chat, retry} from "../lib/chat.svelte.js";
+  import {server} from "../lib/server.svelte.js";
   import {answerParts} from "../lib/markdown.js";
   import {fmt} from "../lib/format.js";
   import {copyText} from "../lib/ui.svelte.js";
   import Icon from "../ui/Icon.svelte";
   import ToolCall from "./ToolCall.svelte";
 
-  let {m, streaming = false} = $props();
+  let {m, streaming = false, last = false} = $props();
 
-  const time = (t) => new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hourCycle: "h23"});
   const thinkingNow = $derived(streaming && !m.text);
   // open while it streams (if wanted), closed once the answer starts - unless the user toggled it themselves
   const thinkOpen = $derived(m.thinkTouched ? !!m.thinkOpen : thinkingNow && chat.settings.show);
   const parts = $derived(m.role === "assistant" && !m.error ? answerParts(m) : []);
+  // before the first token: what the engine is busy with (one engine: another request may be ahead of this one)
+  const waiting = $derived.by(() => {
+    const l = server.metrics?.live || {};
+    if (l.queued > 0 && (l.state === "reading" || l.state === "generating")) return "Waiting for another request to finish";
+    if (l.state === "reading") return l.prompt_total ? `Reading the input · ${fmt(l.prompt_read)} / ${fmt(l.prompt_total)}` : "Reading the input";
+    return "Sending";
+  });
+  const liveMeta = $derived(m.live ? `${fmt(m.live.tokens)} tokens${m.live.tok_s != null ? ` · ${fmt(m.live.tok_s, 1)} tok/s` : ""}` : "");
 
   function onAnswerClick(e) {
     const b = e.target.closest("[data-code-copy]");
@@ -31,7 +39,6 @@
       </div>
     {/if}
     <div class="bubble">{m.text}</div>
-    <div class="meta">You · {time(m.time)}</div>
   </div>
 {:else}
   <div class="msg msg--assistant">
@@ -47,14 +54,15 @@
       {#if m.error}
         <div class="msg-error">{m.error}</div>
       {:else if !m.text && streaming && !m.tools?.length}
-        {#if m.reasoning}<span class="muted cursor">Writing</span>{:else}<span class="cursor"></span>{/if}
+        {#if m.reasoning}<span class="muted cursor">Writing</span>{:else}<span class="muted cursor">{waiting}</span>{/if}
       {:else}
         {#each parts as p}{#if p.tool}<ToolCall t={p.tool} />{:else}{@html p.html}{/if}{/each}
       {/if}
     </div>
     <div class="meta">
-      <span>{m.meta || (streaming ? "" : m.stopped ? "Stopped" : "")}</span>
+      <span class:live={streaming}>{streaming ? liveMeta : m.meta || (m.stopped ? "Stopped" : "")}</span>
       {#if !streaming && m.text}<button class="iconbtn" aria-label="Copy the answer" title="Copy" onclick={() => copyText(m.text)}><Icon name="copy" small /></button>{/if}
+      {#if last && !streaming && !chat.busy}<button class="iconbtn" aria-label="Answer again" title="Answer again" onclick={retry}><Icon name="refresh" small /></button>{/if}
     </div>
   </div>
 {/if}
@@ -65,6 +73,7 @@
   .bubble { padding: 7px 11px; border-radius: var(--r); background: var(--value-tint); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
   .attached { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
   .attached img { max-width: 220px; max-height: 180px; border-radius: var(--r); }
+  .meta .live { color: var(--value); }
   .meta { display: flex; align-items: center; gap: 6px; min-height: 18px; font-size: var(--fs-s); color: var(--dim); }
   .think { border-radius: var(--r); background: var(--cell); }
   .think summary { display: flex; align-items: center; gap: 7px; height: 26px; padding: 0 8px; list-style: none; cursor: pointer;

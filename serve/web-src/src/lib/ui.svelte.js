@@ -3,7 +3,12 @@ import {store} from "./storage.js";
 
 export const TABS = ["chat", "monitor", "experts", "about"];
 const RENAMED = {memory: "experts"};   // old links still land
-export const ui = $state({tab: "monitor", theme: document.documentElement.dataset.theme || "dark", toasts: []});
+export const ui = $state({tab: "monitor", theme: document.documentElement.dataset.theme || "dark", toasts: [],
+                          chatHere: store.get("chat.here", false)});   // this device shows Chat though the server hides it
+export function setChatHere(on) {
+  ui.chatHere = on;
+  store.set("chat.here", on);
+}
 
 // ------------------------------------------------------------------ tabs (the URL hash keeps the tab across reloads)
 export function showTab(name, chatOn) {

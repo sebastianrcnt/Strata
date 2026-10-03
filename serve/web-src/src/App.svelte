@@ -10,8 +10,9 @@
   import ExpertsView from "./experts/ExpertsView.svelte";
 
   start();
-  // the server's "web_chat": false hides the Chat tab (the page then opens on the Monitor)
-  const chatOn = $derived(server.health.web_chat !== false);
+  // the server's "web_chat": false hides the Chat tab (the page then opens on the Monitor), unless this device shows it
+  // anyway (Setup: for a quick demo on a phone)
+  const chatOn = $derived(server.health.web_chat !== false || ui.chatHere);
   const tabs = $derived([
     ...(chatOn ? [{id: "chat", label: "Chat"}] : []),
     {id: "monitor", label: "Monitor"},

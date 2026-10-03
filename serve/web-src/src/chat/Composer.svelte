@@ -1,12 +1,15 @@
 <script>
   import {tick} from "svelte";
-  import {chat, send, stop, newChat, exportChat, addFiles} from "../lib/chat.svelte.js";
+  import {chat, send, stop, addFiles} from "../lib/chat.svelte.js";
   import {server} from "../lib/server.svelte.js";
   import Button from "../ui/Button.svelte";
   import Icon from "../ui/Icon.svelte";
 
   let {active, onSettings} = $props();
   let text = $state(""), input = $state(), fileInput = $state(), dragging = $state(false);
+  // a touch screen (a phone keyboard has no Shift): Enter starts a new line, the button sends, and opening the tab
+  // does not bring the keyboard up over half the screen
+  const touch = matchMedia("(hover: none)").matches;
 
   function autosize() {
     if (!input) return;
@@ -22,7 +25,7 @@
     send(t);
   }
   function keydown(e) {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !touch) { e.preventDefault(); submit(); }
   }
   function paste(e) {
     if (!server.health.images) return;
@@ -37,7 +40,7 @@
     addFiles(e.dataTransfer.files);
     input?.focus();
   }
-  $effect(() => { if (active) input?.focus(); });
+  $effect(() => { if (active && !touch) input?.focus(); });
 </script>
 
 <svelte:window ondragover={(e) => { if (active && hasFiles(e)) { e.preventDefault(); dragging = true; } }}
@@ -60,8 +63,6 @@
       <Button variant="ghost" icon="attach" aria-label="Attach a file" onclick={() => fileInput.click()}
               title={server.health.images ? "Attach a text file or a picture (or drop it here)" : "Attach a text file (or drop it here)"} />
       <input type="file" multiple hidden bind:this={fileInput} onchange={() => { addFiles(fileInput.files); fileInput.value = ""; }}>
-      <Button variant="ghost" icon="new-chat" title="New chat" aria-label="New chat" onclick={newChat} />
-      <Button variant="ghost" icon="download" title="Save this chat as Markdown" aria-label="Save this chat" onclick={exportChat} />
       <Button variant="ghost" icon="settings" title="Chat settings" aria-label="Chat settings" onclick={onSettings} />
       <span class="spacer"></span>
       {#if chat.busy}
@@ -83,6 +84,7 @@
   textarea { min-height: 40px; max-height: 40vh; padding: 4px 6px; border: 0; outline: 0; resize: none; background: transparent; font-size: 13px; line-height: 1.5; }
   .bar { display: flex; align-items: center; gap: 2px; }
   .spacer { flex: 1; }
+  @media (max-width: 640px), (hover: none) { textarea { font-size: 16px; } }   /* under 16px, iOS zooms in on focus */
   .hint { margin-right: 6px; font-size: var(--fs-s); color: var(--off); }
   .attachments { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px; }
   .attachments .iconbtn { width: 16px; height: 16px; }
