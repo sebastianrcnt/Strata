@@ -107,6 +107,8 @@
       </p>
     {/if}
     {#if S && S.all}
+      <p class="miss muted">Every routed lookup counts here, the ones copied over PCIe as misses too; the per-request hit
+        rate below leaves those out, so it reads a little higher.</p>
       <p class="miss">90% of the lookups went to <b>{fmt(S.top90)}</b> experts ({pct(S.top90 / S.n)}); the cache holds
         {fmt(S.held)}. {fmt(S.used)} of {fmt(S.n)} experts were used at all.</p>
     {/if}
