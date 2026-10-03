@@ -136,3 +136,12 @@ test("web_chat false: Setup can show Chat on this device only", async () => {
     await page.waitForSelector("[role=tab] >> text=Chat");
   } finally { srv.state.health.web_chat = true; }
 }, 30000);
+
+test("iOS: no zoom on focus (maximum-scale there only, so pinch zoom stays elsewhere)", async () => {
+  const meta = (p) => p.$eval("meta[name=viewport]", (m) => m.content);
+  const ios = await open(b, srv.url, {width: 390, phone: true,
+    userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"});
+  expect(await meta(ios.page)).toContain("maximum-scale=1");
+  const other = await open(b, srv.url, {width: 390, phone: true});
+  expect(await meta(other.page)).not.toContain("maximum-scale");
+}, 30000);
