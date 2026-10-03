@@ -233,6 +233,7 @@ class StrataEngine:
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.usage = None                # USAGE lines: the expert usage now and before the last request (Memory tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
@@ -284,10 +285,22 @@ class StrataEngine:
             if line.startswith("CACHE "):               # local: the conversation cache report (Monitor)
                 self._parse_cache(line)
                 continue
+            if line.startswith("USAGE "):               # local: the expert usage counters (Memory tab)
+                self._parse_usage(line)
+                continue
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
         lines.put(None)
+
+    def _parse_usage(self, line: str):
+        """USAGE <layers> <experts> <base64>: the engine's expert usage counters since it started and which experts its
+        VRAM cache holds now. Kept as reported (the web app decodes it), with the previous report, so the page can
+        show the last request alone."""
+        f = line.split()
+        if len(f) == 4 and f[1].isdigit() and f[2].isdigit():
+            before = self.usage["now"] if self.usage else None
+            self.usage = {"layers": int(f[1]), "experts": int(f[2]), "now": f[3], "before": before, "at": time.time()}
 
     def _parse_cache(self, line: str):
         """CACHE <live tokens> <parked bytes> <evictions> [<key>:<tokens>:<bytes> ...], oldest parked first."""
@@ -2183,6 +2196,12 @@ def make_handler(svc: Service):
                                {"error": {"message": "request no longer retained"}} if records is None else
                                records if request_id else {"requests": records, "retention": 100, "persistent": False,
                                                           "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
+                return
+            if path == "/experts":
+                # the expert usage counters (engines that report USAGE lines): the web app's Memory tab
+                if self._authorized():
+                    usage = getattr(svc.engine, "usage", None)
+                    self._json(200, {"available": True, **usage} if usage else {"available": False})
                 return
             if path == "/settings":
                 if self._authorized():

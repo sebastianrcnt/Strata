@@ -1564,7 +1564,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         // A hit's row was zeroed by `Launch` and belongs to the GPU; the pool must not touch it.
         if (use_hits && (graph_hits ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0
                                     : d.is_hit[(size_t) i] != 0)) {
-            if (graph_hits) ++d.cache_hits;
+            if (graph_hits) { ++d.cache_hits; d.count_use(e, 0); }
             // The GPU owns this row and `hit_out` is zeroed, so the CPU's contribution is zero - but
             // `y_miss` is a REUSED pinned buffer, so the row must be written, not merely skipped.
             std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
@@ -1574,6 +1574,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
         bool remote_owns = false;
         for (int r = 0; r < d.remote_count; ++r) remote_owns |= d.remote[r]->owns(i);
+        if (graph_hits) d.count_use(e, remote_owns ? 1 : 2);   // without the token graph `expert_hit_run` counts
         if (remote_owns) {
             std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
             continue;
@@ -1778,10 +1779,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
+                d.count_use(e, kind[i] == 0 ? 0 : 1);
                 std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
             }
             ++d.cache_refused;
+            d.count_use(e, 2);
             int16_t& jo = d.job_of[(size_t) e];
             if (jo < 0) {
                 const uint8_t* b = d.src->blob(d.layers, e);
@@ -1858,6 +1861,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                 const int32_t cand = d.cache->admit(d.layers, e);
                 if (cand == kNotResident) {
                     ++d.cache_refused;
+                    d.count_use(e, 2);
                     continue;
                 }
                 // `blob` is asked ONLY for an expert about to be filled, so the source's read counter stays a
@@ -1876,6 +1880,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             } else {
                 ++d.cache_hits;
             }
+            d.count_use(e, 0);
             d.is_hit[(size_t) i] = 1;
             d.h_slot[(size_t) d.n_hits] = slot;
             d.h_dst[(size_t) d.n_hits] = (int32_t) i;

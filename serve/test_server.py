@@ -1082,6 +1082,21 @@ class WebApp(unittest.TestCase):
         finally:
             self.svc.web_chat = True
 
+    def test_expert_usage_lines_reach_experts(self):
+        # the engine's USAGE lines (expert usage counters) go to GET /experts, with the report before them
+        engine = self.svc.engine
+        engine.usage = None
+        try:
+            self.assertEqual(json.loads(self.get("/experts")[2]), {"available": False})
+            for b64 in ("AAAA", "AQAA"):
+                StrataEngine._parse_usage(engine, f"USAGE 48 512 {b64}\n")
+            StrataEngine._parse_usage(engine, "USAGE broken\n")   # ignored
+            got = json.loads(self.get("/experts")[2])
+            self.assertEqual((got["available"], got["layers"], got["experts"], got["now"], got["before"]),
+                             (True, 48, 512, "AQAA", "AAAA"))
+        finally:
+            engine.usage = None
+
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
                      "/fonts/missing.woff2", "/fonts/x.ttf"):

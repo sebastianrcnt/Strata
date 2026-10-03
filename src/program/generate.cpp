@@ -3060,6 +3060,13 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // the expert usage the server's Memory view reads (USAGE lines): counted in memory, never written to disk
+    std::vector<uint32_t> usage;
+    if (o.serve) {
+        usage.assign((size_t) 3 * (size_t) g.n_layers * (size_t) g.n_expert, 0);
+        drive.d.usage = usage.data();
+        drive.d.usage_n = g.n_layers * g.n_expert;
+    }
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
     // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
@@ -4512,6 +4519,34 @@ int main(int argc, char** argv) {
             std::printf("%s\n", s.c_str());
             std::fflush(stdout);
         };
+        // USAGE <layers> <experts> <base64>: since the engine started, the expert usage counters (three uint32 arrays,
+        // layer-major: lookups the VRAM cache served, computed on a GPU from outside it, computed by the CPU) and which
+        // experts the VRAM cache holds now (one bit each), little-endian.  After every DONE, beside CACHE.
+        auto report_usage = [&] {
+            if (usage.empty()) return;
+            const int64_t n = drive.d.usage_n;
+            std::vector<uint8_t> raw(usage.size() * sizeof(uint32_t) + (size_t) (n + 7) / 8, 0);
+            std::memcpy(raw.data(), usage.data(), usage.size() * sizeof(uint32_t));
+            uint8_t* bits = raw.data() + usage.size() * sizeof(uint32_t);
+            for (int64_t i = 0; i < n; ++i) {
+                const bool held = !host_res.empty() ? host_res[(size_t) i] >= 0
+                                  : xcache.slots() > 0 && xcache.slot_of(i / g.n_expert, i % g.n_expert) >= 0;
+                if (held) bits[i >> 3] |= (uint8_t) (1u << (i & 7));
+            }
+            static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string s = "USAGE " + std::to_string(g.n_layers) + " " + std::to_string(g.n_expert) + " ";
+            s.reserve(s.size() + (raw.size() + 2) / 3 * 4 + 1);
+            for (size_t i = 0; i < raw.size(); i += 3) {
+                const uint32_t v = (uint32_t) raw[i] << 16 | (i + 1 < raw.size() ? (uint32_t) raw[i + 1] << 8 : 0) |
+                                   (i + 2 < raw.size() ? (uint32_t) raw[i + 2] : 0);
+                s += b64[v >> 18 & 63];
+                s += b64[v >> 12 & 63];
+                s += i + 1 < raw.size() ? b64[v >> 6 & 63] : '=';
+                s += i + 2 < raw.size() ? b64[v & 63] : '=';
+            }
+            std::printf("%s\n", s.c_str());
+            std::fflush(stdout);
+        };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         Clock::time_point pp_t0 = Clock::now();
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
@@ -4879,6 +4914,7 @@ int main(int argc, char** argv) {
         std::vector<const float*> row_ptr;
         load_all();
         report_cache();
+        report_usage();
         bool vision_lent = false;
         while (next_line(line)) {
             if (line == "QUIT") break;
@@ -5826,6 +5862,7 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6);
             std::fflush(stdout);
             report_cache();
+            report_usage();
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             const int64_t fresh = n - resume;
             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "

@@ -241,6 +241,15 @@ struct ExpertDispatch {
     int64_t cache_hits = 0;      ///< lookups already resident
     int64_t cache_admitted = 0;  ///< lookups that took a slot
     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
+    /// Expert usage (the web app's Memory tab): per (layer, expert), the routed lookups the VRAM cache served [0],
+    /// those computed on a GPU from outside the cache - over PCIe or on another card [1] - and those the CPU
+    /// computed [2]; three arrays of `usage_n` = layers x experts, in memory only.  Null: not counted.
+    uint32_t* usage = nullptr;
+    int64_t usage_n = 0;
+    void count_use(int64_t expert, int where) {
+        const int64_t i = layers * n_expert + expert;
+        if (usage != nullptr && i >= 0 && i < usage_n) ++usage[(size_t) (where * usage_n + i)];
+    }
     void* cache_stream = nullptr;
     const char* cache_fail = nullptr;
 
