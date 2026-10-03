@@ -11,7 +11,11 @@
   const y = (val) => 31 - (val / top) * 29;
   const paths = $derived.by(() => {
     let line = "", area = "", seg = [];
+    // a sample alone between gaps (the input of a short request is read in a second or two) gets a short flat
+    // stretch, one sample wide, rather than no line at all
+    const half = Math.max(.3, 50 / Math.max(1, range - 1));
     const flush = () => {
+      if (seg.length === 1) seg = [[Math.max(0, seg[0][0] - half), seg[0][1]], [Math.min(100, seg[0][0] + half), seg[0][1]]];
       if (seg.length > 1) {
         const d = seg.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
         line += d;

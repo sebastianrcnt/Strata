@@ -61,17 +61,37 @@ test("a track's tooltip opens without folding it; folding is remembered", async 
   expect(await page.$$eval(".fold[aria-expanded=true]", (x) => x.length)).toBe(openBefore - 1);
 }, 30000);
 
-test("now: idle is one line; generating shows the input bar, the tape and the speed", async () => {
+test("now: the rows stay put; generating fills them, idle keeps the last request until the next", async () => {
   const {page} = await open(b, srv.url);
-  expect(await page.$$eval(".row__label", (x) => x.length)).toBe(0);
+  const height = () => page.$eval(".slot--now", (e) => e.getBoundingClientRect().height);
+  expect(await page.$$eval(".row__label", (x) => x.length)).toBe(2);
+  expect(await page.textContent(".tape")).toContain("waiting for a request");
+  const idle = await height();
   srv.state.stream = {...srv.state.stream, state: "generating", request: 1, phase: "thinking", tail: "hello world", generated: 12, tok_s: 51.5};
-  await page.waitForSelector(".row__label", {timeout: 3000});
+  await page.waitForSelector(".tape__cursor", {timeout: 3000});
   await sleep(600);
   expect(await page.textContent(".panel h2 >> nth=0")).toBe("Thinking");
   expect(await page.textContent(".tape")).toContain("hello world");
   expect(await page.textContent(".bar__status, header.bar")).toContain("51.5");
+  expect(await height()).toBe(idle);
   srv.state.stream = {...srv.state.stream, state: "idle", request: null, tail: ""};
+  await page.waitForSelector(".tape.settled", {timeout: 3000});
+  expect(await page.textContent(".tape")).toContain("hello world");     // kept until the next request
+  expect(await page.textContent(".row__end >> nth=0")).toContain("% cached");
+  expect(await height()).toBe(idle);
+  srv.state.stream = {...srv.state.stream, state: "reading", request: 2};
   await sleep(600);
+  expect(await page.textContent(".tape")).not.toContain("hello world");
+  srv.state.stream = {...srv.state.stream, state: "idle", request: null};
+  await sleep(600);
+}, 30000);
+
+test("the request table: input with its cached share, output with its speed, no expert hit column", async () => {
+  const {page} = await open(b, srv.url);
+  expect(await page.$$eval(".slot--requests thead th", (x) => x.map((e) => e.textContent.trim()))).toEqual(["Time", "Input", "Input prep", "Output", "Duration"]);
+  expect(await page.textContent("tr.row td:nth-child(2)")).toMatch(/new · \d+% cached/);
+  expect(await page.textContent("tr.row td:nth-child(4)")).toContain("tok/s");
+  expect(await page.textContent(".slot--requests .note")).toMatch(/input \d+% cached/);
 }, 30000);
 
 test("the graph record is kept in the browser for the next load", async () => {

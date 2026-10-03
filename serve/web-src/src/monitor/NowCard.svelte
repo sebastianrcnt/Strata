@@ -1,8 +1,11 @@
 <script>
   // What the engine is doing right now, for any client: the state, the input being read, and a short live tape of
-  // the output. Prompts and output are not kept: only the server's bounded preview is shown.
+  // the output. Prompts and output are not kept: only the server's bounded preview is shown. The two rows stay put
+  // between requests (the page below does not jump) and keep the last request's preview, as this browser saw it,
+  // until the next one starts.
   import {server, monitor} from "../lib/server.svelte.js";
   import {fmt, kfmt} from "../lib/format.js";
+  import * as inputMetrics from "../lib/inputMetrics.js";
   import Panel from "../ui/Panel.svelte";
   import Badge from "../ui/Badge.svelte";
   import Value from "../ui/Value.svelte";
@@ -22,8 +25,17 @@
                          : live.state === "unloaded" ? "Unloaded" : monitor.live ? "Idle" : "Paused");
   const known = $derived(reading && s.prompt_total > 0 && s.prompt_read != null);
   // the input bar shows only how much of the input is read (a new request starts it from zero, without animating)
-  const readPct = $derived(known ? Math.min(100, (100 * s.prompt_read) / s.prompt_total) : generating ? 100 : 0);
   const busy = $derived(reading || generating);
+  const readPct = $derived(known ? Math.min(100, (100 * s.prompt_read) / s.prompt_total) : generating || (!busy && last) ? 100 : 0);
+  // between requests: the last one's input, from its record
+  const lastInput = $derived.by(() => {
+    if (busy || !last) return "–";
+    const i = inputMetrics.summary(last);
+    return `${kfmt(last.prompt_tokens)}` + (i.reused != null && last.prompt_tokens ? ` · ${fmt((100 * i.reused) / last.prompt_tokens)}% cached` : "");
+  });
+  // the last input preview this browser saw, kept until the next request
+  let prompt = $state("");
+  $effect(() => { if (busy && s.prompt_preview) prompt = previewUnicode(s.prompt_preview); });
 
   // ------------------------------------------------------------------ the output tape
   // The server sends the last 4,096 characters; new characters are let out over a few frames so the tape moves
@@ -46,9 +58,16 @@
   }
   $effect(() => {
     const st = s;
-    if (st.request !== request || st.state !== "generating") {
+    if (st.state !== "reading" && st.state !== "generating") {   // between requests: keep the last tape, settled
+      cancelAnimationFrame(frame);
+      if (pending) shown = (shown + pending).slice(-4096);
+      frame = 0; tick = 0; tail = ""; pending = ""; fresh = "";
+      return;
+    }
+    if (st.request !== request) {                                  // a new request: a new tape
       cancelAnimationFrame(frame);
       frame = 0; tick = 0; tail = ""; pending = ""; shown = ""; fresh = ""; request = st.request;
+      if (st.state === "reading") prompt = "";
     }
     if (st.state !== "generating") return;
     const t = previewUnicode(st.tail || "");
@@ -88,37 +107,38 @@
       <span>last: {fmt(last.output_tokens)} tokens{last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}</span>
     {/if}
   {/snippet}
-  {#if busy || openInput || openOutput}
-    <div class="row">
-      <button class="row__label" aria-expanded={openInput} onclick={() => (openInput = !openInput)}><span class="tri" class:open={openInput}></span>Input</button>
-      {#key s.request}
-        <div class="bar" class:indeterminate={reading && !known}><i style:width="{readPct}%"></i></div>
-      {/key}
-      <span class="row__end">{known ? `${kfmt(s.prompt_read)} / ${kfmt(s.prompt_total)}` : reading ? (s.prompt_tokens ? `${kfmt(s.prompt_tokens)} tokens` : "preparing") : generating ? "read" : "–"}</span>
-    </div>
-    {#if openInput}
-      <pre class="text">{busy ? previewUnicode(s.prompt_preview || "Preparing input…") : "Waiting for a request"}</pre>
-    {/if}
+  <div class="row">
+    <button class="row__label" aria-expanded={openInput} onclick={() => (openInput = !openInput)}><span class="tri" class:open={openInput}></span>Input</button>
+    {#key s.request}
+      <div class="bar" class:indeterminate={reading && !known} class:settled={!busy}><i style:width="{readPct}%"></i></div>
+    {/key}
+    <span class="row__end">{known ? `${kfmt(s.prompt_read)} / ${kfmt(s.prompt_total)}` : reading ? (s.prompt_tokens ? `${kfmt(s.prompt_tokens)} tokens` : "preparing") : generating ? "read" : lastInput}</span>
+  </div>
+  {#if openInput}
+    <pre class="text">{busy ? previewUnicode(s.prompt_preview || "Preparing input…") : prompt || "Waiting for a request"}</pre>
+  {/if}
 
-    <div class="row">
-      <button class="row__label" aria-expanded={openOutput} onclick={() => (openOutput = !openOutput)}><span class="tri" class:open={openOutput}></span>Output</button>
-      <div class="tape-window">
-        <div class="tape">
-          {#if generating}<span>{tapeOld}</span><span class="tape__new">{tapeNew}</span><i class="tape__cursor"></i>
-          {:else}<span>{reading ? "waiting for the input to be read" : "waiting for a request"}</span>{/if}
-        </div>
+  <div class="row">
+    <button class="row__label" aria-expanded={openOutput} onclick={() => (openOutput = !openOutput)}><span class="tri" class:open={openOutput}></span>Output</button>
+    <div class="tape-window">
+      <div class="tape" class:settled={!generating}>
+        {#if generating}<span>{tapeOld}</span><span class="tape__new">{tapeNew}</span><i class="tape__cursor"></i>
+        {:else if reading}<span>waiting for the input to be read</span>
+        {:else if shown}<span>{tapeOld}{tapeNew}</span>
+        {:else}<span>waiting for a request</span>{/if}
       </div>
-      <span class="row__end"></span>
     </div>
-    {#if openOutput}
-      <pre class="text" bind:this={outputPanel}>{generating ? shown : "Waiting for a request"}</pre>
-    {/if}
+    <span class="row__end"></span>
+  </div>
+  {#if openOutput}
+    <pre class="text" bind:this={outputPanel}>{generating || (!reading && shown) ? shown : reading ? "Waiting for the input to be read" : "Waiting for a request"}</pre>
   {/if}
 </Panel>
 
 <style>
   .bar { height: 3px; border-radius: 2px; background: var(--well); overflow: hidden; }
   .bar i { display: block; height: 100%; background: var(--value); transition: width 180ms linear; }
+  .bar.settled i { background: var(--off); }
   .bar.indeterminate i { width: 30% !important; animation: slide 1.2s linear infinite; }
   .row { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; align-items: center; gap: 8px; height: 28px; padding: 0 10px 0 6px; }
   .row { border-top: 1px solid var(--gap); }
@@ -133,6 +153,7 @@
                  mask-image: linear-gradient(to right, transparent, black 15%, black); }
   .tape { position: absolute; right: 0; top: 0; width: max-content; white-space: pre; font: var(--fs-m)/20px var(--mono); color: var(--dim); }
   .tape__new { color: var(--text); }
+  .tape.settled, .tape.settled .tape__new { color: var(--off); }
   .tape__cursor { display: inline-block; width: 2px; height: 13px; margin-left: 3px; vertical-align: middle; background: var(--accent);
                   animation: blink .8s ease-in-out infinite alternate; }
   .text { margin: 0; height: 160px; overflow: auto; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere;

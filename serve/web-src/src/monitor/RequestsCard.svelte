@@ -23,7 +23,7 @@
     monitor.showAll = !monitor.showAll;
     refreshMetrics();
   }
-  const pctOf = (a, b) => (a != null && b ? `${fmt((100 * a) / b, 1)}%` : "–");
+  const pctOf = (a, b, d = 1) => (a != null && b ? `${fmt((100 * a) / b, d)}%` : "–");
   const finishOf = (r) => (r.finish in FINISH ? FINISH[r.finish] : ["neutral", r.finish || "–"]);
   function details(r) {
     const input = inputMetrics.summary(r);
@@ -31,14 +31,13 @@
     return [
       ["Started", new Date(r.time * 1000).toLocaleString([], {hourCycle: "h23"})],
       ["Finished", f ? `${f[1]} (${r.finish})` : "normally (stop)"],
-      ["Input tokens", `${fmt(r.prompt_tokens)} · ${fmt(input.fresh)} new · ${fmt(r.reused)} reused from the cache`],
+      ["Input tokens", `${fmt(r.prompt_tokens)} · ${fmt(input.fresh)} new · ${fmt(r.reused)} reused from the cache (${pctOf(r.reused, r.prompt_tokens)})`],
       ["Input preparation", input.ms == null ? "–" : `${fmt(input.ms / 1000, 2)} s · ${input.rate == null ? "–" : `${fmt(input.rate)} tok/s effective`}`],
       ["Output tokens", fmt(r.output_tokens) + (r.engine_generated != null && r.engine_generated !== r.output_tokens ? ` (engine generated ${fmt(r.engine_generated)})` : "")],
       ["Decode", `${fmt(r.decode_tok_s, 1)} tok/s${r.decode_ms != null ? ` over ${fmt(r.decode_ms / 1000, 1)} s` : ""}`],
       ["MTP drafts accepted", r.drafts_offered ? `${fmt(r.drafts_accepted)} of ${fmt(r.drafts_offered)} · ${pctOf(r.drafts_accepted, r.drafts_offered)}` : null],
-      ["Experts already in VRAM", r.hit_rate == null ? null : `${(r.hit_rate * 100).toFixed(1)}% of lookups while writing`],
-      ["Experts read from", r.ram_blobs == null ? null : `RAM ${fmt(r.ram_blobs)} · disk ${fmt(r.file_blobs)} (${fmt(r.file_mb, 1)} MB)`],
-      ["Speed projection", r.projection == null ? null : r.projection ? "on" : "off (stock model)"],
+      ["Expert cache hit", r.hit_rate == null ? null : `${(r.hit_rate * 100).toFixed(1)}% of the expert lookups were in VRAM while writing (the Memory tab has the rest)`],
+      ["Experts read from disk", r.file_blobs ? `${fmt(r.file_blobs)} (${fmt(r.file_mb, 1)} MB) · RAM ${fmt(r.ram_blobs)}` : null],
       ["Duration", `${fmt(r.duration_s, 2)} s`],
     ].filter((x) => x[1] != null);
   }
@@ -50,7 +49,7 @@
     const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s effective` : "";
     const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
     const mtp = t.drafts_offered ? ` · MTP drafts ${pctOf(t.drafts_accepted, t.drafts_offered)} accepted` : "";
-    return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} new input tokens${pSpeed} (${fmt(t.reused)} reused) · ` +
+    return `Since ${since}: ${fmt(t.requests)} requests · input ${pctOf(t.reused, t.prompt_tokens, 0)} cached, ${fmt(read)} new tokens${pSpeed} · ` +
            `${fmt(t.output_tokens)} written${oSpeed}${mtp}`;
   });
   const flip = (r) => (open = open === r.time ? null : r.time);
@@ -63,9 +62,8 @@
   {/snippet}
   <div class="wrap" class:all={monitor.showAll}>
     <table class="tbl">
-      <thead><tr><th>Time</th><th class="num">Prompt</th><th class="num opt">Reused</th>
-        <th class="num opt"><Tip text={inputMetrics.explanation}>Input prep</Tip></th><th class="num">Output</th><th class="num">Decode tok/s</th>
-        <th class="num opt"><Tip text="While writing the answer: the share of the experts looked up that were already in VRAM (experts copied over PCIe are not counted)">Hit rate</Tip></th>
+      <thead><tr><th>Time</th><th class="num"><Tip text="Input tokens; below, the new ones and the share reused from the prompt cache">Input</Tip></th>
+        <th class="num opt"><Tip text={inputMetrics.explanation}>Input prep</Tip></th><th class="num">Output</th>
         <th class="num">Duration</th></tr></thead>
       <tbody>
         {#each shown as r (r.time)}
@@ -73,19 +71,16 @@
           {@const f = finishOf(r)}
           <tr class="row" class:open={open === r.time} tabindex="0" aria-expanded={open === r.time} onclick={() => flip(r)} onkeydown={(e) => onKey(e, r)}>
             <td>{clock(r.time)}{#if f}{" "}<Badge tone={f[0]}>{f[1]}</Badge>{/if}{#if r.projection}{" "}<Badge tone="value" title="experimental speed projection on">ESP</Badge>{/if}</td>
-            <td class="num">{fmt(r.prompt_tokens)}<span class="sub">{fmt(input.fresh)} new</span></td>
-            <td class="num opt">{fmt(r.reused)}</td>
+            <td class="num">{fmt(r.prompt_tokens)}<span class="sub">{fmt(input.fresh)} new{r.reused != null && r.prompt_tokens ? ` · ${pctOf(r.reused, r.prompt_tokens, 0)} cached` : ""}</span></td>
             <td class="num opt">{input.ms == null ? "–" : `${fmt(input.ms / 1000, 2)} s`}<span class="sub">{input.rate == null ? "–" : `${fmt(input.rate)} tok/s`}</span></td>
-            <td class="num">{fmt(r.output_tokens)}</td>
-            <td class="num">{fmt(r.decode_tok_s, 1)}</td>
-            <td class="num opt">{r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`}</td>
+            <td class="num">{fmt(r.output_tokens)}<span class="sub">{fmt(r.decode_tok_s, 1)} tok/s</span></td>
             <td class="num">{fmt(r.duration_s, 1)} s</td>
           </tr>
           {#if open === r.time}
-            <tr class="details"><td colspan="8"><dl>{#each details(r) as [k, v]}<dt>{k}</dt><dd>{v}</dd>{/each}</dl></td></tr>
+            <tr class="details"><td colspan="5"><dl>{#each details(r) as [k, v]}<dt>{k}</dt><dd>{v}</dd>{/each}</dl></td></tr>
           {/if}
         {:else}
-          <tr><td colspan="8" class="muted">No requests yet</td></tr>
+          <tr><td colspan="5" class="muted">No requests yet</td></tr>
         {/each}
       </tbody>
     </table>
