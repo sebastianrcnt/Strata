@@ -1596,8 +1596,8 @@ class ThinkingBudget(unittest.TestCase):
                                                   "max_tokens": 400, **extra})
 
     def test_effort_caps_across_api_shapes(self):
-        for effort, expected in (("minimal", 256), ("low", 512), ("medium", 1024),
-                                 ("high", 2048), ("xhigh", 4096), ("max", None)):
+        for effort, expected in (("minimal", 256), ("low", 1024), ("medium", 4096),
+                                 ("high", 8192), ("xhigh", 16384), ("max", None)):
             for request in ({"reasoning_effort": effort}, {"output_config": {"effort": effort}},
                             {"reasoning": {"effort": effort}},
                             {"chat_template_kwargs": {"reasoning_effort": effort}}):

@@ -454,14 +454,15 @@ print(r.choices[0].message.content)
   | Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`, `"thinking": {"type": "disabled"}`, or `"thinking": {"type": "enabled", "budget_tokens": N}` (under 2K = low, under 8K = medium, more = high) |
 
   Without a setting the model uses its own default, **high**. `none` answers at once (fastest); `low` keeps the thinking
-  short. The levels are instructions the model was trained with, not a hard token limit: on easy questions all three
-  think briefly, on hard ones `high` thinks longest and is most accurate.
+  short. The levels are instructions the model was trained with, and each also caps the thinking with the hard budget
+  below: `minimal` 256 tokens, `low` 1,024, `medium` 4,096, `high` 8,192, `xhigh` 16,384, `max` none. On easy
+  questions all three think briefly, on hard ones `high` thinks longest and is most accurate.
 - **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` in a request (OpenAI or Anthropic) caps the
   thinking at N tokens: when it gets there the server ends it with a short wrap-up line and `</think>`, and the model
   answers from there (the engine continues from what it already holds, so nothing is read again). The wrap-up is
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
-  `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
-  Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+  `strata-<model>.json` sets it for every request; a request's own value wins over the level's cap, and `0` means no
+  budget. Without a level or a budget there is no cap; Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
 - **Anthropic requests that don't ask for thinking (opt-in, 0.1.32, #278).** By default a `/v1/messages` request
   with no `"thinking"`, effort or budget thinks as the model's template does. `"anthropic_thinking": "on_request"` in
   `strata-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
