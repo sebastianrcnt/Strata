@@ -21,3 +21,11 @@ offers the same steps as tools.
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
 - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a
   measurement.
+
+## Fork branch workflow
+
+- This fork is `sebastianrcnt/Strata`, remote `fork`; `origin` is upstream `Niko1221/Strata`.
+- `main` is the fork integration branch and tracks `fork/main`.
+- Start new features from the fork main on `feat/<feature-name>` branches. Do not implement features directly on `main` or continue the legacy `local-patches` branch.
+- Validate feature changes before merging into the fork main. Push fork changes to `fork`, not upstream `origin`.
+- Keep upstream integration separate from feature work and preserve local patches when resolving conflicts.
