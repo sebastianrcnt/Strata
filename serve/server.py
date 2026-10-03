@@ -228,6 +228,8 @@ class StrataEngine:
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.vision_memory_failed = False
+        self.vision_protocol_failed = False
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
@@ -436,6 +438,8 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        if getattr(self, "vision_memory_failed", False):
+            raise EngineDied("expert memory restoration failed; reload the engine before generating")
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -529,14 +533,50 @@ class StrataEngine:
                 self.ended = True
                 self.progress, self.last = None, {}
 
+    def vision_memory(self, release_mib: int | None = None):
+        """Idle-only control; Service.fifo must be held. Never infer after a failed restoration."""
+        if getattr(self, "vision_protocol_failed", False):
+            raise EngineDied("vision handoff reply is uncertain; explicitly reload the engine before retrying")
+        if not self.info.get("vision_lending"):
+            raise ValueError("GPU expert lending needs an engine built with VMM and STRATA_EXPERT_VMM=1")
+        command = f"VISION_RELEASE {release_mib}" if release_mib is not None else "VISION_RESTORE"
+        expected = "VISION_RELEASED" if release_mib is not None else "VISION_RESTORED"
+        try:
+            self.proc.stdin.write(command + "\n")
+            self.proc.stdin.flush()
+            while True:
+                line = self.lines.get(timeout=600)
+                if line is None:
+                    raise EngineDied("the engine stopped during vision memory handoff")
+                if line.startswith(expected + " "):
+                    if release_mib is None:
+                        self.vision_memory_failed = False
+                    return
+                if line.startswith("ERR "):
+                    raise ValueError(line[4:].strip())
+        except (OSError, queue.Empty, EngineDied) as e:
+            # A delayed reply cannot be associated with a future handoff safely. Do not send a restore
+            # or reuse the pipe: the release may still complete later. Only an explicit reload resets it.
+            self.vision_protocol_failed = self.vision_memory_failed = True
+            raise EngineDied(f"vision handoff timed out or lost its transport; explicitly reload the engine: {e}") from e
+        except ValueError as e:
+            if release_mib is None:
+                self.vision_memory_failed = True
+                raise EngineDied(f"expert restoration failed; generation is disabled: {e}") from e
+            raise
+
     def persist(self) -> int:
         """PERSIST: write the conversations to --conversation-dir now.  The caller holds the service's fifo."""
+        if getattr(self, "vision_memory_failed", False) or getattr(self, "vision_protocol_failed", False):
+            raise EngineDied("cannot persist through an uncertain vision handoff; explicitly reload the engine")
         self.proc.stdin.write("PERSIST\n")
         self.proc.stdin.flush()
         while True:
             line = self.lines.get(timeout=600)
             if line is None:
                 raise EngineDied("the engine stopped while saving conversations")
+            if line.startswith("ERR "):
+                raise EngineDied("the engine refused to save conversations: " + line[4:].strip())
             if line.startswith("PERSISTED"):
                 return int(line.split()[1])
 
@@ -554,25 +594,74 @@ class Vision:
             args += ["--threads", str(cfg["threads"])]
         if cfg.get("max_tokens"):
             args += ["--max-tokens", str(cfg["max_tokens"])]
-        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
-        self.stopped = False
-        self._start()
+        self.expert_swap = cfg.get("expert_swap") is True
+        self.headroom_mib = cfg.get("headroom_mib", 2048)
+        if self.expert_swap and (not cfg.get("gpu") or isinstance(self.headroom_mib, bool) or
+                                 not isinstance(self.headroom_mib, int) or not 1 <= self.headroom_mib <= 65536):
+            raise ValueError("vision expert_swap requires gpu=true and headroom_mib=1..65536")
+        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        self.proc = None
+        self.lines, self.pump = None, None
+        self.start_timeout_s = float(cfg.get("start_timeout_s", 120))
+        self.encode_timeout_s = float(cfg.get("encode_timeout_s", 180))
+        if not 0 < self.start_timeout_s <= 600 or not 0 < self.encode_timeout_s <= 600:
+            raise ValueError("vision startup and encoding timeouts must be between 0 and 600 seconds")
+        self.stopped = True
+        if not self.expert_swap:
+            self._start()
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
 
-    def _start(self):
+    def _start(self, cancel=None):
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                raise EngineStuck("the previous vision encoder is still alive; reap it before starting another")
+            self.close()
         args, log, env = self.spawn
-        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
-                                     text=True, encoding="utf-8", bufsize=1, env=env)
+        try:
+            self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
+                                         text=True, encoding="utf-8", bufsize=1, env=env)
+        except OSError as e:
+            raise EngineDied(f"the vision encoder could not start: {e}") from e
         contain(self.proc)
-        line = self.proc.stdout.readline()
-        if not line.startswith("READY"):
-            raise RuntimeError("the vision encoder did not start: " + line.strip())
+        proc, lines = self.proc, queue.Queue()
+        self.lines = lines
+        def pump():
+            try:
+                for line in proc.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+        self.pump = threading.Thread(target=pump, daemon=True)
+        self.pump.start()
+        try:
+            line = self._read_line(cancel, self.start_timeout_s, "starting")
+            if not line.startswith("READY"):
+                raise EngineDied("the vision encoder did not start: " + line.strip())
+        except BaseException:
+            self.close()
+            raise
         self.stopped = False
 
+    def _read_line(self, cancel, timeout, phase):
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise ValueError("image request cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EngineDied(f"vision encoder timed out while {phase} ({timeout:g} seconds)")
+            try:
+                line = self.lines.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+            if line is None:
+                raise EngineDied(f"vision encoder exited while {phase}")
+            return line
+
     def alive(self) -> bool:
-        return not self.stopped and self.proc.poll() is None
+        return not self.stopped and self.proc is not None and self.proc.poll() is None
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
@@ -582,7 +671,9 @@ class Vision:
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         try:
-            self.proc.kill()
+            if self.proc is not None:
+                self.proc.kill()
+                self.proc.wait(timeout=20)
         except OSError:
             pass
         self._start()
@@ -629,36 +720,103 @@ class Vision:
         return out.getvalue()
 
     def encode(self, source: str) -> tuple[Path, int]:
-        """-> (embeddings file, number of image tokens)."""
-        data = self.normalize(self.load(source))
-        key = hashlib.sha256(data).hexdigest()[:32]
+        return self.encode_batch([source])[0]
+
+    def encode_batch(self, sources, engine=None, cancel=None) -> list[tuple[Path, int]]:
+        """One handoff per image batch, none when every normalized image is already cached."""
+        if len(sources) > 64:
+            raise ValueError("one image batch supports at most 64 images")
+        prepared = []
+        for source in sources:
+            if cancel is not None and cancel.is_set():
+                raise ValueError("image request cancelled")
+            data = self.normalize(self.load(source))
+            prepared.append((hashlib.sha256(data).hexdigest()[:32], data))
         with self.lock:
-            if key in self.cache:
-                return self.cache[key]
-            img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
-            img.write_bytes(data)
+            self.batch_keys = {key for key, _ in prepared}
+            missing = any(key not in self.cache for key, _ in prepared)
+            if not missing:
+                return [self.cache[key] for key, _ in prepared]
+            if getattr(self, "expert_swap", False):
+                if engine is None:
+                    raise ValueError("GPU vision lending requires the engine and the request FIFO")
+                if getattr(engine, "vision_memory_failed", False) or getattr(engine, "vision_protocol_failed", False):
+                    raise EngineDied("expert memory handoff failed; explicitly unload then load before a new image")
+                # Even a partial release failure must run the recovery command.
+                try:
+                    timing = {"images": len(prepared), "uncached_images": sum(key not in self.cache for key, _ in prepared)}
+                    t = time.perf_counter()
+                    engine.vision_memory(self.headroom_mib)
+                    timing["release_s"] = round(time.perf_counter() - t, 4)
+                    t = time.perf_counter()
+                    self._start(cancel)
+                    timing["load_s"] = round(time.perf_counter() - t, 4)
+                    t = time.perf_counter()
+                    encoded = [self._encode_data(key, data, cancel) for key, data in prepared]
+                    timing["encode_s"] = round(time.perf_counter() - t, 4)
+                    return encoded
+                finally:
+                    t = time.perf_counter()
+                    try:
+                        self.unload()
+                    except Exception as e:
+                        # Never reallocate while an unreaped encoder may still own the lent memory.
+                        engine.vision_memory_failed = True
+                        raise EngineDied(f"vision encoder could not release its GPU memory: {e}") from e
+                    timing["unload_s"] = round(time.perf_counter() - t, 4)
+                    t = time.perf_counter()
+                    engine.vision_memory()
+                    timing["restore_s"] = round(time.perf_counter() - t, 4)
+                    self.last_timings = timing
+                    print("[strata] vision handoff: " + json.dumps(timing), flush=True)
             try:
-                self.proc.stdin.write(f"ENC {img} {out}\n")
-                self.proc.stdin.flush()
-                line = self.proc.stdout.readline().strip()
-            finally:                                                   # #352: also when the encoder's pipe is gone
-                img.unlink(missing_ok=True)
-            if not line.startswith("OK"):
-                raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
-                                                                     "the vision encoder stopped"))
-            self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
-                old = next(iter(self.cache))
-                self.cache.pop(old)[0].unlink(missing_ok=True)
+                return [self._encode_data(key, data, cancel) for key, data in prepared]
+            except EngineDied:
+                self.unload()
+                raise
+
+    def _encode_data(self, key, data, cancel=None):
+        if key in self.cache:
             return self.cache[key]
+        img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
+        img.write_bytes(data)
+        try:
+            self.proc.stdin.write(f"ENC {img} {out}\n")
+            self.proc.stdin.flush()
+            line = self._read_line(cancel, self.encode_timeout_s, "encoding").strip()
+        finally:
+            img.unlink(missing_ok=True)
+        if not line.startswith("OK"):
+            out.unlink(missing_ok=True)
+            raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
+                                                                 "the vision encoder stopped"))
+        self.cache[key] = (out, int(line.split()[1]))
+        if len(self.cache) > 64:
+            old = next(key for key in self.cache if key not in self.batch_keys)
+            self.cache.pop(old)[0].unlink(missing_ok=True)
+        return self.cache[key]
 
     def close(self):
+        if self.proc is None:
+            return
+        proc = self.proc
         try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+            if proc.poll() is None:
+                proc.stdin.write("QUIT\n")
+                proc.stdin.flush()
+                proc.wait(timeout=1 if self.expert_swap else 10)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            proc.kill()
+            proc.wait(timeout=20)  # must be reaped before the engine reallocates its expert memory
+        finally:
+            if proc.poll() is not None:
+                if self.pump is not None:
+                    self.pump.join(timeout=2)
+                proc.stdin.close()
+                proc.stdout.close()
+                self.proc = None
+                self.stopped = True
+                self.pump = None
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -697,6 +855,37 @@ def hip_visible(cfg: dict) -> list[int]:
         except ValueError:
             pass
     return gpu_list(cfg)
+
+
+def enable_vision_swap(cfg: dict, env: dict) -> bool:
+    """Validate single-device ownership before starting either child; no GPU context is created."""
+    if (cfg.get("vision") or {}).get("expert_swap") is not True:
+        return False
+    devices = gpu_list(cfg)
+    if cfg.get("backend") == "hip" or len(devices) > 1 or any(i < 0 for i in devices):
+        raise ValueError("vision expert_swap requires a single non-negative CUDA GPU index")
+    vdev = (cfg.get("vision") or {}).get("cuda_device")
+    if vdev is not None:
+        # Do not truncate floats or accept bools. An explicit encoder override needs an explicit
+        # engine index too: otherwise an inherited CUDA_VISIBLE_DEVICES could select another GPU.
+        if isinstance(vdev, bool) or not isinstance(vdev, (int, str)) or not str(vdev).isdigit():
+            raise ValueError("vision cuda_device must be a non-negative integer GPU index")
+        if not devices or int(vdev) != devices[0]:
+            raise ValueError("vision expert_swap cuda_device must match the explicitly configured engine GPU")
+        actual = env.get("CUDA_VISIBLE_DEVICES")
+        if actual is not None and actual != str(devices[0]):
+            raise ValueError("vision cuda_device override conflicts with the engine's CUDA_VISIBLE_DEVICES")
+    args = cfg.get("args") or []
+    opts = dict(zip(args, args[1:]))
+    cache = opts.get("--expert-cache", "0")
+    if cache != "auto" and (not str(cache).isdigit() or int(cache) <= 0):
+        raise ValueError("vision expert_swap requires --expert-cache auto or a positive slot count")
+    for device in (1, 2, 3):
+        value = opts.get(f"--expert-cache-device{device}", "0")
+        if not str(value).isdigit() or int(value) != 0:
+            raise ValueError("vision expert_swap does not support remote expert caches")
+    env["STRATA_EXPERT_VMM"] = "1"
+    return True
 
 
 def child_env(cfg: dict) -> dict:
@@ -886,7 +1075,8 @@ class Service:
         return value if value > 0 else None
 
     def _vision_down(self) -> bool:
-        return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+        return self.vision is not None and not getattr(self.vision, "expert_swap", False) and \
+            hasattr(self.vision, "alive") and not self.vision.alive()
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -906,9 +1096,27 @@ class Service:
         except Exception:
             return None
 
+    def _reap_swap_encoder(self):
+        v = self.vision
+        if v is not None and getattr(v, "expert_swap", False) and getattr(v, "proc", None) is not None:
+            try:
+                v.unload()
+            except (OSError, subprocess.SubprocessError, EngineStuck) as e:
+                self.engine.vision_memory_failed = True
+                raise EngineStuck("the previous vision encoder has not exited; model reload stays blocked") from e
+
+    def engine_error(self, error) -> str:
+        if getattr(self.engine, "vision_memory_failed", False) or getattr(self.engine, "vision_protocol_failed", False):
+            return f"{error}; explicitly unload then load the model to recover"
+        return f"{error}; the next request restarts it"
+
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
+        self._reap_swap_encoder()
+        if self.loaded() and (getattr(self.engine, "vision_memory_failed", False) or
+                              getattr(self.engine, "vision_protocol_failed", False)):
+            raise EngineDied("expert memory handoff failed; explicitly unload then load the model to recover")
         if self.loaded() and not self._vision_down():
             return
         if self.before_load:
@@ -945,7 +1153,8 @@ class Service:
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
-        if self.loaded() and not self._vision_down():
+        if self.loaded() and not self._vision_down() and not (
+                getattr(self.engine, "vision_memory_failed", False) or getattr(self.engine, "vision_protocol_failed", False)):
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -981,6 +1190,7 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
+            self._reap_swap_encoder()
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
@@ -1209,7 +1419,7 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
@@ -1227,7 +1437,11 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+                if getattr(self.vision, "expert_swap", False):
+                    self.ensure_loaded()
+                    encoded = self.vision.encode_batch(images, self.engine, cancel)
+                else:
+                    encoded = [self.vision.encode(src) for src in images]
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -1374,7 +1588,7 @@ class Service:
                             finish = "error"
                             note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
                             log = getattr(self.engine, "log_path", None)
-                            print(f"[strata] {e}. {note} The next request starts the engine again."
+                            print(f"[strata] {self.engine_error(e)}. {note}"
                                   f"{' Its log: ' + log if log else ''}", flush=True)
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
@@ -2056,13 +2270,16 @@ def make_handler(svc: Service):
                 self._json(409 if r == "busy" else 200, {"status": r})
                 return
             if path == "/conversations/save":                # write the KV conversations to disk now
-                self._json(200, svc.persist())
+                try:
+                    self._json(200, svc.persist())
+                except EngineDied as e:
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineDied, EngineStuck) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
@@ -2113,7 +2330,7 @@ def make_handler(svc: Service):
             except (GpuBusy, EngineStarting) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                self._json(503, {"error": {"type": "server_error", "message": svc.engine_error(e)}})
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
@@ -2249,10 +2466,10 @@ def make_handler(svc: Service):
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
-            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # includes image preparation
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
@@ -2275,7 +2492,7 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                err = {"error": {"type": "server_error", "message": svc.engine_error(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
@@ -2301,10 +2518,10 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
-            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # includes image preparation
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
@@ -2324,7 +2541,7 @@ def make_handler(svc: Service):
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                err = {"type": "error", "error": {"type": "api_error", "message": svc.engine_error(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -2585,7 +2802,11 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
-        if lazy and cfg.get("vision"):
+        try:
+            swap = enable_vision_swap(cfg, env)
+        except (ValueError, TypeError) as e:
+            ap.error(str(e))
+        if lazy and cfg.get("vision") and not swap:
             ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)

@@ -4859,6 +4859,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        std::printf("INFO vision_lending=%d\n", xcache.vmm_enabled() && stages.empty() && !remote_caches);
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -4878,8 +4879,42 @@ int main(int argc, char** argv) {
         std::vector<const float*> row_ptr;
         load_all();
         report_cache();
+        bool vision_lent = false;
         while (next_line(line)) {
             if (line == "QUIT") break;
+            // The command loop runs only between requests; adaptive host threads are already joined.
+            if (line.rfind("VISION_RELEASE ", 0) == 0) {
+                err.clear();
+                char* end = nullptr;
+                const long long mib = std::strtoll(line.c_str() + 15, &end, 10);
+                bool remote = false;
+                for (int r = 0; r < 3; ++r) remote |= o.expert_cache_remote[(size_t) r] > 0;
+                bool ok = false;
+                if (vision_lent) err = "expert memory is already lent";
+                else if (!stages.empty() || remote) err = "vision lending currently requires a single CUDA GPU";
+                else if (mib <= 0 || mib > 65536 || !end || *end) err = "vision headroom must be 1..65536 MiB";
+                else {
+                    apply_pending(true);
+                    ok = xcache.lend_for_vision((size_t) mib << 20, err);
+                }
+                vision_lent = vision_lent || ok || xcache.lent();
+                std::printf("%s %s\n", ok ? "VISION_RELEASED" : "ERR", ok ? "ok" : err.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "VISION_RESTORE") {
+                err.clear();
+                const bool ok = xcache.reclaim_after_vision(err);
+                if (ok) vision_lent = false;
+                std::printf("%s %s\n", ok ? "VISION_RESTORED" : "ERR", ok ? "ok" : err.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            if (vision_lent || xcache.lent()) {
+                std::printf("ERR expert memory is lent to vision; restore it before any engine work\n");
+                std::fflush(stdout);
+                continue;
+            }
             if (line == "PERSIST") {
                 const int n = persist_all("PERSIST");
                 std::printf("PERSISTED %d\n", n);

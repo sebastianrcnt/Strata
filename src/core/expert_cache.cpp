@@ -2,6 +2,11 @@
 #include "strata/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <cuda.h>
+#endif
+#include <cstdlib>
+#include <new>
 
 #include <cstdio>
 #include <utility>
@@ -120,7 +125,10 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+    const char* use_vmm = std::getenv("STRATA_EXPERT_VMM");
+    if (use_vmm && std::strcmp(use_vmm, "1") == 0) {
+        if (!open_vmm((size_t) want, err)) return false;
+    } else if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
         base_ = nullptr;
         char buf[256];
         std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
@@ -200,6 +208,7 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
+    if (vmm_bytes_) close_vmm();
     if (base_ != nullptr) {
         cudaFree(base_);
         base_ = nullptr;
@@ -213,6 +222,163 @@ void ExpertCache::close() {
     fills_ = 0;
     admitted_ = 0;
     layer_next_.clear();
+}
+
+
+#if !defined(STRATA_USE_HIP)
+static bool driver_ok(CUresult rc, const char* operation, std::string& err) {
+    if (rc == CUDA_SUCCESS) return true;
+    const char* name = nullptr;
+    cuGetErrorName(rc, &name);
+    err = std::string("ExpertCache VMM: ") + operation + ": " + (name ? name : "CUDA driver error");
+    return false;
+}
+#endif
+
+bool ExpertCache::open_vmm(size_t bytes, std::string& err) {
+#if defined(STRATA_USE_HIP)
+    (void) bytes;
+    err = "expert VMM lending requires CUDA, not HIP";
+    return false;
+#else
+    CUdevice dev = 0;
+    int supported = 0;
+    if (!driver_ok(cuCtxGetDevice(&dev), "current device", err) ||
+        !driver_ok(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, dev),
+                   "VMM support", err)) return false;
+    if (!supported) { err = "this CUDA device does not support VMM"; return false; }
+    vmm_device_ = dev;
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    size_t granule = 0;
+    if (!driver_ok(cuMemGetAllocationGranularity(&granule, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                   "granularity", err)) return false;
+    vmm_chunk_ = ((64ULL << 20) + granule - 1) / granule * granule;
+    vmm_bytes_ = (bytes + vmm_chunk_ - 1) / vmm_chunk_ * vmm_chunk_;
+    // open() checked the logical blob bytes. Physical VMM chunks are rounded up, and that extra
+    // chunk must fit too. Refuse before reserving an address or allocating any physical handle.
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b < vmm_bytes_) {
+        char buf[320];
+        std::snprintf(buf, sizeof buf,
+                      "ExpertCache VMM: %zu MiB logical bytes require %zu MiB after chunk rounding, "
+                      "but only %zu MiB of VRAM is free. Lower --expert-cache.",
+                      bytes >> 20, vmm_bytes_ >> 20, free_b >> 20);
+        err = buf;
+        vmm_bytes_ = vmm_chunk_ = 0;
+        return false;
+    }
+    CUdeviceptr address = 0;
+    if (!driver_ok(cuMemAddressReserve(&address, vmm_bytes_, granule, 0, 0), "reserve address", err)) {
+        vmm_bytes_ = 0;
+        return false;
+    }
+    base_ = reinterpret_cast<uint8_t*>(address);
+    vmm_handles_.assign(vmm_bytes_ / vmm_chunk_, 0);
+    vmm_mapped_.assign(vmm_handles_.size(), false);
+    for (size_t i = 0; i < vmm_handles_.size(); ++i)
+        if (!map_vmm_chunk(i, err)) { close_vmm(); return false; }
+    return true;
+#endif
+}
+
+bool ExpertCache::map_vmm_chunk(size_t i, std::string& err) {
+#if defined(STRATA_USE_HIP)
+    (void) i; (void) err;
+    return false;
+#else
+
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = vmm_device_;
+    CUmemGenericAllocationHandle handle = vmm_handles_[i];
+    if (!handle) {
+        if (!driver_ok(cuMemCreate(&handle, vmm_chunk_, &prop, 0), "allocate chunk", err)) return false;
+        vmm_handles_[i] = handle;
+    }
+    const CUdeviceptr address = reinterpret_cast<CUdeviceptr>(base_) + i * vmm_chunk_;
+    if (!vmm_mapped_[i]) {
+        if (!driver_ok(cuMemMap(address, vmm_chunk_, 0, handle, 0), "map chunk", err)) return false;
+        vmm_mapped_[i] = true;
+    }
+    CUmemAccessDesc access{};
+    access.location = prop.location;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    return driver_ok(cuMemSetAccess(address, vmm_chunk_, &access, 1), "set access", err);
+#endif
+}
+
+void ExpertCache::close_vmm() {
+#if !defined(STRATA_USE_HIP)
+    for (size_t i = 0; i < vmm_handles_.size(); ++i) {
+        if (vmm_mapped_[i]) cuMemUnmap(reinterpret_cast<CUdeviceptr>(base_) + i * vmm_chunk_, vmm_chunk_);
+        if (vmm_handles_[i]) cuMemRelease(vmm_handles_[i]);
+    }
+    if (base_) cuMemAddressFree(reinterpret_cast<CUdeviceptr>(base_), vmm_bytes_);
+#endif
+    base_ = nullptr;
+    vmm_bytes_ = vmm_chunk_ = 0;
+    vmm_handles_.clear();
+    vmm_mapped_.clear();
+    std::vector<uint8_t>().swap(lent_bytes_);
+    lent_offset_ = 0;
+}
+
+bool ExpertCache::lend_for_vision(size_t free_bytes_required, std::string& err) {
+    if (!vmm_enabled()) { err = "vision lending needs STRATA_EXPERT_VMM=1 at engine startup"; return false; }
+    if (lent()) { err = "expert memory is already lent"; return false; }
+#if !defined(STRATA_USE_HIP)
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = "cannot synchronize before lending"; return false; }
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { err = "cannot read free VRAM"; return false; }
+    if (free_b >= free_bytes_required) return true;
+    const size_t needed = free_bytes_required - free_b;
+    const size_t chunks = (needed + vmm_chunk_ - 1) / vmm_chunk_;
+    if (chunks > vmm_handles_.size()) { err = "requested vision headroom exceeds the expert cache"; return false; }
+    const size_t size = chunks * vmm_chunk_;
+    lent_offset_ = vmm_bytes_ - size;
+    try { lent_bytes_.resize(size); }
+    catch (const std::bad_alloc&) { err = "not enough host RAM for the expert snapshot"; return false; }
+    if (cudaMemcpy(lent_bytes_.data(), base_ + lent_offset_, size, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        std::vector<uint8_t>().swap(lent_bytes_);
+        err = "cannot snapshot expert memory";
+        return false;
+    }
+    for (size_t i = lent_offset_ / vmm_chunk_; i < vmm_handles_.size(); ++i) {
+        if (!driver_ok(cuMemUnmap(reinterpret_cast<CUdeviceptr>(base_) + i * vmm_chunk_, vmm_chunk_),
+                       "lend: unmap", err)) return false;
+        vmm_mapped_[i] = false;
+        if (!driver_ok(cuMemRelease(vmm_handles_[i]), "lend: release", err)) return false;
+        vmm_handles_[i] = 0;
+    }
+    return true;
+#else
+    (void) free_bytes_required;
+    err = "CUDA required";
+    return false;
+#endif
+}
+
+bool ExpertCache::reclaim_after_vision(std::string& err) {
+    if (!lent()) return true;
+    for (size_t i = lent_offset_ / vmm_chunk_; i < vmm_handles_.size(); ++i)
+        if (!map_vmm_chunk(i, err)) return false;
+    if (cudaMemcpy(base_ + lent_offset_, lent_bytes_.data(), lent_bytes_.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "cannot restore the expert snapshot";
+        return false;
+    }
+    // Pageable H2D cudaMemcpy may return after staging but before DMA completes. The decoder's streams
+    // are nonblocking and do not inherit legacy-stream ordering, so restoration must finish before ACK.
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = "cannot synchronize restored expert memory";
+        return false;
+    }
+    std::vector<uint8_t>().swap(lent_bytes_);
+    lent_offset_ = 0;
+    return true;
 }
 
 /// R4.2g.  Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
@@ -252,13 +418,13 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (lent() || slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (lent() || slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
