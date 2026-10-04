@@ -1,5 +1,6 @@
 """Token ids whose text contains a script the old llama.cpp no-hanja.gbnf banned (CJK ideographs, kana, Cyrillic,
 Turkish-specific letters), plus byte-fragment tokens whose trailing partial UTF-8 sequence can only become one.
+Also bans every vocabulary token containing em dash (U+2014).
 Hangul (syllables, jamo) is never banned.  Writes int32 ids."""
 import json, struct, sys
 
@@ -10,7 +11,7 @@ RANGES = [(0xC7, 0xC7), (0xD6, 0xD6), (0xDC, 0xDC), (0xE7, 0xE7), (0xF6, 0xF6), 
           (0x2F800, 0x2FA1F), (0x30000, 0x323AF)]
 
 def banned_cp(c):
-    return any(a <= c <= b for a, b in RANGES)
+    return c == 0x2014 or any(a <= c <= b for a, b in RANGES)
 
 def byte_decoder():
     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
