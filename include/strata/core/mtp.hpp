@@ -156,6 +156,8 @@ private:
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
+    int32_t* draft_bans_ = nullptr;   ///< banned row indices in the reduced head, uploaded once before capture
+    int n_draft_bans_ = 0;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)

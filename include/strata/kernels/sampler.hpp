@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -31,6 +32,10 @@ struct SamplerParams {
 // before any graph capture; apply_bans is a no-op without a list.
 void sampler_set_bans(const int* ids, int n);
 void apply_bans(float* logits, int n_tokens, int n_vocab, void* stream);
+// Map the same bans to a draft head's vocabulary. `sub_to_id` is a HOST array; the returned ids index its rows.
+// Called once before graph capture. The row list passed to apply_bans_rows is a DEVICE array, owned by the caller.
+std::vector<int32_t> sampler_subset_bans(const int32_t* sub_to_id, int n_sub);
+void apply_bans_rows(float* logits, int n_tokens, int n_vocab, const int32_t* rows, int n_rows, void* stream);
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
 //
