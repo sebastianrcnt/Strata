@@ -2,9 +2,11 @@
   // The engine's conversation cache: the live conversation in the GPU, parked ones in RAM, saved ones on disk.
   import {fmt, gb, dateTime} from "../lib/format.js";
   import Panel from "../ui/Panel.svelte";
+  import Button from "../ui/Button.svelte";
   import Badge from "../ui/Badge.svelte";
   let {c} = $props();
 
+  let showAll = $state(false);
   const gbs = (b) => (b == null ? "–" : `${gb(b)} GB`);
   const rows = $derived.by(() => {
     if (!c || !c.slots) return [];
@@ -24,19 +26,22 @@
       out.push({id: `file-${f.key}`, slot: "–", state: [["neutral", "Disk only"]], tokens: f.tokens, disk: f.bytes, saved: dateTime(f.mtime)});
     return out;
   });
+  const shown = $derived(showAll ? rows : rows.slice(0, 5));
   const budget = $derived(c ? c.budget_mib * 1048576 : 0);
   const disk = $derived((c?.files || []).reduce((a, f) => a + f.bytes, 0));
 </script>
 
 {#if c && c.slots}
   <Panel title="Conversation cache" lamp={c.live_tokens > 0 ? "on" : ""} flush>
-    {#snippet tools()}<span>{fmt((c.parked || []).length)} of {fmt(c.slots)} parked · {gbs(c.bytes)} of {gbs(budget)} RAM</span>{/snippet}
+    {#snippet tools()}<span>{fmt((c.parked || []).length)} of {fmt(c.slots)} parked · {gbs(c.bytes)} of {gbs(budget)} RAM</span>
+      {#if rows.length > 5}<Button aria-expanded={showAll} onclick={() => showAll = !showAll}>{showAll ? "Show fewer" : `Show all ${rows.length}`}</Button>{/if}
+    {/snippet}
     <div class="bar"><i style:width="{budget ? Math.min(100, (100 * c.bytes) / budget) : 0}%"></i></div>
-    <div class="wrap">
+    <div class="wrap" class:all={showAll}>
       <table class="tbl">
         <thead><tr><th>Slot</th><th>State</th><th class="num">Tokens</th><th class="num">RAM</th><th class="num">On disk</th><th>Saved</th></tr></thead>
         <tbody>
-          {#each rows as r (r.id)}
+          {#each shown as r (r.id)}
             <tr><td>{r.slot}</td>
               <td>{#each r.state as [tone, text]}<Badge {tone} title={text === "next out" ? "evicted first when a new conversation needs the room" : undefined}>{text}</Badge>{" "}{:else}<span class="muted">Empty</span>{/each}</td>
               <td class="num">{fmt(r.tokens)}</td><td class="num">{gbs(r.ram)}</td><td class="num">{gbs(r.disk)}</td><td>{r.saved}</td></tr>
@@ -53,5 +58,6 @@
   .bar { height: 2px; background: var(--well); }
   .bar i { display: block; height: 100%; background: var(--value); }
   .wrap { overflow-x: auto; }
+  .wrap.all { max-height: 420px; overflow-y: auto; }
   .note { margin: 0; padding: 6px 10px; font-size: var(--fs-s); color: var(--dim); border-top: 1px solid var(--gap); }
 </style>
