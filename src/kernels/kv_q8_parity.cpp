@@ -82,7 +82,7 @@ int main() {
                     const float* x = (kvsel ? hv[pos] : hk[pos]).data() + h * D + g * 64;
                     float amax = 0.f;
                     for (int t = 0; t < 64; ++t) amax = std::fmax(amax, std::fabs(x[t]));
-                    const uint16_t sb = k::f16_from_f32(amax / 127.0f);
+                    const uint16_t sb = k::f16_from_f32(std::fmin(amax / 127.0f, 65504.0f));   // the kernel keeps the scale finite
                     const float sf = k::f32_from_f16(sb);
                     const long long row = ((long long) table[pos / P] * H + h) * P + pos % P;
                     if ((kvsel ? hvs : hks)[row * G + g] != sb) ++bad_codes;

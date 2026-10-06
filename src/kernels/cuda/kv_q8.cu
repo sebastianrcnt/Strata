@@ -44,7 +44,7 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
     if ((t & 31) == 0) warp_max[t >> 5] = a;
     __syncthreads();
     const float amax = fmaxf(warp_max[0], warp_max[1]);
-    const uint16_t sbits = f16_from_f32(amax / 127.0f);
+    const uint16_t sbits = f16_from_f32(kv_q8_scale(amax));   // finite: f16_bits.hpp
     const float sf = f32_from_f16(sbits);                          // quantize against the STORED scale
     int q = 0;
     if (sf > 0.0f) {

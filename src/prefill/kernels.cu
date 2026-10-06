@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/router_top10.hpp"
 
@@ -627,7 +628,7 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
     if ((threadIdx.x & 31) == 0) wm[threadIdx.x >> 5] = a;
     __syncthreads();
     const float amax = fmaxf(wm[0], wm[1]);
-    const uint16_t sb = hf(amax / 127.0f);
+    const uint16_t sb = hf(strata::kernels::kv_q8_scale(amax));   // finite: f16_bits.hpp, the same bits for every finite block
     const float sf = __half2float(__ushort_as_half(sb));
     int q = 0;
     if (sf > 0.0f) { q = __float2int_rn(x / sf); q = q < -127 ? -127 : (q > 127 ? 127 : q); }

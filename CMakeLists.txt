@@ -787,6 +787,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)
   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
+  # the int8 KV block scale stays a finite fp16: finite blocks bit-identical, overflowing ones clamped (header-only, CPU)
+  add_executable(kv_q8_scale_test src/kernels/kv_q8_scale_test.cpp)
+  target_include_directories(kv_q8_scale_test PRIVATE include)
+  add_test(NAME kv_q8_scale_test COMMAND kv_q8_scale_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

@@ -102,7 +102,7 @@ int main() {
                 float amax = 0.0f;
                 for (int t = 0; t < k::KV_Q8_GROUP; ++t)
                     amax = std::max(amax, std::fabs(K[((size_t) c * H + h) * D + g * k::KV_Q8_GROUP + t]));
-                const uint16_t sb = k::f16_from_f32(amax / 127.0f);
+                const uint16_t sb = k::f16_from_f32(std::fmin(amax / 127.0f, 65504.0f));   // the kernel keeps the scale finite
                 const float sf = k::f32_from_f16(sb);
                 for (int t = 0; t < k::KV_Q8_GROUP; ++t) {
                     int q = 0;

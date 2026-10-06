@@ -68,6 +68,15 @@ STRATA_HD inline uint16_t f16_from_f32(float f) {
     return h;
 }
 
+/// The int8 KV cache block scale `max|x| / 127`, kept finite as an fp16.  A block with max|x| past 127 * 65520 (8.3M)
+/// would store an inf scale, and the cell would dequantize to inf * 0 = NaN; clamped to the largest finite half it
+/// reads back approximately instead (the codes are already held to [-127, 127]).  Every block whose scale was finite
+/// is stored bit for bit as before (values in (65504, 65520) round to 65504 anyway); a NaN stays a NaN.
+STRATA_HD inline float kv_q8_scale(float amax) {
+    const float d = amax / 127.0f;
+    return d > 65504.0f ? 65504.0f : d;
+}
+
 /// Exact fp16 bits -> f32.  No rounding, no exceptions: every one of the 65,536 inputs maps to a value f32
 /// represents exactly, including the subnormals (which is why the `ex == 0` case cannot be skipped).
 STRATA_HD inline float f32_from_f16(uint16_t h) {
