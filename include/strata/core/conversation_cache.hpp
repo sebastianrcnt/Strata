@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -159,6 +160,7 @@ public:
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             bytes_ -= entries_.front().bytes();
+            if (evicted_) evicted_(std::move(entries_.front()));   // --conversation-dir: spilled, not lost
             entries_.pop_front();
             ++evictions_;
         }
@@ -198,6 +200,8 @@ public:
         return dropped;
     }
     size_t superseded() const { return superseded_; }
+    // Receives each conversation make_room evicts (it may block: the caller's request waits).
+    void on_evict(std::function<void(SavedConversation&&)> sink) { evicted_ = std::move(sink); }
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
@@ -212,6 +216,7 @@ public:
 private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
+    std::function<void(SavedConversation&&)> evicted_;
     ConversationKvReuse reuse_;
 };
 

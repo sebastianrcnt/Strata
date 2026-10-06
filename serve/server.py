@@ -303,13 +303,21 @@ class StrataEngine:
             self.usage = {"layers": int(f[1]), "experts": int(f[2]), "now": f[3], "before": before, "at": time.time()}
 
     def _parse_cache(self, line: str):
-        """CACHE <live tokens> <parked bytes> <evictions> [<key>:<tokens>:<bytes> ...], oldest parked first."""
+        """CACHE <live tokens> <parked bytes> <evictions> [<key>:<tokens>:<bytes> ...], oldest parked first; then the
+        disk tier's conversations as D<key>:<tokens>:<file bytes> (least recently used first) and
+        S<spills>:<disk restores>:<bytes waiting to be written>."""
         f = line.split()
         try:
-            parked = [{"key": k, "tokens": int(t), "bytes": int(b)}
-                      for k, t, b in (x.split(":") for x in f[4:])]
+            parked, disk, spill = [], [], None
+            for k, t, b in (x.split(":") for x in f[4:]):
+                if k.startswith("D"):
+                    disk.append({"key": k[1:], "tokens": int(t), "bytes": int(b)})
+                elif k.startswith("S"):
+                    spill = {"spills": int(k[1:]), "restores": int(t), "pending_bytes": int(b)}
+                else:
+                    parked.append({"key": k, "tokens": int(t), "bytes": int(b)})
             self.conv.update(reported=True, live_tokens=int(f[1]), bytes=int(f[2]), evictions=int(f[3]),
-                             parked=parked)
+                             parked=parked, disk=disk, spill=spill)
         except (ValueError, IndexError):
             pass
 

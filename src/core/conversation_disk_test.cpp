@@ -6,6 +6,7 @@
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace strata::core;
@@ -313,7 +315,7 @@ int main(int argc, char** argv) {
     if (argc == 5 && std::string(argv[1]) == "real") return real(argv[2], argv[3], argv[4]);
     if (argc == 5 && std::string(argv[1]) == "prefix") return prefix(argv[2], (size_t) std::atoi(argv[3]), argv[4]);
     const std::string dir = tmpdir();
-    std::string e;
+    std::string e, e0;
     // A conversation over four turns: the third rewrites the reply's tail (#342: the client re-renders it).
     const auto ids0 = tokens(10000, 1);
     const auto ids1 = extend(ids0, 700, 2);
@@ -417,55 +419,173 @@ int main(int argc, char** argv) {
     for (const auto& n : conv_files(dir)) fs::remove(fs::path(dir) / n);
 
     std::vector<std::string> log;
-    auto persist = [&](std::vector<const SavedConversation*> v, ConversationDiskPolicy pol = {}) {
-        auto st = conversation_disk_persist(dir, v, pol, [&](const std::string& m) { log.push_back(m); });
-        std::printf("  persist: %d written (%d deltas, %.2f MB of %.2f MB), %d unchanged, %d removed, files=%zu\n",
-                    st.written, st.deltas, st.bytes / 1e6, st.image_bytes / 1e6, st.unchanged, st.removed,
-                    conv_files(dir).size());
-        return st;
+    auto logger = [&](const std::string& m) {
+        std::printf("  log: %s\n", m.c_str());
+        if (m.find("FAILED") != std::string::npos || m.find("cannot") != std::string::npos) log.push_back(m);
     };
-    auto loadable = [&] {
-        std::vector<std::string> n;
-        for (const auto& p : conversation_disk_loadable(dir)) n.push_back(fs::path(p).filename().string());
-        return n;
+    auto clean = [&] { for (const auto& de : fs::directory_iterator(dir)) fs::remove(de.path()); };
+    auto options = [](uint64_t budget = 1ull << 40) {
+        ConversationStoreOptions o;
+        o.budget_bytes = budget;
+        return o;
     };
-    {   // persist: deltas, ancestors kept but not loaded, GC once nothing needs them
-        auto s = persist({&a0});
-        check(s.written == 1 && s.deltas == 0, "first persist is whole");
-        s = persist({&a1});
-        check(s.written == 1 && s.deltas == 1 && s.removed == 0, "next turn is a delta; its parent is kept");
-        check(loadable() == std::vector<std::string>{conversation_disk_name(a1)}, "the parent kept only for a delta is not loaded");
-        s = persist({&a1});
-        check(s.unchanged == 1 && s.written == 0, "an unchanged conversation is not written again");
-        s = persist({&a2, &a3});
-        check(s.written == 2 && s.deltas == 2 && conv_files(dir).size() == 4, "two held deltas, chain a0-a1 kept");
-        auto l = loadable();
-        check(l.size() == 2 && l[0] == conversation_disk_name(a2) && l[1] == conversation_disk_name(a3),
-              "both held conversations load, in recency order");
-        for (const auto& n : l) {
-            SavedConversation im;
-            check(conversation_disk_read(im, (fs::path(dir) / n).string(), e), "loadable file reads");
+    auto prompt = [](const std::vector<int32_t>& ids, size_t keep, size_t more) {
+        std::vector<int32_t> p(ids.begin(), ids.begin() + (std::ptrdiff_t) keep);
+        for (size_t i = 0; i < more; ++i) p.push_back(5);
+        return p;
+    };
+    auto fsize = [&](const SavedConversation& im) { return (uint64_t) fs::file_size(P(dir, im)); };
+    auto show = [](const char* what, const ConversationDiskStats& s) {
+        std::printf("  %s: %d written (%d deltas, %.2f MB of %.2f MB), %d unchanged, %d removed\n", what, s.written,
+                    s.deltas, s.bytes / 1e6, s.image_bytes / 1e6, s.unchanged, s.removed);
+        return s;
+    };
+    clean();
+    {   // the catalog: deltas, supersession, matching by the index alone
+        ConversationStore st;
+        check(st.open(dir, options(), logger), "open");
+        auto s = show("a0", st.persist({&a0}));
+        check(s.written == 1 && s.deltas == 0, "first file is whole");
+        s = show("a1", st.persist({&a1}));
+        check(s.written == 1 && s.deltas == 1 && s.removed == 0, "next turn is a delta; its parent stays");
+        auto e = st.entries();
+        check(e.size() == 1 && e[0].name == conversation_disk_name(a1) && e[0].tokens == (int64_t) ids1.size(),
+              "a0 is superseded by a1: one conversation, two files");
+        check(conv_files(dir).size() == 2, "a0 kept as a1's parent");
+        auto m = st.best(prompt(ids1, ids1.size(), 10), {}, true);
+        check(m.tokens == (int64_t) ids1.size() && m.live && m.name == conversation_disk_name(a1) &&
+              m.read_bytes == fsize(a0) + fsize(a1), "a continuation of a1 matches its live state; the read is the chain");
+        auto c = st.best(prompt(ids1, 9500, 3), {}, true);
+        check(c.tokens == 9000 && !c.live, "an edit after token 9500 matches the 9000 checkpoint");
+        check(st.best(prompt(ids1, ids1.size(), 10), {}, false).tokens == 0, "the steering mode must match");
+        check(st.best(prompt(ids1, ids1.size(), 10), {{5, 42}}, true).tokens == 0, "a picture in the prefix must match");
+        check(st.best(prompt(ids1, 900, 10), {}, true).tokens == 0, "nothing shorter than the first checkpoint");
+        check(st.worth(m, 0), "10700 tokens to read again (~6 s) beat reading ~40 MB");
+        check(!st.worth(m, m.tokens - 100), "a 100-token gain is not worth a read");
+        check(!st.worth(c, 0) || c.read_bytes > 0, "worth weighs the chain's bytes");
+        SavedConversation back;
+        check(st.take(m, back, e0) && same(back, a1), "a disk hit restores a1 byte for byte");
+        check(st.stats().hits == 1, "counted as a disk hit");
+    }
+    {   // a new process: the catalog comes back from the manifest and the indexes
+        ConversationStore st;
+        check(st.open(dir, options(), logger), "reopen");
+        check(st.entries().size() == 1 && st.recent(2) == std::vector<std::string>{conversation_disk_name(a1)},
+              "reopened: the same conversation, a0 still a parent only");
+        check(st.best(prompt(ids1, ids1.size(), 1), {}, true).tokens == (int64_t) ids1.size(), "and it matches");
+    }
+    clean();
+    {   // a format 1 file is matched from its token lists, then superseded by a whole format 2 file
+        write_v1(a0, P(dir, a0));
+        ConversationStore st;
+        check(st.open(dir, options(), logger), "open with a format 1 file");
+        auto m = st.best(prompt(ids0, ids0.size(), 4), {}, true);
+        check(m.tokens == (int64_t) ids0.size() && m.live, "format 1 live state matched without reading its states");
+        SavedConversation back;
+        check(st.take(m, back, e0) && same(back, a0), "format 1 restore");
+        auto s = show("a1 over format 1", st.persist({&a1}));
+        check(s.written == 1 && s.deltas == 0 && s.removed == 1 && conv_files(dir).size() == 1,
+              "a1 is whole (format 1 is never a parent); a0 superseded and removed");
+    }
+    clean();
+    {   // spill: queued, matched and taken back before its write
+        ConversationStore st;
+        check(st.open(dir, options(), logger), "open");
+        st.hold_writes(true);
+        SavedConversation c = a1;
+        const uint64_t bytes = c.bytes();
+        st.spill(std::move(c));
+        check(st.pending_bytes() == bytes && st.stats().pending == 1, "queued bytes counted");
+        auto m = st.best(prompt(ids1, ids1.size(), 5), {}, true);
+        check(m.pending != 0 && m.tokens == (int64_t) ids1.size() && st.worth(m, 0), "a queued image matches, no read");
+        SavedConversation back;
+        check(st.take(m, back, e0) && same(back, a1), "taken back whole");
+        check(st.pending_bytes() == 0 && conv_files(dir).empty(), "nothing written, nothing pending");
+        st.hold_writes(false);
+        // written between best() and take(): take refuses, best() then finds the file
+        c = a1;
+        st.hold_writes(true);
+        st.spill(std::move(c));
+        m = st.best(prompt(ids1, ids1.size(), 5), {}, true);
+        st.hold_writes(false);
+        st.flush();
+        check(!st.take(m, back, e0), "a queued match written meanwhile is refused");
+        m = st.best(prompt(ids1, ids1.size(), 5), {}, true);
+        check(m.pending == 0 && m.name == conversation_disk_name(a1) && st.take(m, back, e0) && same(back, a1),
+              "and found on disk");
+        // the same image spilled again is not written again
+        c = a1;
+        st.spill(std::move(c));
+        st.flush();
+        check(st.stats().spill_unchanged == 1, "a spill of a conversation already on disk writes nothing");
+    }
+    clean();
+    {   // queued bytes are bounded: the second spill waits for the first write
+        ConversationStoreOptions o = options();
+        o.pending_bytes = a1.bytes() + 1;
+        ConversationStore st;
+        check(st.open(dir, o, logger), "open");
+        st.hold_writes(true);
+        SavedConversation c1 = a1, c2 = a2;
+        st.spill(std::move(c1));   // one image is always admitted
+        std::atomic<bool> done{false};
+        std::thread t([&] { st.spill(std::move(c2)); done = true; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        check(!done.load(), "a spill past the pending bound blocks");
+        st.hold_writes(false);
+        t.join();
+        st.flush();
+        const auto s = st.stats();
+        check(done.load() && s.spills == 2 && s.spill_wait_seconds > 0.2 && s.pending_bytes == 0,
+              "it went on once the first was written");
+        check(st.entries().size() == 1 && conv_files(dir).size() == 2, "a2 (a delta of a1) supersedes a1, which stays its parent");
+        std::printf("  spills: %llu, %.2f MB written for %.2f MB of images in %.2f s (waited %.2f s)\n",
+                    (unsigned long long) s.spills, s.spill_bytes / 1e6, s.spill_image_bytes / 1e6, s.spill_seconds,
+                    s.spill_wait_seconds);
+    }
+    clean();
+    {   // the byte budget: least recently used conversations go, never a parent a kept delta needs
+        uint64_t other_b, a0_b, a1_b;
+        {
+            ConversationStore st;
+            check(st.open(dir, options(), logger), "open");
+            st.persist({&other});
+            st.persist({&a0});
+            st.persist({&a1});
+            other_b = fsize(other); a0_b = fsize(a0); a1_b = fsize(a1);
         }
-        s = persist({&a1, &a3});
-        check(s.unchanged == 2 && s.removed == 0 && conv_files(dir).size() == 4,
-              "a2 no longer held but kept: a3 is its delta");
-        check(loadable().size() == 2, "a1 is held (manifest) and loads although a3 descends from it");
-        fs::remove(fs::path(dir) / "conversations.manifest");
-        check(loadable() == std::vector<std::string>{conversation_disk_name(a3)},
-              "without a manifest a parent is taken for an ancestor only");
-        s = persist({&other});
-        check(s.written == 1 && s.deltas == 0 && s.removed == 4 && conv_files(dir).size() == 1,
-              "an unrelated conversation is whole; the whole old chain is removed");
+        {
+            ConversationStore st;
+            check(st.open(dir, options(a0_b + a1_b + other_b / 2), logger), "reopen under a smaller budget");
+            check(conv_files(dir).size() == 2 && !fs::exists(P(dir, other)) && fs::exists(P(dir, a0)),
+                  "the least recently used conversation went; a1's parent stayed");
+            check(st.stats().evicted == 1, "one budget eviction");
+        }
+        {
+            ConversationStore st;
+            check(st.open(dir, options(a1_b), logger), "a budget below the last conversation's chain");
+            check(conv_files(dir).size() == 2 && st.entries().size() == 1, "the last conversation is never dropped");
+            const SavedConversation b = image(tokens(5000, 77), {1000}, 1);
+            auto s = show("b", st.persist({&b}));
+            check(s.written == 1 && s.removed == 2 && conv_files(dir).size() == 1 && fs::exists(P(dir, b)),
+                  "a newer one replaces it: the delta and its parent go together");
+        }
     }
-    {   // a broken chain on disk: the held file is rewritten whole
-        persist({&a0});
-        persist({&a1});
+    clean();
+    {   // a broken chain found at start: dropped, never offered
+        {
+            ConversationStore st;
+            check(st.open(dir, options(), logger), "open");
+            st.persist({&a0});
+            st.persist({&a1});
+        }
         fs::remove(P(dir, a0));
-        auto s = persist({&a1});
-        check(s.written == 1 && s.deltas == 0 && s.unchanged == 0, "held delta with a missing parent is rewritten whole");
-        check(reads_as(P(dir, a1), a1), "the repaired file reads");
+        ConversationStore st;
+        check(st.open(dir, options(), logger), "reopen without a1's parent");
+        check(st.entries().empty() && conv_files(dir).empty() &&
+              st.best(prompt(ids1, ids1.size(), 1), {}, true).tokens == 0, "a1 dropped and removed");
     }
-    for (const auto& n : conv_files(dir)) fs::remove(fs::path(dir) / n);
+    clean();
     {   // compaction by depth: the chain restarts whole after max_depth deltas
         std::vector<SavedConversation> turns;
         std::vector<int32_t> ids = ids0;
@@ -475,37 +595,39 @@ int main(int argc, char** argv) {
             cks.push_back(ids.size());
             ids = extend(ids, 150, 100 + i);
         }
+        ConversationStoreOptions o = options();
+        o.policy.max_depth = 4;
+        o.policy.max_chain_fraction = 10;
+        ConversationStore st;
+        check(st.open(dir, o, logger), "open");
         int deltas = 0, wholes = 0;
-        ConversationDiskPolicy pol;
-        pol.max_depth = 4;
-        pol.max_chain_fraction = 10;
         for (auto& t : turns) {
-            auto s = persist({&t}, pol);
+            auto s = st.persist({&t});
             deltas += s.deltas;
             wholes += s.written - s.deltas;
             ConversationDiskIndex x;
-            check(conversation_disk_read_index(x, P(dir, t), e) && x.depth <= 4, "depth bounded by the policy");
+            check(conversation_disk_read_index(x, P(dir, t), e0) && x.depth <= 4, "depth bounded by the policy");
             check(reads_as(P(dir, t), t), "every turn restores");
         }
         check(wholes == 3 && deltas == 8, "11 turns at max_depth 4: whole, 4 deltas, whole, 4 deltas, whole");
-        check(conv_files(dir).size() == 1, "after compaction the old chain is removed");
+        check(conv_files(dir).size() == 1 && st.entries().size() == 1, "after compaction the old chain is removed");
     }
-    for (const auto& n : conv_files(dir)) fs::remove(fs::path(dir) / n);
-    {   // compaction by size: deltas past the share of the base are written whole
-        ConversationDiskPolicy pol;
-        pol.max_chain_fraction = 0.15;
-        persist({&a0}, pol);
-        auto s = persist({&a1}, pol);
-        check(s.deltas == 1, "a small turn fits 15%");
-        s = persist({&a2}, pol);
-        check(s.deltas == 0 && s.written == 1, "the chain past 15% of the base is written whole");
-        check(conv_files(dir).size() == 1, "and the old chain goes");
+    clean();
+    {   // compaction by size
+        ConversationStoreOptions o = options();
+        o.policy.max_chain_fraction = 0.15;
+        ConversationStore st;
+        check(st.open(dir, o, logger), "open");
+        st.persist({&a0});
+        check(st.persist({&a1}).deltas == 1, "a small turn fits 15%");
+        auto s = st.persist({&a2});
+        check(s.deltas == 0 && s.written == 1 && conv_files(dir).size() == 1, "past 15% of the base: whole, old chain gone");
     }
-    for (const auto& n : conv_files(dir)) fs::remove(fs::path(dir) / n);
+    clean();
     {   // the state codec: lossless, and it takes something off
         SavedConversation small = image(tokens(64, 5), {16, 32, 48}, 1);
         ConversationDiskWritten w;
-        check(conversation_disk_write(small, P(dir, small), e, {}, &w), "write state-heavy image");
+        check(conversation_disk_write(small, P(dir, small), e0, {}, &w), "write state-heavy image");
         std::printf("state-heavy image: %.2f MB on disk for %.2f MB\n", w.file_bytes / 1e6, w.image_bytes / 1e6);
 #if defined(STRATA_HAVE_ZSTD)
         check(w.file_bytes < w.image_bytes * 0.97, "checkpoint state is stored compressed");
@@ -515,8 +637,7 @@ int main(int argc, char** argv) {
         fs::copy_file(P(dir, small), c);
         corrupt(c, 400000);   // inside the first checkpoint's packed GDN
         check(rejected(c, ""), "a flipped byte in packed state is rejected");
-        fs::remove(c);
-        fs::remove(P(dir, small));
+        clean();
     }
     {   // checkpoint thinning: the positions of a real file (conv-3593...-70768)
         SavedConversation t;
@@ -526,28 +647,25 @@ int main(int argc, char** argv) {
             t.checkpoints.push_back(c);
         }
         check(conversation_disk_keep_checkpoints(t, 0).size() == 6, "gap 0 keeps every checkpoint");
-        const auto keep = conversation_disk_keep_checkpoints(t, 4096);
-        check(keep == std::vector<size_t>{0, 1, 2, 5}, "gap 4096: root, 67547 and the two deepest");
+        check(conversation_disk_keep_checkpoints(t, 4096) == std::vector<size_t>{0, 1, 2, 5},
+              "gap 4096: root, 67547 and the two deepest");
         check(conversation_disk_keep_checkpoints(t, 100000) == std::vector<size_t>{0, 1, 5},
               "a gap past everything keeps the root and the two deepest");
-        // persisting with a gap writes the thinned image; reading and persisting it again changes nothing
         const auto ids = tokens(12000, 21);
         const SavedConversation full = image(ids, {1000, 9000, 9300, 9600, 11000, 11500}, 1);
-        ConversationDiskPolicy pol;
-        pol.checkpoint_gap = 1024;
-        auto st = persist({&full}, pol);
-        check(st.written == 1 && st.dropped_checkpoints == 2, "two middle checkpoints dropped");
-        const auto files = conversation_disk_loadable(dir);
-        check(files.size() == 1, "one file");
+        ConversationStoreOptions o = options();
+        o.policy.checkpoint_gap = 1024;
+        ConversationStore st;
+        check(st.open(dir, o, logger), "open");
+        auto s = st.persist({&full});
+        check(s.written == 1 && s.dropped_checkpoints == 2, "two middle checkpoints dropped");
         SavedConversation back, want = full;
         want.checkpoints = {full.checkpoints[0], full.checkpoints[1], full.checkpoints[4], full.checkpoints[5]};
-        check(conversation_disk_read(back, files[0], e) && same(back, want), "thinned image restores");
-        st = persist({&back}, pol);
-        check(st.unchanged == 1 && st.written == 0, "the reloaded thinned image is the same file");
-        st = persist({&full}, pol);
-        check(st.unchanged == 1, "the in-RAM image maps to that file too");
+        check(st.load(st.recent(1).at(0), back, e0) && same(back, want), "thinned image restores");
+        check(st.persist({&back}).unchanged == 1, "the reloaded thinned image is the same file");
+        check(st.persist({&full}).unchanged == 1, "the in-RAM image maps to that file too");
     }
-    check(log.empty(), "no persist errors");
+    check(log.empty(), "no write errors");
     fs::remove_all(dir);
     std::printf("conversation_disk_test: %d checks passed\n", checks);
     return 0;

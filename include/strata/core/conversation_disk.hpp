@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,7 @@ std::string conversation_disk_name(const SavedConversation& image);
 // What a format 2 file says about the image it restores to, read without loading it.
 struct ConversationDiskIndex {
     static constexpr size_t chunk_bytes = 64 * 1024;
-    uint32_t version = 0;                 // 1: legacy whole image without an index (no other field is set)
+    uint32_t version = 0;                 // 1: legacy whole image without an index (only the slots' tokens are set)
     bool delta = false;
     std::string parent;                   // the parent's file name, in the same directory (delta only)
     uint64_t parent_fingerprint = 0;
@@ -43,7 +44,11 @@ struct ConversationDiskIndex {
     std::array<int64_t, 18> geometry{};
     int64_t layer_lo = 0, layer_hi = 0;
     bool cvec = true;
-    struct Slot { uint64_t hash = 0, bytes = 0, used = 0; };   // checkpoint payload hash without `used`
+    struct Slot {
+        uint64_t hash = 0, bytes = 0, used = 0;   // checkpoint payload hash without `used`
+        uint64_t ids_len = 0, ids_hash = 0;       // its tokens, for matching a prompt without reading the file
+        std::vector<ConversationImageKey> imgs;
+    };
     std::vector<Slot> slots;              // the live checkpoint first, then the checkpoints
     struct Buffer { uint64_t size = 0; std::vector<uint64_t> chunks; };
     struct Layer {
@@ -87,13 +92,76 @@ struct ConversationDiskStats {
 };
 // The image's checkpoints (indices, in its order) a disk image keeps under ConversationDiskPolicy::checkpoint_gap.
 std::vector<size_t> conversation_disk_keep_checkpoints(const SavedConversation& image, uint64_t gap);
-// --conversation-dir's QUIT/PERSIST: `images` least recently active first.  Writes each image not already on disk
-// (a delta where a held or kept file shares enough with it), then the manifest of held files, then removes the
-// conv-* files that are neither held nor an ancestor of a held one.  `log` gets one line per problem.
-ConversationDiskStats conversation_disk_persist(const std::string& dir, const std::vector<const SavedConversation*>& images,
-                                                const ConversationDiskPolicy& policy,
-                                                const std::function<void(const std::string&)>& log);
-// The .bin files load_all should load, oldest first: all but those kept only as a held delta's ancestor.
-std::vector<std::string> conversation_disk_loadable(const std::string& dir);
+// ---- the disk tier of --serve's conversation cache (--conversation-dir)
+//
+// A directory of conversation files the cache spills evicted conversations into and restores them from.  Its
+// catalog is built from each file's index (format 2) or its token lists (format 1), never by reading images, and
+// matches a prompt by the hash of its leading tokens.  A file is a conversation (listed in conversations.manifest,
+// or not a parent of another file) or kept only as a held delta's parent.  A new file supersedes (#342) the
+// conversations whose deepest checkpoint it holds.  Files past the byte budget go least recently used first,
+// with every parent a kept delta needs.  Writes run on one background thread; the images waiting for it are
+// bounded by `pending_bytes` and can be handed back before (or after) they are written.
+struct ConversationStoreOptions {
+    ConversationDiskPolicy policy;
+    uint64_t budget_bytes = 100ull << 30;  // the directory's conv-* files
+    uint64_t pending_bytes = 4ull << 30;   // spilled images not written yet (one is always admitted)
+    double read_mb_s = 100;                // a disk restore is taken when re-reading the tokens it adds would
+    double prefill_tok_s = 1800;           //   take longer than reading its files
+    int64_t min_gain = 4096;               //   ... and it adds at least this many tokens
+    bool background = true;                // false: spill() writes before it returns
+};
+struct ConversationStoreMatch {
+    int64_t tokens = 0;
+    bool live = false;
+    std::string name;                      // the file, or empty for a spilled image not written yet
+    uint64_t pending = 0;                  // that image's id
+    uint64_t read_bytes = 0, image_bytes = 0;
+};
+struct ConversationStoreStats {
+    uint64_t spills = 0, spill_written = 0, spill_unchanged = 0, spill_bytes = 0, spill_image_bytes = 0;
+    double spill_seconds = 0, spill_wait_seconds = 0;
+    uint64_t hits = 0, hit_tokens = 0, read_bytes = 0, reclaimed = 0, evicted = 0, removed = 0;
+    double read_seconds = 0;
+    uint64_t conversations = 0, files = 0, disk_bytes = 0, pending = 0, pending_bytes = 0;
+};
+struct ConversationStoreEntry {
+    std::string name;
+    uint64_t key = 0;
+    int64_t tokens = 0;
+    uint64_t bytes = 0;                    // its file (a delta's own)
+};
+
+class ConversationStore {
+public:
+    using Log = std::function<void(const std::string&)>;
+    ConversationStore();
+    ~ConversationStore();                  // finishes the queued writes
+    ConversationStore(const ConversationStore&) = delete;
+    ConversationStore& operator=(const ConversationStore&) = delete;
+
+    bool open(const std::string& dir, const ConversationStoreOptions& options, Log log);
+    bool enabled() const;
+    // An evicted conversation: queued for the writer.  Blocks while the queued images would pass pending_bytes.
+    void spill(SavedConversation&& image);
+    // QUIT/PERSIST: after the queue, writes each image not on disk yet.
+    ConversationDiskStats persist(const std::vector<const SavedConversation*>& images);
+    void flush();                          // until every queued write is done
+    ConversationStoreMatch best(const std::vector<int32_t>& prompt, const std::vector<ConversationImageKey>& images,
+                                bool cvec) const;
+    // whether restoring `m` beats reading again what it adds to the `have` tokens a request has already
+    bool worth(const ConversationStoreMatch& m, int64_t have) const;
+    // The image of a match: a queued one is taken back (after its write, if that has begun), a file is read.
+    bool take(const ConversationStoreMatch& m, SavedConversation& image, std::string& error);
+    bool load(const std::string& name, SavedConversation& image, std::string& error);
+    std::vector<std::string> recent(size_t n) const;   // conversations, most recently used first
+    std::vector<ConversationStoreEntry> entries() const;   // conversations, least recently used first
+    ConversationStoreStats stats() const;
+    uint64_t pending_bytes() const;
+    void hold_writes(bool hold);           // tests: the writer starts nothing while held
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace strata::core

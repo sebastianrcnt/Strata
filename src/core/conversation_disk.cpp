@@ -1,7 +1,14 @@
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <tuple>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -154,7 +161,7 @@ bool unpack(const std::vector<uint8_t>& packed, std::vector<uint8_t>& v, size_t 
 // ---- the index's byte form
 struct Out {
     std::string s;
-    void raw(const void* p, size_t n) { s.append(static_cast<const char*>(p), n); }
+    void raw(const void* p, size_t n) { if (n) s.append(static_cast<const char*>(p), n); }
     template<class T> void pod(const T& v) { raw(&v, sizeof v); }
     void str(const std::string& v) { pod<uint64_t>(v.size()); raw(v.data(), v.size()); }
 };
@@ -165,7 +172,8 @@ struct In {
     void raw(void* d, size_t n) {
         ok = ok && n <= left;
         if (!ok) return;
-        std::memcpy(d, p, n); p += n; left -= n;
+        if (n) std::memcpy(d, p, n);
+        p += n; left -= n;
     }
     template<class T> void pod(T& v) { raw(&v, sizeof v); }
     uint64_t count(size_t elem) {
@@ -181,7 +189,11 @@ std::string describe(const Index& x) {
     Out o;
     o.pod(x.geometry); o.pod(x.layer_lo); o.pod(x.layer_hi); o.pod<uint8_t>(x.cvec);
     o.pod<uint64_t>(x.slots.size());
-    for (const auto& s : x.slots) { o.pod(s.hash); o.pod(s.bytes); o.pod(s.used); }
+    for (const auto& s : x.slots) {
+        o.pod(s.hash); o.pod(s.bytes); o.pod(s.used); o.pod(s.ids_len); o.pod(s.ids_hash);
+        o.pod<uint64_t>(s.imgs.size());
+        o.raw(s.imgs.data(), s.imgs.size() * sizeof(ConversationImageKey));
+    }
     o.pod<uint64_t>(x.kv.size());
     for (const auto& l : x.kv) {
         o.pod(l.format); o.pod(l.cells); o.pod(l.heads); o.pod(l.head_dim); o.pod(l.page_size);
@@ -213,8 +225,13 @@ bool parse(Index& x, const std::string& bytes) {
     in.pod(x.geometry); in.pod(x.layer_lo); in.pod(x.layer_hi); in.pod(cvec);
     x.delta = delta != 0;
     x.cvec = cvec != 0;
-    x.slots.resize(in.count(24));
-    for (auto& s : x.slots) { in.pod(s.hash); in.pod(s.bytes); in.pod(s.used); }
+    x.slots.resize(in.count(48));
+    for (auto& s : x.slots) {
+        if (!in.ok) break;
+        in.pod(s.hash); in.pod(s.bytes); in.pod(s.used); in.pod(s.ids_len); in.pod(s.ids_hash);
+        s.imgs.resize(in.count(sizeof(ConversationImageKey)));
+        in.raw(s.imgs.data(), s.imgs.size() * sizeof(ConversationImageKey));
+    }
     x.kv.resize(in.count(60));
     for (auto& l : x.kv) {
         if (!in.ok) break;
@@ -294,6 +311,23 @@ struct Reader {
         raw(v.data(), v.size() * sizeof(T));
     }
     void str(std::string& v) { v.resize(count(1)); raw(v.data(), v.size()); }
+    void skip(uint64_t n) {
+        ok = ok && n <= left && ::fseeko(f, (off_t) n, SEEK_CUR) == 0;
+        if (ok) left -= n;
+    }
+    // a format 1 checkpoint's tokens and pictures; its state is skipped, not read
+    void summary(Index::Slot& s, int depth = 0) {
+        std::vector<int32_t> ids;
+        vec(ids);
+        s.ids_len = ids.size();
+        s.ids_hash = xxh64(ids.data(), ids.size() * sizeof(int32_t), 0);
+        vec(s.imgs);
+        for (int i = 0; i < 5 && ok; ++i) skip(count(1));
+        pod(s.used);
+        const uint64_t parts = count(1);
+        if (depth > 0 && parts) ok = false;
+        for (uint64_t i = 0; i < parts && ok; ++i) { Index::Slot part; summary(part, depth + 1); }
+    }
     void range(ConversationBuffer& b, size_t from) {
         ok = ok && b.visit(from, b.size() - from, [&](uint8_t* p, size_t n, size_t) {
             raw(p, n);
@@ -327,10 +361,11 @@ struct File {
     FILE* f = nullptr;
     std::vector<char> io;
     ~File() { if (f) std::fclose(f); }
-    bool open(const std::string& path, const char* mode) {
+    // 8 MiB for streaming an image; small for the index reads, which seek (a seek drops the buffer)
+    bool open(const std::string& path, const char* mode, size_t buffer = 8u << 20) {
         f = std::fopen(path.c_str(), mode);
         if (!f) return false;
-        io.resize(8u << 20);
+        io.resize(buffer);
         std::setvbuf(f, io.data(), _IOFBF, io.size());
         return true;
     }
@@ -434,6 +469,9 @@ Index index_of(const SavedConversation& image, const Checkpoints& checkpoints) {
         Index::Slot slot;
         slot.hash = checkpoint_hash(c, 0, slot.bytes);
         slot.used = c.used;
+        slot.ids_len = c.ids.size();
+        slot.ids_hash = xxh64(c.ids.data(), c.ids.size() * sizeof(int32_t), 0);
+        slot.imgs = c.imgs;
         x.image_bytes += slot.bytes;
         x.slots.push_back(slot);
     }
@@ -528,7 +566,7 @@ bool read_index_file(Index& x, const std::string& path, std::string& error) {
     const uint64_t size = fs::file_size(path, ec);
     if (ec) { error = path + ": " + ec.message(); return false; }
     File file;
-    if (!file.open(path, "rb")) { error = "cannot open " + path + ": " + std::strerror(errno); return false; }
+    if (!file.open(path, "rb", 64 * 1024)) { error = "cannot open " + path + ": " + std::strerror(errno); return false; }
     Reader r{file.f, size};
     char magic[8] = {};
     uint32_t version = 0;
@@ -539,7 +577,21 @@ bool read_index_file(Index& x, const std::string& path, std::string& error) {
         return false;
     }
     x.version = version;
-    if (version == kVersionLegacy) { x.image_bytes = size; return true; }
+    if (version == kVersionLegacy) {
+        // what matching needs (the slots' tokens and pictures), seeking over the states
+        uint8_t cvec = 1;
+        r.pod(x.geometry); r.pod(x.layer_lo); r.pod(x.layer_hi); r.pod(cvec);
+        x.cvec = cvec != 0;
+        x.slots.emplace_back();
+        r.summary(x.slots[0]);
+        const uint64_t n = r.count(1);
+        for (uint64_t i = 0; i < n && r.ok; ++i) { x.slots.emplace_back(); r.summary(x.slots.back()); }
+        if (!r.ok) { x = {}; error = path + ": truncated or corrupt"; return false; }
+        x.version = version;
+        x.tokens = x.slots[0].ids_len;
+        x.image_bytes = size;
+        return true;
+    }
     uint64_t at = 0;
     if (size < 28 + 16 || ::fseeko(file.f, (off_t) (size - 16), SEEK_SET) != 0) { error = path + ": truncated"; return false; }
     r.left = 16;
@@ -784,153 +836,543 @@ bool conversation_disk_read(SavedConversation& image, const std::string& path, s
     return read_image(image, path, 0, nullptr, error);
 }
 
-ConversationDiskStats conversation_disk_persist(const std::string& dir, const std::vector<const SavedConversation*>& images,
-                                                const ConversationDiskPolicy& policy,
-                                                const std::function<void(const std::string&)>& log) {
-    ConversationDiskStats st;
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    // What is on disk now: every conv-*.bin with its index (format 1 and unreadable files have none).
-    struct Entry { Index index; bool readable = false; };
-    std::map<std::string, Entry> disk;
-    for (const auto& de : fs::directory_iterator(dir, ec)) {
-        const std::string n = de.path().filename().string();
-        if (n.rfind("conv-", 0) != 0 || de.path().extension() != ".bin" || !de.is_regular_file(ec)) continue;
-        Entry e;
-        std::string err;
-        e.readable = read_index_file(e.index, de.path().string(), err);
-        disk[n] = std::move(e);
-    }
-    // A chain is whole when every parent is there and still holds the image the delta was made against.
-    std::map<std::string, bool> whole;
-    std::function<bool(const std::string&, int)> chain_ok = [&](const std::string& n, int depth) -> bool {
-        if (auto it = whole.find(n); it != whole.end()) return it->second;
-        bool ok = false;
+// ---- ConversationStore: the disk tier
+
+namespace {
+struct Pending {
+    uint64_t id = 0, bytes = 0;
+    SavedConversation image;
+    bool started = false, done = false, claimed = false;
+};
+struct DiskEntry {
+    Index index;
+    uint64_t file_bytes = 0, last_use = 0;
+    bool readable = false, conversation = false, foreign = false;   // foreign: not conv-*, never removed
+    int pins = 0;                                                    // being read or used as a parent right now
+};
+uint64_t key_from_name(const std::string& n) {
+    if (n.size() < 22 || n.rfind("conv-", 0) != 0) return 0;
+    return std::strtoull(n.substr(5, 16).c_str(), nullptr, 16);
+}
+double since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+}
+constexpr const char* kStoreManifest = "conversations.manifest";
+} // namespace
+
+struct ConversationStore::Impl {
+    std::string dir;
+    ConversationStoreOptions opt;
+    Log log = [](const std::string&) {};
+    mutable std::mutex mu;
+    std::condition_variable cv;
+    std::map<std::string, DiskEntry> disk;
+    std::deque<std::shared_ptr<Pending>> queue;   // the front one may be being written
+    uint64_t pending_bytes = 0, next_id = 1, clock = 0;
+    ConversationStoreStats st;
+    bool stop = false, held = false, open = false;
+    std::thread writer;
+
+    std::string path(const std::string& n) const { return (fs::path(dir) / n).string(); }
+
+    // ---- everything below until write() runs with `mu` held
+    bool chain_ok(const std::string& n, int depth = 0) const {
         auto it = disk.find(n);
-        if (depth <= kMaxReadDepth && it != disk.end() && it->second.readable) {
-            const Index& x = it->second.index;
-            if (x.version == kVersionLegacy || !x.delta) ok = true;
-            else if (auto p = disk.find(x.parent); p != disk.end() && p->second.readable &&
-                     p->second.index.version == kVersion && p->second.index.fingerprint == x.parent_fingerprint)
-                ok = chain_ok(x.parent, depth + 1);
-        }
-        return whole[n] = ok;
-    };
-    std::vector<std::string> held;
-    for (const SavedConversation* im : images) {
-        Checkpoints cks;
-        for (size_t i : conversation_disk_keep_checkpoints(*im, policy.checkpoint_gap)) cks.push_back(&im->checkpoints[i]);
-        const std::string name = name_of(*im, cks);
-        const fs::path path = fs::path(dir) / name;
-        held.push_back(name);
-        if (disk.count(name) && chain_ok(name, 0)) {
-            ++st.unchanged;
-            fs::last_write_time(path, fs::file_time_type::clock::now(), ec);   // load order = recency
-            continue;
-        }
-        const Index self = index_of(*im, cks);
-        // The parent sharing the most bytes with it; a chain grown too long or too heavy is written whole again.
-        const std::string* best_name = nullptr;
-        Plan best;
-        for (const auto& [n, e] : disk) {
-            Plan p;
-            if (n == name || !e.readable || e.index.version != kVersion || !chain_ok(n, 0) ||
-                !plan_delta(self, e.index, p) || p.reused == 0)
-                continue;
-            if (!best_name || p.reused > best.reused) { best_name = &n; best = std::move(p); }
-        }
-        const Index* parent = nullptr;
-        Index named;
-        if (best_name) {
-            named = disk[*best_name].index;
-            const uint64_t payload = self.image_bytes - best.reused;   // about what the delta will hold
-            if (named.depth + 1 <= policy.max_depth &&
-                (double) (named.chain_bytes + payload) <= policy.max_chain_fraction * (double) named.base_bytes)
-                parent = &named;
-        }
-        Index out;
-        std::string err;
-        if (!write_image(*im, cks, self, path.string(), parent, best_name ? *best_name : std::string(),
-                         parent ? &best : nullptr, out, err)) {
-            ++st.failed;
-            log(err);
-            disk.erase(name);
-            whole.erase(name);
-            continue;
-        }
-        ++st.written;
-        st.deltas += parent != nullptr;
-        st.dropped_checkpoints += (int) (im->checkpoints.size() - cks.size());
-        st.bytes += out.payload_bytes;
-        st.image_bytes += self.image_bytes;
-        disk[name] = {std::move(out), true};
-        whole.clear();   // a rewritten file can repair (or, never, break) another's chain
+        if (depth > kMaxReadDepth || it == disk.end() || !it->second.readable) return false;
+        const Index& x = it->second.index;
+        if (x.version == kVersionLegacy || !x.delta) return true;
+        auto p = disk.find(x.parent);
+        return p != disk.end() && p->second.readable && p->second.index.version == kVersion &&
+               p->second.index.fingerprint == x.parent_fingerprint && chain_ok(x.parent, depth + 1);
     }
-    // Durable files before the manifest names them, and the manifest before anything is removed.
-    sync_dir(dir);
-    {
-        const std::string m = (fs::path(dir) / kManifest).string(), tmp = m + ".tmp";
+    std::vector<std::string> chain(const std::string& n) const {   // n, then its parents
+        std::vector<std::string> out;
+        std::string at = n;
+        for (int d = 0; d <= kMaxReadDepth; ++d) {
+            auto it = disk.find(at);
+            if (it == disk.end()) break;
+            out.push_back(at);
+            if (!it->second.readable || !it->second.index.delta) break;
+            at = it->second.index.parent;
+        }
+        return out;
+    }
+    uint64_t chain_bytes(const std::string& n) const {
+        uint64_t b = 0;
+        for (const auto& c : chain(n)) b += disk.at(c).file_bytes;
+        return b;
+    }
+    void pin(const std::string& n, int d) { for (const auto& c : chain(n)) disk[c].pins += d; }
+
+    // #342 on disk: the conversations whose deepest checkpoint the new file holds are a turn back of it
+    void supersede(const std::string& name) {
+        const Index& x = disk[name].index;
+        auto holds = [&](const Index::Slot& s) {
+            for (const auto& t : x.slots)
+                if (t.ids_len == s.ids_len && t.ids_hash == s.ids_hash && t.imgs == s.imgs) return true;
+            return false;
+        };
+        for (auto& [n, e] : disk) {
+            if (n == name || !e.conversation || e.foreign || !e.readable || e.index.cvec != x.cvec || e.index.slots.size() < 2)
+                continue;
+            const Index::Slot* deepest = nullptr;
+            for (size_t i = 1; i < e.index.slots.size(); ++i)
+                if (!deepest || e.index.slots[i].ids_len > deepest->ids_len) deepest = &e.index.slots[i];
+            if (deepest->ids_len > 0 && holds(*deepest)) {
+                e.conversation = false;
+                log("conversation dir: " + n + " superseded by " + name);
+            }
+        }
+    }
+
+    void write_manifest() {
+        std::vector<std::pair<uint64_t, std::string>> order;
+        for (const auto& [n, e] : disk) if (e.conversation) order.emplace_back(e.last_use, n);
+        std::sort(order.begin(), order.end());
+        const std::string m = path(kStoreManifest), tmp = m + ".tmp";
         FILE* f = std::fopen(tmp.c_str(), "w");
         bool ok = f != nullptr;
         if (f) {
-            for (const auto& n : held) ok = ok && std::fprintf(f, "%s\n", n.c_str()) > 0;
+            for (const auto& [use, n] : order) ok = ok && std::fprintf(f, "%s %llu\n", n.c_str(), (unsigned long long) use) > 0;
             ok = std::fflush(f) == 0 && ::fsync(fileno(f)) == 0 && ok;
             ok = std::fclose(f) == 0 && ok;
         }
+        std::error_code ec;
         if (ok) fs::rename(tmp, m, ec);
-        if (!ok || ec) { log("cannot write " + m); std::remove(tmp.c_str()); }
+        if (!ok || ec) { log("conversation dir: cannot write " + m); std::remove(tmp.c_str()); }
         sync_dir(dir);
     }
-    // Keep what is held and every ancestor a held file needs; everything else named conv-* goes.
-    std::set<std::string> keep;
-    for (const auto& n : held) {
-        std::string at = n;
-        for (int d = 0; d <= kMaxReadDepth && keep.insert(at).second; ++d) {
-            auto it = disk.find(at);
-            if (it == disk.end() || !it->second.readable || !it->second.index.delta) break;
-            at = it->second.index.parent;
+
+    // The budget (least recently used conversations go, never the last one), then every file no conversation
+    // needs.  The manifest is written before anything is removed.
+    void collect() {
+        auto needed = [&] {
+            std::set<std::string> keep;
+            uint64_t bytes = 0;
+            for (const auto& [n, e] : disk)
+                if (e.conversation || e.pins || e.foreign)
+                    for (const auto& c : chain(n))
+                        if (keep.insert(c).second) bytes += disk.at(c).file_bytes;
+            return std::make_pair(keep, bytes);
+        };
+        auto [keep, bytes] = needed();
+        while (bytes > opt.budget_bytes) {
+            std::string victim;
+            size_t conversations = 0;
+            for (const auto& [n, e] : disk) {
+                if (!e.conversation || e.foreign) continue;
+                ++conversations;
+                if (!e.pins && (victim.empty() || e.last_use < disk[victim].last_use)) victim = n;
+            }
+            if (victim.empty() || conversations <= 1) break;
+            disk[victim].conversation = false;
+            ++st.evicted;
+            log("conversation dir: " + victim + " dropped (over the " + std::to_string(opt.budget_bytes >> 20) +
+                " MiB budget)");
+            std::tie(keep, bytes) = needed();
+        }
+        write_manifest();
+        for (auto it = disk.begin(); it != disk.end();) {
+            if (keep.count(it->first) || it->second.pins || it->second.foreign) { ++it; continue; }
+            std::error_code ec;
+            fs::remove(path(it->first), ec);
+            ++st.removed;
+            it = disk.erase(it);
         }
     }
-    for (const auto& de : fs::directory_iterator(dir, ec)) {
-        const std::string n = de.path().filename().string();
-        if (n.rfind("conv-", 0) != 0 || keep.count(n)) continue;
-        if (fs::remove(de.path(), ec)) ++st.removed;
+
+    // ---- one image to disk: the writer thread, or persist() on the request thread while the writer is idle.
+    // The catalog is locked to plan and to commit, not while hashing or writing.
+    struct Outcome {
+        bool written = false, unchanged = false, delta = false, failed = false;
+        uint64_t bytes = 0, image_bytes = 0;
+        int dropped = 0;
+        std::string name;
+    };
+    Outcome write(const SavedConversation& im) {
+        Outcome out;
+        Checkpoints cks;
+        for (size_t i : conversation_disk_keep_checkpoints(im, opt.policy.checkpoint_gap)) cks.push_back(&im.checkpoints[i]);
+        out.dropped = (int) (im.checkpoints.size() - cks.size());
+        out.name = name_of(im, cks);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            auto it = disk.find(out.name);
+            if (it != disk.end() && chain_ok(out.name)) {
+                it->second.conversation = true;
+                it->second.last_use = ++clock;
+                std::error_code ec;
+                fs::last_write_time(path(out.name), fs::file_time_type::clock::now(), ec);
+                out.unchanged = true;
+                supersede(out.name);
+                collect();
+                return out;
+            }
+        }
+        const Index self = index_of(im, cks);
+        out.image_bytes = self.image_bytes;
+        std::string parent;
+        Plan plan;
+        Index named;
+        bool delta = false;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            for (const auto& [n, e] : disk) {
+                Plan p;
+                if (n == out.name || !e.readable || e.index.version != kVersion || !chain_ok(n) ||
+                    !plan_delta(self, e.index, p) || p.reused == 0)
+                    continue;
+                if (parent.empty() || p.reused > plan.reused) { parent = n; plan = std::move(p); }
+            }
+            if (!parent.empty()) {
+                named = disk[parent].index;
+                const uint64_t payload = self.image_bytes - plan.reused;
+                delta = named.depth + 1 <= opt.policy.max_depth &&
+                        (double) (named.chain_bytes + payload) <= opt.policy.max_chain_fraction * (double) named.base_bytes;
+                if (delta) pin(parent, +1);   // collect() must not remove it while the delta is written
+            }
+        }
+        Index written;
+        std::string err;
+        const bool ok = write_image(im, cks, self, path(out.name), delta ? &named : nullptr, parent,
+                                    delta ? &plan : nullptr, written, err);
+        std::error_code ec;
+        const uint64_t size = ok ? fs::file_size(path(out.name), ec) : 0;
+        if (ok) sync_dir(dir);
+        std::lock_guard<std::mutex> lk(mu);
+        if (delta) pin(parent, -1);
+        if (!ok) {
+            out.failed = true;
+            log("conversation dir: " + err);
+            return out;
+        }
+        auto& e = disk[out.name];
+        const int pins = e.pins;
+        e = DiskEntry{};
+        e.index = std::move(written);
+        e.file_bytes = size;
+        e.readable = e.conversation = true;
+        e.last_use = ++clock;
+        e.pins = pins;
+        out.written = true;
+        out.delta = delta;
+        out.bytes = size;
+        supersede(out.name);
+        collect();
+        return out;
     }
-    return st;
+
+    void run() {
+        std::unique_lock<std::mutex> lk(mu);
+        for (;;) {
+            cv.wait(lk, [&] { return (stop && queue.empty()) || (!held && !queue.empty() && !queue.front()->started); });
+            if (queue.empty()) return;
+            auto item = queue.front();
+            item->started = true;
+            lk.unlock();
+            const auto t0 = std::chrono::steady_clock::now();
+            const Outcome o = write(item->image);
+            const double secs = since(t0);
+            char line[256];
+            std::snprintf(line, sizeof line, "conversation dir: spilled %s (%zu tokens): %s%s, %.0f MB in %.1f s",
+                          o.name.c_str(), item->image.live.ids.size(),
+                          o.failed ? "FAILED" : o.unchanged ? "already on disk" : o.delta ? "delta" : "whole",
+                          o.dropped ? (", " + std::to_string(o.dropped) + " checkpoints left out").c_str() : "",
+                          o.bytes / 1e6, secs);
+            log(line);
+            lk.lock();
+            ++st.spills;
+            st.spill_written += o.written;
+            st.spill_unchanged += o.unchanged;
+            st.spill_bytes += o.bytes;
+            st.spill_image_bytes += o.image_bytes;
+            st.spill_seconds += secs;
+            item->done = true;
+            queue.pop_front();
+            pending_bytes -= item->bytes;   // a claimer counts it from here on
+            SavedConversation drop;
+            if (!item->claimed) drop = std::move(item->image);
+            cv.notify_all();
+            lk.unlock();
+            drop = {};   // freed outside the lock
+            lk.lock();
+        }
+    }
+};
+
+ConversationStore::ConversationStore() : impl_(std::make_unique<Impl>()) {}
+
+ConversationStore::~ConversationStore() {
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->stop = true;
+        impl_->held = false;
+    }
+    impl_->cv.notify_all();
+    if (impl_->writer.joinable()) impl_->writer.join();
 }
 
-std::vector<std::string> conversation_disk_loadable(const std::string& dir) {
+bool ConversationStore::open(const std::string& dir, const ConversationStoreOptions& options, Log log) {
+    auto& m = *impl_;
+    std::lock_guard<std::mutex> lk(m.mu);
+    if (m.open) return false;
+    m.dir = dir;
+    m.opt = options;
+    if (log) m.log = std::move(log);
     std::error_code ec;
-    std::set<std::string> manifest, ancestors;
-    bool have_manifest = false;
-    if (FILE* f = std::fopen((fs::path(dir) / kManifest).c_str(), "r")) {
-        have_manifest = true;
-        char line[512];
-        while (std::fgets(line, sizeof line, f)) {
-            std::string n = line;
-            while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
-            if (!n.empty()) manifest.insert(n);
-        }
+    fs::create_directories(dir, ec);
+    if (!fs::is_directory(dir, ec)) { m.log("conversation dir: " + dir + " is not a directory"); return false; }
+    std::map<std::string, uint64_t> manifest;
+    if (FILE* f = std::fopen(m.path(kStoreManifest).c_str(), "r")) {
+        char name[512];
+        unsigned long long use = 0;
+        while (std::fscanf(f, "%511s %llu", name, &use) == 2) manifest[name] = use;
         std::fclose(f);
     }
-    std::vector<std::pair<fs::file_time_type, fs::path>> files;
+    std::vector<std::pair<fs::file_time_type, std::string>> unlisted;
     for (const auto& de : fs::directory_iterator(dir, ec)) {
-        if (!de.is_regular_file(ec) || de.path().extension() != ".bin") continue;
-        files.emplace_back(de.last_write_time(ec), de.path());
-        Index x;
-        std::string e;
-        if (read_index_file(x, de.path().string(), e) && x.delta) ancestors.insert(x.parent);
+        const std::string n = de.path().filename().string();
+        const bool conv = n.rfind("conv-", 0) == 0;
+        if (!de.is_regular_file(ec)) continue;
+        if (conv && de.path().extension() != ".bin") { fs::remove(de.path(), ec); continue; }   // a torn write
+        if (de.path().extension() != ".bin") continue;
+        DiskEntry e;
+        std::string err;
+        e.readable = read_index_file(e.index, de.path().string(), err);
+        if (!e.readable) m.log("conversation dir: " + n + ": " + err);
+        e.file_bytes = de.file_size(ec);
+        e.foreign = !conv;
+        m.disk[n] = std::move(e);
+        if (!manifest.count(n)) unlisted.emplace_back(de.last_write_time(ec), n);
     }
-    std::sort(files.begin(), files.end());   // oldest first: the newest ends most recent in the LRU
-    std::vector<std::string> out;
-    for (const auto& [when, path] : files) {
-        const std::string n = path.filename().string();
-        // A parent kept only for a held delta is not a conversation of its own (#342 dropped it from the cache);
-        // without a manifest every parent is taken for one of those.
-        if (ancestors.count(n) && (!have_manifest || !manifest.count(n))) continue;
-        out.push_back(path.string());
+    std::set<std::string> parents;
+    for (const auto& [n, e] : m.disk) if (e.readable && e.index.delta) parents.insert(e.index.parent);
+    for (auto& [n, e] : m.disk) {
+        e.conversation = e.readable && (manifest.count(n) || !parents.count(n));
+        if (auto it = manifest.find(n); it != manifest.end()) { e.last_use = it->second; m.clock = std::max(m.clock, it->second); }
     }
+    std::sort(unlisted.begin(), unlisted.end());   // files the manifest does not know: after it, oldest first
+    for (const auto& [when, n] : unlisted) m.disk[n].last_use = ++m.clock;
+    for (auto& [n, e] : m.disk)
+        if (e.readable && e.index.delta && !m.chain_ok(n)) {
+            m.log("conversation dir: " + n + ": broken chain (parent " + e.index.parent + "), dropped");
+            e.readable = e.conversation = false;
+        }
+    m.collect();
+    m.open = true;
+    m.writer = std::thread([this] { impl_->run(); });
+    return true;
+}
+
+bool ConversationStore::enabled() const { return impl_->open; }
+
+void ConversationStore::spill(SavedConversation&& image) {
+    auto& m = *impl_;
+    if (!m.open) return;
+    auto item = std::make_shared<Pending>();
+    item->bytes = image.bytes();
+    item->image = std::move(image);
+    std::unique_lock<std::mutex> lk(m.mu);
+    item->id = m.next_id++;
+    const auto t0 = std::chrono::steady_clock::now();
+    m.cv.wait(lk, [&] { return m.pending_bytes == 0 || m.pending_bytes + item->bytes <= m.opt.pending_bytes; });
+    m.st.spill_wait_seconds += since(t0);
+    m.queue.push_back(item);
+    m.pending_bytes += item->bytes;
+    m.cv.notify_all();
+    if (!m.opt.background) m.cv.wait(lk, [&] { return item->done; });
+}
+
+void ConversationStore::flush() {
+    auto& m = *impl_;
+    std::unique_lock<std::mutex> lk(m.mu);
+    m.cv.wait(lk, [&] { return m.queue.empty(); });
+}
+
+ConversationDiskStats ConversationStore::persist(const std::vector<const SavedConversation*>& images) {
+    auto& m = *impl_;
+    ConversationDiskStats out;
+    if (!m.open) return out;
+    flush();
+    uint64_t removed0;
+    {
+        std::lock_guard<std::mutex> lk(m.mu);
+        removed0 = m.st.removed;
+    }
+    for (const SavedConversation* im : images) {
+        const auto o = m.write(*im);
+        out.written += o.written;
+        out.deltas += o.delta;
+        out.unchanged += o.unchanged;
+        out.failed += o.failed;
+        out.bytes += o.bytes;
+        out.image_bytes += o.written ? o.image_bytes : 0;
+        out.dropped_checkpoints += o.written ? o.dropped : 0;
+    }
+    std::lock_guard<std::mutex> lk(m.mu);
+    out.removed = (int) (m.st.removed - removed0);
     return out;
+}
+
+ConversationStoreMatch ConversationStore::best(const std::vector<int32_t>& prompt,
+                                               const std::vector<ConversationImageKey>& images, bool cvec) const {
+    auto& m = *impl_;
+    ConversationStoreMatch best;
+    std::lock_guard<std::mutex> lk(m.mu);
+    // queued images first: they need no read
+    for (const auto& item : m.queue) {
+        if (item->claimed || item->image.cvec != cvec) continue;
+        auto consider = [&](const ConversationCheckpoint& c, bool live) {
+            const int64_t n = conversation_prefix(c, prompt, images);
+            if (n > best.tokens) {
+                best = {};
+                best.tokens = n;
+                best.live = live;
+                best.pending = item->id;
+                best.image_bytes = item->bytes;
+            }
+        };
+        consider(item->image.live, true);
+        for (const auto& c : item->image.checkpoints) consider(c, false);
+    }
+    std::map<uint64_t, uint64_t> hashes;   // the prompt's leading tokens, by length
+    for (const auto& [n, e] : m.disk) {
+        if (!e.conversation || !e.readable || e.index.cvec != cvec) continue;
+        for (size_t s = 0; s < e.index.slots.size(); ++s) {
+            const auto& slot = e.index.slots[s];
+            const uint64_t len = slot.ids_len;
+            // as conversation_prefix: the last prompt token always starts the next verify window
+            if (len == 0 || len >= prompt.size() || (int64_t) len <= best.tokens) continue;
+            size_t j = 0;
+            bool same = true;
+            for (const auto& image : images) {
+                if (image.start >= (int64_t) len) continue;
+                if (j == slot.imgs.size() || !(slot.imgs[j++] == image)) { same = false; break; }
+            }
+            if (!same || j != slot.imgs.size()) continue;
+            auto h = hashes.find(len);
+            if (h == hashes.end()) h = hashes.emplace(len, xxh64(prompt.data(), len * sizeof(int32_t), 0)).first;
+            if (h->second != slot.ids_hash || !m.chain_ok(n)) continue;
+            best = {};
+            best.tokens = (int64_t) len;
+            best.live = s == 0;
+            best.name = n;
+            best.read_bytes = m.chain_bytes(n);
+            best.image_bytes = e.index.image_bytes;
+        }
+    }
+    return best;
+}
+
+bool ConversationStore::worth(const ConversationStoreMatch& m, int64_t have) const {
+    if (m.tokens <= have) return false;
+    if (m.pending) return true;   // in RAM still
+    const int64_t gain = m.tokens - have;
+    if (gain < impl_->opt.min_gain) return false;
+    const double read = (double) m.read_bytes / (impl_->opt.read_mb_s * 1e6);
+    const double prefill = (double) gain / impl_->opt.prefill_tok_s;
+    return prefill > read;
+}
+
+bool ConversationStore::take(const ConversationStoreMatch& match, SavedConversation& image, std::string& error) {
+    auto& m = *impl_;
+    if (match.pending) {
+        std::unique_lock<std::mutex> lk(m.mu);
+        auto it = std::find_if(m.queue.begin(), m.queue.end(), [&](const auto& p) { return p->id == match.pending; });
+        if (it == m.queue.end()) { error = "the spilled conversation was written meanwhile"; return false; }
+        auto item = *it;
+        if (!item->started) {
+            m.queue.erase(it);
+            m.pending_bytes -= item->bytes;
+        } else {
+            item->claimed = true;   // being written: wait, then keep the image instead of reading the file back
+            m.cv.wait(lk, [&] { return item->done; });
+        }
+        image = std::move(item->image);
+        ++m.st.reclaimed;
+        m.st.hit_tokens += (uint64_t) match.tokens;
+        m.cv.notify_all();
+        return true;
+    }
+    if (!load(match.name, image, error)) return false;
+    std::lock_guard<std::mutex> lk(m.mu);
+    m.st.hit_tokens += (uint64_t) match.tokens;
+    return true;
+}
+
+bool ConversationStore::load(const std::string& name, SavedConversation& image, std::string& error) {
+    auto& m = *impl_;
+    uint64_t bytes = 0;
+    {
+        std::lock_guard<std::mutex> lk(m.mu);
+        auto it = m.disk.find(name);
+        if (it == m.disk.end() || !it->second.readable) { error = name + ": not in the conversation dir"; return false; }
+        m.pin(name, +1);
+        it->second.last_use = ++m.clock;
+        bytes = m.chain_bytes(name);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = read_image(image, m.path(name), 0, nullptr, error);
+    const double secs = since(t0);
+    std::lock_guard<std::mutex> lk(m.mu);
+    m.pin(name, -1);
+    if (ok) {
+        ++m.st.hits;
+        m.st.read_bytes += bytes;
+        m.st.read_seconds += secs;
+    } else if (auto it = m.disk.find(name); it != m.disk.end()) {
+        it->second.readable = it->second.conversation = false;   // not offered again; collect() removes it
+        m.collect();
+    }
+    return ok;
+}
+
+std::vector<std::string> ConversationStore::recent(size_t n) const {
+    auto e = entries();
+    std::vector<std::string> out;
+    for (auto it = e.rbegin(); it != e.rend() && out.size() < n; ++it) out.push_back(it->name);
+    return out;
+}
+
+std::vector<ConversationStoreEntry> ConversationStore::entries() const {
+    auto& m = *impl_;
+    std::lock_guard<std::mutex> lk(m.mu);
+    std::vector<std::pair<uint64_t, ConversationStoreEntry>> order;
+    for (const auto& [n, e] : m.disk)
+        if (e.conversation)
+            order.push_back({e.last_use, {n, key_from_name(n), (int64_t) e.index.tokens, e.file_bytes}});
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<ConversationStoreEntry> out;
+    for (auto& [use, e] : order) out.push_back(std::move(e));
+    return out;
+}
+
+ConversationStoreStats ConversationStore::stats() const {
+    auto& m = *impl_;
+    std::lock_guard<std::mutex> lk(m.mu);
+    ConversationStoreStats s = m.st;
+    s.conversations = s.files = s.disk_bytes = 0;
+    for (const auto& [n, e] : m.disk) {
+        s.conversations += e.conversation;
+        ++s.files;
+        s.disk_bytes += e.file_bytes;
+    }
+    s.pending = m.queue.size();
+    s.pending_bytes = m.pending_bytes;
+    return s;
+}
+
+uint64_t ConversationStore::pending_bytes() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->pending_bytes;
+}
+
+void ConversationStore::hold_writes(bool hold) {
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->held = hold;
+    }
+    impl_->cv.notify_all();
 }
 
 } // namespace strata::core

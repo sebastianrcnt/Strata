@@ -393,6 +393,15 @@ struct Options {
     /// --serve: write to --conversation-dir only the checkpoints whose loss would make a request resume more than
     /// this many tokens earlier (plus the root and the two deepest; 0 = all)
     int64_t conversation_dir_checkpoint_gap = 0;
+    /// --serve: the disk tier.  Conversations the RAM cache evicts are written to --conversation-dir (a delta of a
+    /// file they share pages with) and restored from it when a request matches one; the directory is kept under
+    /// --conversation-dir-mib, least recently used first.
+    bool conversation_spill = true;
+    int64_t conversation_dir_mib = 102400;
+    int64_t conversation_dir_preload = 1;          // conversations read into RAM at start, most recent first
+    int64_t conversation_spill_pending_mib = 4096; // evicted images waiting to be written (beyond the RAM budget)
+    int64_t conversation_dir_read_mbps = 100;      // a disk restore is taken when reading its files is faster
+    int64_t conversation_dir_prefill_tps = 1800;   //   than reading the tokens it adds again
     /// --serve: a turn whose role token (the one after <|im_start|>) is this id and that directly precedes the
     /// last turn belongs to the new turn's header (a trailing per-request system note): the turn checkpoint goes
     /// before it (-1 = off)
@@ -511,6 +520,13 @@ void usage() {
                  "  --conversation-dir DIR  --serve: keep parked conversations on disk across restarts (QUIT/PERSIST)\n"
                  "  --conversation-dir-checkpoint-gap N  --serve: on disk keep only checkpoints more than N tokens apart\n"
                  "                       (plus the root and the two deepest; default 0 = all)\n"
+                 "  --conversation-spill 0|1  --serve: write conversations the RAM cache evicts to --conversation-dir and\n"
+                 "                       restore them from it on a match (default 1)\n"
+                 "  --conversation-dir-mib N  --serve: --conversation-dir's size, least recently used out (default 102400)\n"
+                 "  --conversation-dir-preload N  --serve: conversations read at start, most recent first (default 1)\n"
+                 "  --conversation-spill-pending-mib N  --serve: evicted conversations waiting for their write (default 4096)\n"
+                 "  --conversation-dir-read-mbps N / --conversation-dir-prefill-tps N  --serve: a disk restore is taken when\n"
+                 "                       reading it beats reading its tokens again (defaults 100 MB/s, 1800 tokens/s)\n"
                  "  --tail-role-token ID  --serve: a trailing turn with this role token checkpoints before itself\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
@@ -1167,6 +1183,16 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-dir") o.conversation_dir = next("--conversation-dir");
         else if (a == "--conversation-dir-checkpoint-gap")
             o.conversation_dir_checkpoint_gap = std::stoll(next("--conversation-dir-checkpoint-gap"));
+        else if (a == "--conversation-spill") o.conversation_spill = std::stoll(next("--conversation-spill")) != 0;
+        else if (a == "--conversation-dir-mib") o.conversation_dir_mib = std::stoll(next("--conversation-dir-mib"));
+        else if (a == "--conversation-dir-preload")
+            o.conversation_dir_preload = std::stoll(next("--conversation-dir-preload"));
+        else if (a == "--conversation-spill-pending-mib")
+            o.conversation_spill_pending_mib = std::stoll(next("--conversation-spill-pending-mib"));
+        else if (a == "--conversation-dir-read-mbps")
+            o.conversation_dir_read_mbps = std::stoll(next("--conversation-dir-read-mbps"));
+        else if (a == "--conversation-dir-prefill-tps")
+            o.conversation_dir_prefill_tps = std::stoll(next("--conversation-dir-prefill-tps"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--ban-tokens") o.ban_tokens = next("--ban-tokens");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -4350,6 +4376,32 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
+        // --conversation-dir: the disk tier (catalog from the files' indexes, one writer thread)
+        strata::core::ConversationStore store;
+        if (!o.conversation_dir.empty()) {
+            strata::core::ConversationStoreOptions so;
+            so.policy.checkpoint_gap = (uint64_t) std::max<int64_t>(0, o.conversation_dir_checkpoint_gap);
+            so.budget_bytes = (uint64_t) std::max<int64_t>(0, o.conversation_dir_mib) << 20;
+            so.pending_bytes = (uint64_t) std::max<int64_t>(0, o.conversation_spill_pending_mib) << 20;
+            so.read_mb_s = (double) std::max<int64_t>(1, o.conversation_dir_read_mbps);
+            so.prefill_tok_s = (double) std::max<int64_t>(1, o.conversation_dir_prefill_tps);
+            const auto t0 = Clock::now();
+            if (store.open(o.conversation_dir, so, [](const std::string& m) {
+                    std::fprintf(stderr, "strata serve: %s\n", m.c_str());
+                    std::fflush(stderr);
+                })) {
+                const auto st = store.stats();
+                std::fprintf(stderr, "strata serve: conversation dir: %llu conversations in %llu files, %.0f MB, indexed in %.1f s\n",
+                             (unsigned long long) st.conversations, (unsigned long long) st.files, st.disk_bytes / 1e6,
+                             std::chrono::duration<double>(Clock::now() - t0).count());
+                if (o.conversation_spill && o.prompt_cache > 0 && conversations.enabled())
+                    conversations.on_evict([&store](strata::core::SavedConversation&& im) {
+                        std::fprintf(stderr, "strata serve: conversation cache: evicted %zu tokens to the disk tier\n",
+                                     im.live.ids.size());
+                        store.spill(std::move(im));
+                    });
+            }
+        }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current = [&](size_t held) -> bool {
@@ -4389,8 +4441,14 @@ int main(int argc, char** argv) {
             try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t additional = estimate - reuse.bytes();
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
-                        additional, floor)) {
+                bool admitted = strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                                                                        additional, floor);
+                if (!admitted && store.pending_bytes() > 0) {   // spilled images still waiting for their write
+                    store.flush();
+                    admitted = strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                                                                       additional, floor);
+                }
+                if (!admitted) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
                     return true;
@@ -4440,63 +4498,65 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation dir: no RAM to capture the live session\n");
                 }
             }
-            strata::core::ConversationDiskPolicy policy;
-            policy.checkpoint_gap = (uint64_t) std::max<int64_t>(0, o.conversation_dir_checkpoint_gap);
-            const auto st = strata::core::conversation_disk_persist(o.conversation_dir, images, policy,
-                [](const std::string& e) { std::fprintf(stderr, "strata serve: conversation dir: %s\n", e.c_str()); });
+            if (!store.enabled()) return -1;
+            const auto st = store.persist(images);   // after the spills still queued
+            const auto ts = store.stats();
             std::fprintf(stderr, "strata serve: conversation dir (%s): %d written (%d deltas, %.0f MB of %.0f MB whole), "
-                                 "%d unchanged, %d removed, %d checkpoints left out in %.1f s\n",
+                                 "%d unchanged, %d removed, %d checkpoints left out in %.1f s; on disk %llu conversations, "
+                                 "%.0f MB; since start %llu spills (%.0f MB in %.0f s), %llu disk restores (%.0f MB in %.0f s)\n",
                          why, st.written, st.deltas, st.bytes / 1e6, st.image_bytes / 1e6, st.unchanged, st.removed,
-                         st.dropped_checkpoints,
-                         std::chrono::duration<double>(Clock::now() - t0).count());
+                         st.dropped_checkpoints, std::chrono::duration<double>(Clock::now() - t0).count(),
+                         (unsigned long long) ts.conversations, ts.disk_bytes / 1e6, (unsigned long long) ts.spills,
+                         ts.spill_bytes / 1e6, ts.spill_seconds, (unsigned long long) (ts.hits + ts.reclaimed),
+                         ts.read_bytes / 1e6, ts.read_seconds);
             std::fflush(stderr);
             return st.written + st.unchanged;
         };
+        // At start only the most recent --conversation-dir-preload conversations are read; the rest stay on disk
+        // until a request matches one (the catalog is the files' indexes).
         auto load_all = [&] {
-            namespace fs = std::filesystem;
-            if (o.conversation_dir.empty()) return;
+            if (!store.enabled() || o.conversation_dir_preload <= 0) return;
             if (!conversations.enabled()) {
-                std::fprintf(stderr, "strata serve: conversation dir needs --conversation-cache-mib; not loading\n");
+                std::fprintf(stderr, "strata serve: conversation dir: preloading needs --conversation-cache-mib\n");
                 return;
             }
             const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
-            // oldest first, so the newest ends most recent in the LRU; a parent kept only for a delta is left out
-            for (const fs::path path : strata::core::conversation_disk_loadable(o.conversation_dir)) {
+            auto names = store.recent((size_t) o.conversation_dir_preload);
+            std::reverse(names.begin(), names.end());   // oldest first: the newest ends most recent in the LRU
+            for (const auto& name : names) {
                 const auto t0 = Clock::now();
                 strata::core::ConversationDiskIndex index;
-                std::string ie;
-                std::error_code ec;
-                // a delta restores to its whole image: admit that, not the file
-                const uint64_t size = strata::core::conversation_disk_read_index(index, path.string(), ie)
-                                          ? index.image_bytes : fs::file_size(path, ec);
+                std::string e;
+                const std::string path = (std::filesystem::path(o.conversation_dir) / name).string();
+                const uint64_t size = strata::core::conversation_disk_read_index(index, path, e) ? index.image_bytes : 0;
                 if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
                                                              (size_t) size, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation dir: %s skipped (RAM)\n", path.c_str());
+                    std::fprintf(stderr, "strata serve: conversation dir: %s not preloaded (RAM)\n", name.c_str());
                     continue;
                 }
                 strata::core::SavedConversation im;
-                std::string e;
                 try {
-                    if (!strata::core::conversation_disk_read(im, path.string(), e) ||
-                        !strata::core::conversation_snapshot_validate(im, ss, g, mtp.kv_state(), e)) {
-                        std::fprintf(stderr, "strata serve: conversation dir: %s not loaded: %s\n", path.c_str(), e.c_str());
+                    if (!store.load(name, im, e) || !strata::core::conversation_snapshot_validate(im, ss, g, mtp.kv_state(), e)) {
+                        std::fprintf(stderr, "strata serve: conversation dir: %s not loaded: %s\n", name.c_str(), e.c_str());
                         continue;
                     }
                 } catch (const std::bad_alloc&) {
-                    std::fprintf(stderr, "strata serve: conversation dir: %s skipped (allocation)\n", path.c_str());
+                    std::fprintf(stderr, "strata serve: conversation dir: %s skipped (allocation)\n", name.c_str());
                     continue;
                 }
                 const size_t tokens = im.live.ids.size();
                 const bool stored = conversations.put(std::move(im));
                 std::fprintf(stderr, "strata serve: conversation dir: %s %s (%zu tokens) in %.1f s; parked=%zu bytes=%zu\n",
-                             stored ? "loaded" : "did not fit", path.filename().c_str(), tokens,
+                             stored ? "preloaded" : "did not fit", name.c_str(), tokens,
                              std::chrono::duration<double>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
             std::fflush(stderr);
         };
         // CACHE <live tokens> <parked bytes> <evictions> [<key>:<tokens>:<bytes> ...]: the conversation cache for the
-        // Monitor, least recently active first; sent after loading and after every request.
+        // Monitor, least recently active first; sent after loading and after every request.  The disk tier's
+        // conversations follow as D<key>:<tokens>:<file bytes> (least recently used first), and one
+        // S<spills>:<disk restores>:<bytes waiting to be written>, all in the same three-field form older readers take.
         auto report_cache = [&] {
             std::string s = "CACHE " + std::to_string(live_ok ? live.size() : 0) + " " +
                             std::to_string(conversations.bytes()) + " " + std::to_string(conversations.evictions());
@@ -4504,6 +4564,17 @@ int main(int argc, char** argv) {
             for (const auto& e : conversations.entries()) {
                 std::snprintf(b, sizeof b, " %016llx:%zu:%zu",
                               (unsigned long long) strata::core::conversation_disk_key(e), e.live.ids.size(), e.bytes());
+                s += b;
+            }
+            if (store.enabled()) {
+                for (const auto& e : store.entries()) {
+                    std::snprintf(b, sizeof b, " D%016llx:%lld:%llu", (unsigned long long) e.key, (long long) e.tokens,
+                                  (unsigned long long) e.bytes);
+                    s += b;
+                }
+                const auto st = store.stats();
+                std::snprintf(b, sizeof b, " S%llu:%llu:%llu", (unsigned long long) st.spills,
+                              (unsigned long long) (st.hits + st.reclaimed), (unsigned long long) st.pending_bytes);
                 s += b;
             }
             std::printf("%s\n", s.c_str());
@@ -5158,8 +5229,65 @@ int main(int argc, char** argv) {
                     }
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            int64_t in_tokens = parked.tokens;
+            bool in_live = parked.live;
             std::optional<strata::core::SavedConversation> incoming;
-            if (parked.tokens > resume) incoming.emplace(conversations.take(parked.index));
+            // The disk tier: a conversation the RAM cache evicted (or a past run left), taken when restoring it beats
+            // reading again what it adds; a spilled one still waiting for its write is taken back without a read.
+            if (store.enabled() && o.prompt_cache > 0) {
+                const std::vector<int32_t> ids32(ids.begin(), ids.end());
+                const int64_t have = std::max<int64_t>(resume, parked.tokens);
+                for (int attempt = 0; attempt < 2 && !incoming; ++attempt) {
+                    const auto dm = store.best(ids32, req_imgs, want_cvec);
+                    if (!store.worth(dm, have)) break;
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                    if (!dm.pending && !strata::core::conversation_memory_admit(
+                            strata::core::conversation_available_memory(), (size_t) dm.image_bytes, floor)) {
+                        std::fprintf(stderr, "strata serve: conversation dir: %s not restored (physical RAM admission)\n",
+                                     dm.name.c_str());
+                        break;
+                    }
+                    const auto td = Clock::now();
+                    strata::core::SavedConversation im;
+                    std::string e;
+                    bool taken = false;
+                    try {
+                        taken = store.take(dm, im, e);
+                    } catch (const std::bad_alloc&) {
+                        e = "allocation failed";
+                    }
+                    if (!taken) {
+                        std::fprintf(stderr, "strata serve: conversation dir: not restored: %s\n", e.c_str());
+                        if (dm.pending) continue;   // written meanwhile: ask the files
+                        break;
+                    }
+                    // the index matched by hashes; what the image itself offers this prompt
+                    int64_t got = 0;
+                    bool got_live = false;
+                    auto consider = [&](const strata::core::ConversationCheckpoint& c, bool l) {
+                        const int64_t k = strata::core::conversation_prefix(c, ids, req_imgs);
+                        if (k > got) { got = k; got_live = l; }
+                    };
+                    consider(im.live, true);
+                    for (const auto& c : im.checkpoints) consider(c, false);
+                    const bool valid = got > have && strata::core::conversation_snapshot_validate(im, ss, g, mtp.kv_state(), e);
+                    std::fprintf(stderr, "strata serve: conversation dir: %s %s: %lld tokens (%s, %lld already held) in %.1f s, "
+                                         "%.0f MB read\n",
+                                 valid ? "restoring" : "not using", dm.pending ? "a spilled conversation" : dm.name.c_str(),
+                                 (long long) got, got_live ? "live" : "checkpoint", (long long) have,
+                                 std::chrono::duration<double>(Clock::now() - td).count(),
+                                 dm.pending ? 0.0 : dm.read_bytes / 1e6);
+                    if (valid) {
+                        incoming.emplace(std::move(im));
+                        in_tokens = got;
+                        in_live = got_live;
+                    } else if (dm.pending && conversations.enabled()) {
+                        conversations.put(std::move(im));   // taken off the queue but not used: parked again
+                    }
+                    break;
+                }
+            }
+            if (!incoming && parked.tokens > resume) incoming.emplace(conversations.take(parked.index));
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g, mtp.kv_state(), err)) {
@@ -5198,8 +5326,8 @@ int main(int argc, char** argv) {
                 live_imgs = std::move(incoming->live.imgs);
                 checks = std::move(incoming->checkpoints);
                 cvec_cached = incoming->cvec;
-                resume = parked.tokens;
-                from_live = parked.live;
+                resume = in_tokens;
+                from_live = in_live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr)
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()));
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
