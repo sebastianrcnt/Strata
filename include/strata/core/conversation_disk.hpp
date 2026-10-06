@@ -103,11 +103,21 @@ std::vector<size_t> conversation_disk_keep_checkpoints(const SavedConversation& 
 // bounded by `pending_bytes` and can be handed back before (or after) they are written.
 struct ConversationStoreOptions {
     ConversationDiskPolicy policy;
-    uint64_t budget_bytes = 100ull << 30;  // the directory's conv-* files
+    // The directory's conv-* files.  0: min(80 GiB, 70% of what the filesystem has free plus what the files take
+    // already, at open) - a safe share of a small disk, and the most a 2.5" USB disk holds without crowding it.
+    uint64_t budget_bytes = 0;
+    uint64_t min_free_bytes = 5ull << 30;  // no file is written that would leave the filesystem less free than this
     uint64_t pending_bytes = 4ull << 30;   // spilled images not written yet (one is always admitted)
-    double read_mb_s = 100;                // a disk restore is taken when re-reading the tokens it adds would
-    double prefill_tok_s = 1800;           //   take longer than reading its files
-    int64_t min_gain = 4096;               //   ... and it adds at least this many tokens
+    // A disk restore is taken when reading its files takes less time than reading again the tokens it adds.
+    // Measured (production server.log, 2026-10, 5214 prompts): a re-read of 20k-50k tokens ran at a median
+    // 1807 tok/s (n=29), above 50k at 2054 (n=32), 1800-1900 aggregate; 2k-20k at a median 916 (n=733).  The
+    // conversation disk (2.5" USB HDD) reads ~108 MB/s with dd; checking the hashes (0.35 s per 2 GB) and
+    // unpacking the checkpoint state (~40% of the bytes, ~2.4 GB/s) take that to ~100 MB/s.
+    double read_mb_s = 100;
+    double prefill_tok_s = 1800;           // for a gain of prefill_split tokens or more
+    double prefill_small_tok_s = 900;      // below it
+    int64_t prefill_split = 20000;
+    int64_t min_gain = 4096;               // and never for fewer tokens than this
     bool background = true;                // false: spill() writes before it returns
 };
 struct ConversationStoreMatch {
@@ -121,6 +131,7 @@ struct ConversationStoreStats {
     uint64_t spills = 0, spill_written = 0, spill_unchanged = 0, spill_bytes = 0, spill_image_bytes = 0;
     double spill_seconds = 0, spill_wait_seconds = 0;
     uint64_t hits = 0, hit_tokens = 0, read_bytes = 0, reclaimed = 0, evicted = 0, removed = 0;
+    uint64_t dropped = 0;                  // not written: the filesystem was at its free-space floor
     double read_seconds = 0;
     uint64_t conversations = 0, files = 0, disk_bytes = 0, pending = 0, pending_bytes = 0;
 };
@@ -157,6 +168,7 @@ public:
     std::vector<ConversationStoreEntry> entries() const;   // conversations, least recently used first
     ConversationStoreStats stats() const;
     uint64_t pending_bytes() const;
+    uint64_t budget_bytes() const;         // the budget in force (resolved at open when 0)
     void hold_writes(bool hold);           // tests: the writer starts nothing while held
 
 private:

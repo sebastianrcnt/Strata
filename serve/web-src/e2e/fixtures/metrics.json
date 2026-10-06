@@ -93,7 +93,24 @@
     "bytes": 3790062973,
     "mtime": 1791057297.2763305
    }
-  ]
+  ],
+  "disk": [
+   {
+    "key": "122e0d7aefab79b5",
+    "tokens": 185848,
+    "bytes": 3667706597
+   },
+   {
+    "key": "177394114d26e5ff",
+    "tokens": 193851,
+    "bytes": 3790062973
+   }
+  ],
+  "spill": {
+   "spills": 7,
+   "restores": 3,
+   "pending_bytes": 1500000000
+  }
  },
  "requests": [
   {

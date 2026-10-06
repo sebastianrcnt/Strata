@@ -84,6 +84,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <future>
 #include <optional>
 #include <new>
 #include <charconv>
@@ -397,7 +398,8 @@ struct Options {
     /// file they share pages with) and restored from it when a request matches one; the directory is kept under
     /// --conversation-dir-mib, least recently used first.
     bool conversation_spill = true;
-    int64_t conversation_dir_mib = 102400;
+    int64_t conversation_dir_mib = -1;             // -1: min(80 GiB, 70% of the disk's free space + ours)
+    int64_t conversation_dir_min_free_mib = 5120;  // never write a file that leaves the disk less free than this
     int64_t conversation_dir_preload = 1;          // conversations read into RAM at start, most recent first
     int64_t conversation_spill_pending_mib = 4096; // evicted images waiting to be written (beyond the RAM budget)
     int64_t conversation_dir_read_mbps = 100;      // a disk restore is taken when reading its files is faster
@@ -522,11 +524,15 @@ void usage() {
                  "                       (plus the root and the two deepest; default 0 = all)\n"
                  "  --conversation-spill 0|1  --serve: write conversations the RAM cache evicts to --conversation-dir and\n"
                  "                       restore them from it on a match (default 1)\n"
-                 "  --conversation-dir-mib N  --serve: --conversation-dir's size, least recently used out (default 102400)\n"
-                 "  --conversation-dir-preload N  --serve: conversations read at start, most recent first (default 1)\n"
+                 "  --conversation-dir-mib N  --serve: --conversation-dir's size, least recently used out (default: the\n"
+                 "                       smaller of 80 GiB and 70%% of the disk's free space plus the files already there)\n"
+                 "  --conversation-dir-min-free-mib N  --serve: never write a file that leaves less free (default 5120)\n"
+                 "  --conversation-dir-preload N  --serve: conversations read at start in the background, most recent first\n"
+                 "                       (default 1)\n"
                  "  --conversation-spill-pending-mib N  --serve: evicted conversations waiting for their write (default 4096)\n"
                  "  --conversation-dir-read-mbps N / --conversation-dir-prefill-tps N  --serve: a disk restore is taken when\n"
-                 "                       reading it beats reading its tokens again (defaults 100 MB/s, 1800 tokens/s)\n"
+                 "                       reading it beats reading its tokens again (defaults 100 MB/s; 1800 tokens/s for\n"
+                 "                       20k tokens or more, 900 below)\n"
                  "  --tail-role-token ID  --serve: a trailing turn with this role token checkpoints before itself\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
@@ -1185,6 +1191,8 @@ int main(int argc, char** argv) {
             o.conversation_dir_checkpoint_gap = std::stoll(next("--conversation-dir-checkpoint-gap"));
         else if (a == "--conversation-spill") o.conversation_spill = std::stoll(next("--conversation-spill")) != 0;
         else if (a == "--conversation-dir-mib") o.conversation_dir_mib = std::stoll(next("--conversation-dir-mib"));
+        else if (a == "--conversation-dir-min-free-mib")
+            o.conversation_dir_min_free_mib = std::stoll(next("--conversation-dir-min-free-mib"));
         else if (a == "--conversation-dir-preload")
             o.conversation_dir_preload = std::stoll(next("--conversation-dir-preload"));
         else if (a == "--conversation-spill-pending-mib")
@@ -4381,7 +4389,8 @@ int main(int argc, char** argv) {
         if (!o.conversation_dir.empty()) {
             strata::core::ConversationStoreOptions so;
             so.policy.checkpoint_gap = (uint64_t) std::max<int64_t>(0, o.conversation_dir_checkpoint_gap);
-            so.budget_bytes = (uint64_t) std::max<int64_t>(0, o.conversation_dir_mib) << 20;
+            so.budget_bytes = o.conversation_dir_mib < 0 ? 0 : std::max<uint64_t>(1, (uint64_t) o.conversation_dir_mib << 20);
+            so.min_free_bytes = (uint64_t) std::max<int64_t>(0, o.conversation_dir_min_free_mib) << 20;
             so.pending_bytes = (uint64_t) std::max<int64_t>(0, o.conversation_spill_pending_mib) << 20;
             so.read_mb_s = (double) std::max<int64_t>(1, o.conversation_dir_read_mbps);
             so.prefill_tok_s = (double) std::max<int64_t>(1, o.conversation_dir_prefill_tps);
@@ -4512,8 +4521,18 @@ int main(int argc, char** argv) {
             std::fflush(stderr);
             return st.written + st.unchanged;
         };
-        // At start only the most recent --conversation-dir-preload conversations are read; the rest stay on disk
-        // until a request matches one (the catalog is the files' indexes).
+        // At start only the most recent --conversation-dir-preload conversations are read, on a thread of their own
+        // while requests are served; the rest stay on disk until a request matches one (the catalog is the files'
+        // indexes).  Only the reading runs there: the images are checked and parked on this thread, between
+        // requests (adopt_preload), or at once when a request matches one still being read.
+        struct Preloaded {
+            std::string name, error;
+            bool ok = false;
+            strata::core::SavedConversation image;
+            double seconds = 0;
+        };
+        std::future<std::vector<Preloaded>> preloading;
+        std::vector<std::string> preload_names;
         auto load_all = [&] {
             if (!store.enabled() || o.conversation_dir_preload <= 0) return;
             if (!conversations.enabled()) {
@@ -4523,35 +4542,39 @@ int main(int argc, char** argv) {
             const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
             auto names = store.recent((size_t) o.conversation_dir_preload);
             std::reverse(names.begin(), names.end());   // oldest first: the newest ends most recent in the LRU
+            uint64_t total = 0;
             for (const auto& name : names) {
-                const auto t0 = Clock::now();
                 strata::core::ConversationDiskIndex index;
                 std::string e;
                 const std::string path = (std::filesystem::path(o.conversation_dir) / name).string();
                 const uint64_t size = strata::core::conversation_disk_read_index(index, path, e) ? index.image_bytes : 0;
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
-                                                             (size_t) size, floor)) {
+                if (!size || !strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                                                                      (size_t) (total + size), floor)) {
                     std::fprintf(stderr, "strata serve: conversation dir: %s not preloaded (RAM)\n", name.c_str());
                     continue;
                 }
-                strata::core::SavedConversation im;
-                try {
-                    if (!store.load(name, im, e) || !strata::core::conversation_snapshot_validate(im, ss, g, mtp.kv_state(), e)) {
-                        std::fprintf(stderr, "strata serve: conversation dir: %s not loaded: %s\n", name.c_str(), e.c_str());
-                        continue;
-                    }
-                } catch (const std::bad_alloc&) {
-                    std::fprintf(stderr, "strata serve: conversation dir: %s skipped (allocation)\n", name.c_str());
-                    continue;
-                }
-                const size_t tokens = im.live.ids.size();
-                const bool stored = conversations.put(std::move(im));
-                std::fprintf(stderr, "strata serve: conversation dir: %s %s (%zu tokens) in %.1f s; parked=%zu bytes=%zu\n",
-                             stored ? "preloaded" : "did not fit", name.c_str(), tokens,
-                             std::chrono::duration<double>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes());
+                total += size;
+                preload_names.push_back(name);
             }
-            std::fflush(stderr);
+            if (preload_names.empty()) return;
+            std::fprintf(stderr, "strata serve: conversation dir: preloading %zu conversation%s (%.0f MB) in the background\n",
+                         preload_names.size(), preload_names.size() == 1 ? "" : "s", total / 1e6);
+            preloading = std::async(std::launch::async, [&store, names = preload_names] {
+                std::vector<Preloaded> out;
+                for (const auto& n : names) {
+                    Preloaded p;
+                    p.name = n;
+                    const auto t0 = Clock::now();
+                    try {
+                        p.ok = store.load(n, p.image, p.error);
+                    } catch (const std::bad_alloc&) {
+                        p.error = "allocation failed";
+                    }
+                    p.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+                    out.push_back(std::move(p));
+                }
+                return out;
+            });
         };
         // CACHE <live tokens> <parked bytes> <evictions> [<key>:<tokens>:<bytes> ...]: the conversation cache for the
         // Monitor, least recently active first; sent after loading and after every request.  The disk tier's
@@ -4579,6 +4602,27 @@ int main(int argc, char** argv) {
             }
             std::printf("%s\n", s.c_str());
             std::fflush(stdout);
+        };
+        // the background preload's images: checked and parked here, on the engine thread (wait: until it is done)
+        auto adopt_preload = [&](bool wait) {
+            if (!preloading.valid()) return;
+            if (!wait && preloading.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+            auto got = preloading.get();
+            preload_names.clear();
+            for (auto& p : got) {
+                std::string e = p.error;
+                if (!p.ok || !strata::core::conversation_snapshot_validate(p.image, ss, g, mtp.kv_state(), e)) {
+                    std::fprintf(stderr, "strata serve: conversation dir: %s not loaded: %s\n", p.name.c_str(), e.c_str());
+                    continue;
+                }
+                const size_t tokens = p.image.live.ids.size();
+                const bool stored = conversations.put(std::move(p.image));
+                std::fprintf(stderr, "strata serve: conversation dir: %s %s (%zu tokens), read in %.1f s in the background; "
+                                     "parked=%zu bytes=%zu\n", stored ? "preloaded" : "did not fit", p.name.c_str(), tokens,
+                             p.seconds, conversations.size(), conversations.bytes());
+            }
+            std::fflush(stderr);
+            report_cache();
         };
         // USAGE <layers> <experts> <base64>: since the engine started, the expert usage counters (three uint32 arrays,
         // layer-major: lookups the VRAM cache served, computed on a GPU from outside it, computed by the CPU) and which
@@ -4978,6 +5022,7 @@ int main(int argc, char** argv) {
         report_usage();
         bool vision_lent = false;
         while (next_line(line)) {
+            adopt_preload(false);
             if (line == "QUIT") break;
             // The command loop runs only between requests; adaptive host threads are already joined.
             if (line.rfind("VISION_RELEASE ", 0) == 0) {
@@ -5227,6 +5272,14 @@ int main(int argc, char** argv) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
+            }
+            // a request on a conversation the background preload is still reading waits for it, not a second read
+            if (preloading.valid() && store.enabled()) {
+                const auto dm = store.best(std::vector<int32_t>(ids.begin(), ids.end()), req_imgs, want_cvec);
+                if (!dm.name.empty() && std::find(preload_names.begin(), preload_names.end(), dm.name) != preload_names.end()) {
+                    std::fprintf(stderr, "strata serve: conversation dir: waiting for the preload of %s\n", dm.name.c_str());
+                    adopt_preload(true);
+                }
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             int64_t in_tokens = parked.tokens;

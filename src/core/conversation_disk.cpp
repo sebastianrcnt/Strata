@@ -16,7 +16,12 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 
 #if defined(STRATA_HAVE_ZSTD)
 #include <zstd.h>
@@ -854,6 +859,28 @@ uint64_t key_from_name(const std::string& n) {
     if (n.size() < 22 || n.rfind("conv-", 0) != 0) return 0;
     return std::strtoull(n.substr(5, 16).c_str(), nullptr, 16);
 }
+// what the filesystem holding `dir` has free for an unprivileged writer (UINT64_MAX: unknown)
+uint64_t free_bytes(const std::string& dir) {
+    struct statvfs v {};
+    if (::statvfs(dir.c_str(), &v) != 0) return UINT64_MAX;
+    return (uint64_t) v.f_bavail * (uint64_t) v.f_frsize;
+}
+// The writer runs beside decoding (whose CPU experts want every core) and beside restores from the same disk:
+// lowest CPU and I/O priority, where the OS allows it (a container may not).  Returns what was set.
+std::string lower_this_thread() {
+#if defined(__linux__)
+    const long tid = ::syscall(SYS_gettid);
+    std::string got;
+    got += ::setpriority(PRIO_PROCESS, (id_t) tid, 15) == 0 ? "nice 15" : "nice unchanged (" + std::string(std::strerror(errno)) + ")";
+    constexpr int kWhoProcess = 1, kShift = 13, kIdle = 3, kBestEffort = 2;   // linux/ioprio.h
+    if (::syscall(SYS_ioprio_set, kWhoProcess, (int) tid, kIdle << kShift) == 0) got += ", I/O idle";
+    else if (::syscall(SYS_ioprio_set, kWhoProcess, (int) tid, (kBestEffort << kShift) | 7) == 0) got += ", I/O best-effort 7";
+    else got += ", I/O priority unchanged (" + std::string(std::strerror(errno)) + ")";
+    return got;
+#else
+    return "priority unchanged (not Linux)";
+#endif
+}
 double since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
@@ -984,7 +1011,7 @@ struct ConversationStore::Impl {
     // ---- one image to disk: the writer thread, or persist() on the request thread while the writer is idle.
     // The catalog is locked to plan and to commit, not while hashing or writing.
     struct Outcome {
-        bool written = false, unchanged = false, delta = false, failed = false;
+        bool written = false, unchanged = false, delta = false, failed = false, skipped = false;
         uint64_t bytes = 0, image_bytes = 0;
         int dropped = 0;
         std::string name;
@@ -1032,6 +1059,18 @@ struct ConversationStore::Impl {
                 if (delta) pin(parent, +1);   // collect() must not remove it while the delta is written
             }
         }
+        // never fill the disk: what the file will take at most (the state codec only shrinks it) must leave the floor
+        const uint64_t need = self.image_bytes - (delta ? plan.reused : 0);
+        if (const uint64_t free = free_bytes(dir); free != UINT64_MAX && free < opt.min_free_bytes + need) {
+            std::lock_guard<std::mutex> lk(mu);
+            if (delta) pin(parent, -1);
+            ++st.dropped;
+            out.skipped = true;
+            log("conversation dir: " + out.name + " not written: " + std::to_string(free >> 20) + " MiB free, " +
+                std::to_string(need >> 20) + " MiB needed above the " + std::to_string(opt.min_free_bytes >> 20) +
+                " MiB floor");
+            return out;
+        }
         Index written;
         std::string err;
         const bool ok = write_image(im, cks, self, path(out.name), delta ? &named : nullptr, parent,
@@ -1063,6 +1102,7 @@ struct ConversationStore::Impl {
     }
 
     void run() {
+        log("conversation dir: writer thread at " + lower_this_thread());
         std::unique_lock<std::mutex> lk(mu);
         for (;;) {
             cv.wait(lk, [&] { return (stop && queue.empty()) || (!held && !queue.empty() && !queue.front()->started); });
@@ -1076,7 +1116,8 @@ struct ConversationStore::Impl {
             char line[256];
             std::snprintf(line, sizeof line, "conversation dir: spilled %s (%zu tokens): %s%s, %.0f MB in %.1f s",
                           o.name.c_str(), item->image.live.ids.size(),
-                          o.failed ? "FAILED" : o.unchanged ? "already on disk" : o.delta ? "delta" : "whole",
+                          o.failed ? "FAILED" : o.skipped ? "DROPPED (disk full)" : o.unchanged ? "already on disk"
+                                   : o.delta ? "delta" : "whole",
                           o.dropped ? (", " + std::to_string(o.dropped) + " checkpoints left out").c_str() : "",
                           o.bytes / 1e6, secs);
             log(line);
@@ -1158,6 +1199,16 @@ bool ConversationStore::open(const std::string& dir, const ConversationStoreOpti
             m.log("conversation dir: " + n + ": broken chain (parent " + e.index.parent + "), dropped");
             e.readable = e.conversation = false;
         }
+    if (m.opt.budget_bytes == 0) {
+        uint64_t ours = 0;
+        for (const auto& [n, e] : m.disk) if (!e.foreign) ours += e.file_bytes;
+        const uint64_t free = free_bytes(dir);
+        const uint64_t room = free == UINT64_MAX ? (80ull << 30) : (uint64_t) (0.7 * (double) (free + ours));
+        m.opt.budget_bytes = std::min<uint64_t>(80ull << 30, room);
+        m.log("conversation dir: budget " + std::to_string(m.opt.budget_bytes >> 20) + " MiB (" +
+              (free == UINT64_MAX ? std::string("free space unknown") :
+               std::to_string(free >> 20) + " MiB free, " + std::to_string(ours >> 20) + " MiB ours") + ")");
+    }
     m.collect();
     m.open = true;
     m.writer = std::thread([this] { impl_->run(); });
@@ -1270,7 +1321,8 @@ bool ConversationStore::worth(const ConversationStoreMatch& m, int64_t have) con
     const int64_t gain = m.tokens - have;
     if (gain < impl_->opt.min_gain) return false;
     const double read = (double) m.read_bytes / (impl_->opt.read_mb_s * 1e6);
-    const double prefill = (double) gain / impl_->opt.prefill_tok_s;
+    const auto& o = impl_->opt;
+    const double prefill = (double) gain / (gain >= o.prefill_split ? o.prefill_tok_s : o.prefill_small_tok_s);
     return prefill > read;
 }
 
@@ -1360,6 +1412,11 @@ ConversationStoreStats ConversationStore::stats() const {
     s.pending = m.queue.size();
     s.pending_bytes = m.pending_bytes;
     return s;
+}
+
+uint64_t ConversationStore::budget_bytes() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->opt.budget_bytes;
 }
 
 uint64_t ConversationStore::pending_bytes() const {

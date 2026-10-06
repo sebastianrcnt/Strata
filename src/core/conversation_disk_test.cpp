@@ -462,7 +462,17 @@ int main(int argc, char** argv) {
         check(st.best(prompt(ids1, 900, 10), {}, true).tokens == 0, "nothing shorter than the first checkpoint");
         check(st.worth(m, 0), "10700 tokens to read again (~6 s) beat reading ~40 MB");
         check(!st.worth(m, m.tokens - 100), "a 100-token gain is not worth a read");
-        check(!st.worth(c, 0) || c.read_bytes > 0, "worth weighs the chain's bytes");
+        {   // the calibrated rule: ~100 MB/s against 900 tok/s below 20k tokens, 1800 above
+            ConversationStoreMatch big = m;
+            big.read_bytes = 2000000000;   // a 2 GB file: ~20 s to read
+            big.tokens = 30000;
+            check(!st.worth(big, 0), "30k tokens (~17 s to read again) do not pay for 2 GB (~20 s)");
+            big.tokens = 40000;
+            check(st.worth(big, 0), "40k tokens (~22 s) do");
+            big.tokens = 15000;
+            big.read_bytes = 1000000000;
+            check(st.worth(big, 0), "15k tokens at 900 tok/s (~17 s) pay for 1 GB (~10 s)");
+        }
         SavedConversation back;
         check(st.take(m, back, e0) && same(back, a1), "a disk hit restores a1 byte for byte");
         check(st.stats().hits == 1, "counted as a disk hit");
@@ -570,6 +580,26 @@ int main(int argc, char** argv) {
             check(s.written == 1 && s.removed == 2 && conv_files(dir).size() == 1 && fs::exists(P(dir, b)),
                   "a newer one replaces it: the delta and its parent go together");
         }
+    }
+    clean();
+    {   // the default budget is a share of the disk; the free-space floor drops a write instead of filling it
+        ConversationStore st;
+        check(st.open(dir, options(0), logger), "open with the automatic budget");
+        check(st.budget_bytes() > 0 && st.budget_bytes() <= (80ull << 30), "automatic budget: min(80 GiB, 70% of free)");
+        std::printf("  automatic budget here: %llu MiB\n", (unsigned long long) (st.budget_bytes() >> 20));
+    }
+    {
+        ConversationStoreOptions o = options();
+        o.min_free_bytes = 1ull << 60;   // no disk has that free
+        ConversationStore st;
+        check(st.open(dir, o, logger), "open with an impossible floor");
+        auto s = st.persist({&a0});
+        check(s.written == 0 && conv_files(dir).empty(), "nothing written under the floor");
+        SavedConversation c = a1;
+        st.spill(std::move(c));
+        st.flush();
+        check(st.stats().dropped == 2 && st.pending_bytes() == 0 && conv_files(dir).empty(),
+              "a spill under the floor is dropped, its memory freed");
     }
     clean();
     {   // a broken chain found at start: dropped, never offered

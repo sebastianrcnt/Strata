@@ -22,10 +22,24 @@
                 tokens: p.tokens, ram: p.bytes, disk: f?.bytes, saved: f ? dateTime(f.mtime) : "–"});
     });
     for (let i = parked.length; i < c.slots; i++) out.push({id: `empty-${i}`, slot: `${i + 1} / ${c.slots}`, state: [], saved: "–"});
-    for (const f of [...files.values()].reverse())
-      out.push({id: `file-${f.key}`, slot: "–", state: [["neutral", "Disk only"]], tokens: f.tokens, disk: f.bytes, saved: dateTime(f.mtime)});
+    if (c.disk) {
+      // the engine's disk tier (most recently used first); a file it does not list is a delta's parent, kept for it
+      for (const d of c.disk.slice().reverse()) {
+        if ((c.parked || []).some((p) => p.key === d.key)) continue;   // parked as well: its row is above
+        const f = files.get(d.key);
+        out.push({id: `disk-${d.key}`, slot: "–", state: [["neutral", "Disk only"]], tokens: d.tokens, disk: d.bytes,
+                  saved: f ? dateTime(f.mtime) : "–"});
+      }
+    } else {
+      for (const f of [...files.values()].reverse())
+        out.push({id: `file-${f.key}`, slot: "–", state: [["neutral", "Disk only"]], tokens: f.tokens, disk: f.bytes, saved: dateTime(f.mtime)});
+    }
     return out;
   });
+  // files the disk tier keeps only as the parent of a delta (no conversation of their own)
+  const parents = $derived(c?.disk ? (c.files || []).filter((f) => !c.disk.some((d) => d.key === f.key)).length : 0);
+  const spill = $derived(c?.spill ? ` · spilled ${fmt(c.spill.spills)}, restored from disk ${fmt(c.spill.restores)}` +
+    (c.spill.pending_bytes ? `, ${gbs(c.spill.pending_bytes)} waiting to be written` : "") : "");
   const shown = $derived(showAll ? rows : rows.slice(0, 5));
   const budget = $derived(c ? c.budget_mib * 1048576 : 0);
   const disk = $derived((c?.files || []).reduce((a, f) => a + f.bytes, 0));
@@ -49,8 +63,9 @@
         </tbody>
       </table>
     </div>
-    <p class="note">{c.reported ? "" : "Waiting for the engine's first report. "}Evicted since start: {fmt(c.evictions)}{c.dir
-      ? ` · disk: ${(c.files || []).length} files, ${gbs(disk)} in ${c.dir}` : " · no --conversation-dir"}</p>
+    <p class="note">{c.reported ? "" : "Waiting for the engine's first report. "}Evicted since start: {fmt(c.evictions)}{spill}{c.dir
+      ? ` · disk: ${c.disk ? `${fmt(c.disk.length)} conversations, ` : ""}${(c.files || []).length} files${parents
+        ? ` (${fmt(parents)} kept as delta parents)` : ""}, ${gbs(disk)} in ${c.dir}` : " · no --conversation-dir"}</p>
   </Panel>
 {/if}
 

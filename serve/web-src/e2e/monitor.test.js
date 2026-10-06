@@ -30,6 +30,19 @@ test("the request table updates in place: a selection and an open row survive th
   expect(await page.textContent("tr.details")).toContain("MTP drafts accepted");
 }, 30000);
 
+test("the conversation card lists the disk tier's conversations and its spills", async () => {
+  const {page, errors} = await open(b, srv.url);
+  const card = await page.waitForSelector(".panel:has-text(\"Conversation cache\")");
+  await (await card.$("button:has-text(\"Show all\")")).click();   // live + 4 parked fill the first five rows
+  await sleep(100);
+  const text = await card.textContent();
+  expect((text.match(/Disk only/g) || []).length).toBe(2);   // the fixture's third file is a delta's parent
+  expect(text).toContain("spilled 7, restored from disk 3");
+  expect(text).toContain("waiting to be written");
+  expect(text).toContain("2 conversations, 3 files (1 kept as delta parents)");
+  expect(errors).toEqual([]);
+}, 30000);
+
 test("only exceptions get a badge", async () => {
   const {page} = await open(b, srv.url);
   const badges = await page.$$eval("tr.row .badge", (x) => x.map((e) => e.textContent));
