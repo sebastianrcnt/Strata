@@ -2850,8 +2850,7 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
-                   hub.close if hub is not None else None]
+        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
         for close in filter(None, closers):
             try:
                 close()
