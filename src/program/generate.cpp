@@ -402,7 +402,7 @@ struct Options {
     int64_t conversation_dir_min_free_mib = 5120;  // never write a file that leaves the disk less free than this
     int64_t conversation_dir_preload = 1;          // conversations read into RAM at start, most recent first
     int64_t conversation_spill_pending_mib = 4096; // evicted images waiting to be written (beyond the RAM budget)
-    int64_t conversation_dir_read_mbps = 100;      // a disk restore is taken when reading its files is faster
+    int64_t conversation_dir_read_mbps = 70;      // a disk restore is taken when reading its files is faster
     int64_t conversation_dir_prefill_tps = 1800;   //   than reading the tokens it adds again
     /// --serve: a turn whose role token (the one after <|im_start|>) is this id and that directly precedes the
     /// last turn belongs to the new turn's header (a trailing per-request system note): the turn checkpoint goes
@@ -531,7 +531,7 @@ void usage() {
                  "                       (default 1)\n"
                  "  --conversation-spill-pending-mib N  --serve: evicted conversations waiting for their write (default 4096)\n"
                  "  --conversation-dir-read-mbps N / --conversation-dir-prefill-tps N  --serve: a disk restore is taken when\n"
-                 "                       reading it beats reading its tokens again (defaults 100 MB/s; 1800 tokens/s for\n"
+                 "                       reading it beats reading its tokens again (defaults 70 MB/s; 1800 tokens/s for\n"
                  "                       20k tokens or more, 900 below)\n"
                  "  --tail-role-token ID  --serve: a trailing turn with this role token checkpoints before itself\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"

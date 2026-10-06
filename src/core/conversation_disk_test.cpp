@@ -466,12 +466,14 @@ int main(int argc, char** argv) {
             ConversationStoreMatch big = m;
             big.read_bytes = 2000000000;   // a 2 GB file: ~20 s to read
             big.tokens = 30000;
-            check(!st.worth(big, 0), "30k tokens (~17 s to read again) do not pay for 2 GB (~20 s)");
+            check(!st.worth(big, 0), "30k tokens (~17 s to read again) do not pay for 2 GB (~29 s)");
             big.tokens = 40000;
-            check(st.worth(big, 0), "40k tokens (~22 s) do");
+            check(!st.worth(big, 0), "40k tokens (~22 s) do not either at 70 MB/s (~29 s)");
+            big.tokens = 55000;
+            check(st.worth(big, 0), "55k tokens (~31 s) do");
             big.tokens = 15000;
             big.read_bytes = 1000000000;
-            check(st.worth(big, 0), "15k tokens at 900 tok/s (~17 s) pay for 1 GB (~10 s)");
+            check(st.worth(big, 0), "15k tokens at 900 tok/s (~17 s) pay for 1 GB (~14 s)");
         }
         SavedConversation back;
         check(st.take(m, back, e0) && same(back, a1), "a disk hit restores a1 byte for byte");
@@ -523,11 +525,37 @@ int main(int argc, char** argv) {
         m = st.best(prompt(ids1, ids1.size(), 5), {}, true);
         check(m.pending == 0 && m.name == conversation_disk_name(a1) && st.take(m, back, e0) && same(back, a1),
               "and found on disk");
+        // a conversation too short to ever be restored is not spilled
+        SavedConversation tiny = image(tokens(300, 3), {100}, 1);
+        st.spill(std::move(tiny));
+        st.flush();
+        check(st.stats().too_short == 1 && !fs::exists(P(dir, image(tokens(300, 3), {100}, 1))),
+              "a 300-token conversation is not spilled");
         // the same image spilled again is not written again
         c = a1;
         st.spill(std::move(c));
         st.flush();
         check(st.stats().spill_unchanged == 1, "a spill of a conversation already on disk writes nothing");
+    }
+    clean();
+    {   // taken back while its write is running: a copy at once, and the write still completes
+        ConversationStoreOptions o = options();
+        o.test_write_delay_ms = 1500;
+        ConversationStore st;
+        check(st.open(dir, o, logger), "open");
+        SavedConversation c = a1;
+        st.spill(std::move(c));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));   // the writer has started it
+        auto m = st.best(prompt(ids1, ids1.size(), 5), {}, true);
+        check(m.pending != 0, "still queued while it is written");
+        const auto t0 = std::chrono::steady_clock::now();
+        SavedConversation back;
+        check(st.take(m, back, e0) && same(back, a1), "taken back while being written");
+        const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        check(waited < 1.0, "without waiting for the write");
+        st.flush();
+        check(fs::exists(P(dir, a1)) && st.pending_bytes() == 0 && reads_as(P(dir, a1), a1),
+              "the write went on and the file is whole");
     }
     clean();
     {   // queued bytes are bounded: the second spill waits for the first write

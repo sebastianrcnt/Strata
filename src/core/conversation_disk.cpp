@@ -1110,6 +1110,8 @@ struct ConversationStore::Impl {
             auto item = queue.front();
             item->started = true;
             lk.unlock();
+            if (opt.test_write_delay_ms > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(opt.test_write_delay_ms));
             const auto t0 = std::chrono::steady_clock::now();
             const Outcome o = write(item->image);
             const double secs = since(t0);
@@ -1220,6 +1222,19 @@ bool ConversationStore::enabled() const { return impl_->open; }
 void ConversationStore::spill(SavedConversation&& image) {
     auto& m = *impl_;
     if (!m.open) return;
+    // A conversation shorter than min_gain is never worth a restore (worth()), yet its checkpoint state alone is
+    // ~200 MB on disk: the integration test spent 31 s writing a 327-token one.  QUIT/PERSIST still write them.
+    size_t longest = image.live.ids.size();
+    for (const auto& c : image.checkpoints) longest = std::max(longest, c.ids.size());
+    if ((int64_t) longest < m.opt.min_gain) {
+        {
+            std::lock_guard<std::mutex> lk(m.mu);
+            ++m.st.too_short;
+        }
+        m.log("conversation dir: not spilled: " + std::to_string(longest) + " tokens, below the " +
+              std::to_string(m.opt.min_gain) + " a restore needs");
+        return;
+    }
     auto item = std::make_shared<Pending>();
     item->bytes = image.bytes();
     item->image = std::move(image);
@@ -1336,11 +1351,16 @@ bool ConversationStore::take(const ConversationStoreMatch& match, SavedConversat
         if (!item->started) {
             m.queue.erase(it);
             m.pending_bytes -= item->bytes;
+            image = std::move(item->image);
         } else {
-            item->claimed = true;   // being written: wait, then keep the image instead of reading the file back
-            m.cv.wait(lk, [&] { return item->done; });
+            // Being written: a copy now, not the image after the write (the integration test waited 11 s for a
+            // 620 MB write to the USB disk).  The writer only reads the original; claimed, it leaves it to be
+            // freed with the item.  Until then the copy and the original are both in RAM.
+            item->claimed = true;
+            lk.unlock();
+            image = item->image;
+            lk.lock();
         }
-        image = std::move(item->image);
         ++m.st.reclaimed;
         m.st.hit_tokens += (uint64_t) match.tokens;
         m.cv.notify_all();

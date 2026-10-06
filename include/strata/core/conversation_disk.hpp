@@ -111,14 +111,16 @@ struct ConversationStoreOptions {
     // A disk restore is taken when reading its files takes less time than reading again the tokens it adds.
     // Measured (production server.log, 2026-10, 5214 prompts): a re-read of 20k-50k tokens ran at a median
     // 1807 tok/s (n=29), above 50k at 2054 (n=32), 1800-1900 aggregate; 2k-20k at a median 916 (n=733).  The
-    // conversation disk (2.5" USB HDD) reads ~108 MB/s with dd; checking the hashes (0.35 s per 2 GB) and
-    // unpacking the checkpoint state (~40% of the bytes, ~2.4 GB/s) take that to ~100 MB/s.
-    double read_mb_s = 100;
+    // conversation disk (2.5" USB HDD) reads ~108 MB/s with dd, but a cold restore read (conversation_disk_read
+    // with its hash check and state unpacking, page cache dropped) measured 71 MB/s for a 619 MB whole file and
+    // 68 MB/s for an 825 MB delta chain (2026-10-07).
+    double read_mb_s = 70;
     double prefill_tok_s = 1800;           // for a gain of prefill_split tokens or more
     double prefill_small_tok_s = 900;      // below it
     int64_t prefill_split = 20000;
-    int64_t min_gain = 4096;               // and never for fewer tokens than this
+    int64_t min_gain = 4096;               // and never for fewer tokens than this (nor is a shorter one spilled)
     bool background = true;                // false: spill() writes before it returns
+    int test_write_delay_ms = 0;           // tests: each write starts this late (after it is marked started)
 };
 struct ConversationStoreMatch {
     int64_t tokens = 0;
@@ -132,6 +134,7 @@ struct ConversationStoreStats {
     double spill_seconds = 0, spill_wait_seconds = 0;
     uint64_t hits = 0, hit_tokens = 0, read_bytes = 0, reclaimed = 0, evicted = 0, removed = 0;
     uint64_t dropped = 0;                  // not written: the filesystem was at its free-space floor
+    uint64_t too_short = 0;                // not spilled: shorter than min_gain, so never worth a restore
     double read_seconds = 0;
     uint64_t conversations = 0, files = 0, disk_bytes = 0, pending = 0, pending_bytes = 0;
 };
