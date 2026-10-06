@@ -390,6 +390,9 @@ struct Options {
     /// --serve: a directory the parked conversations (and the live one) are written to on QUIT / PERSIST and
     /// read back from at start, so a restart keeps them ("" = off)
     std::string conversation_dir;
+    /// --serve: write to --conversation-dir only the checkpoints whose loss would make a request resume more than
+    /// this many tokens earlier (plus the root and the two deepest; 0 = all)
+    int64_t conversation_dir_checkpoint_gap = 0;
     /// --serve: a turn whose role token (the one after <|im_start|>) is this id and that directly precedes the
     /// last turn belongs to the new turn's header (a trailing per-request system note): the turn checkpoint goes
     /// before it (-1 = off)
@@ -506,6 +509,8 @@ void usage() {
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-dir DIR  --serve: keep parked conversations on disk across restarts (QUIT/PERSIST)\n"
+                 "  --conversation-dir-checkpoint-gap N  --serve: on disk keep only checkpoints more than N tokens apart\n"
+                 "                       (plus the root and the two deepest; default 0 = all)\n"
                  "  --tail-role-token ID  --serve: a trailing turn with this role token checkpoints before itself\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
@@ -1160,6 +1165,8 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-dir") o.conversation_dir = next("--conversation-dir");
+        else if (a == "--conversation-dir-checkpoint-gap")
+            o.conversation_dir_checkpoint_gap = std::stoll(next("--conversation-dir-checkpoint-gap"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--ban-tokens") o.ban_tokens = next("--ban-tokens");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -4433,11 +4440,14 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation dir: no RAM to capture the live session\n");
                 }
             }
-            const auto st = strata::core::conversation_disk_persist(o.conversation_dir, images, {},
+            strata::core::ConversationDiskPolicy policy;
+            policy.checkpoint_gap = (uint64_t) std::max<int64_t>(0, o.conversation_dir_checkpoint_gap);
+            const auto st = strata::core::conversation_disk_persist(o.conversation_dir, images, policy,
                 [](const std::string& e) { std::fprintf(stderr, "strata serve: conversation dir: %s\n", e.c_str()); });
             std::fprintf(stderr, "strata serve: conversation dir (%s): %d written (%d deltas, %.0f MB of %.0f MB whole), "
-                                 "%d unchanged, %d removed in %.1f s\n",
+                                 "%d unchanged, %d removed, %d checkpoints left out in %.1f s\n",
                          why, st.written, st.deltas, st.bytes / 1e6, st.image_bytes / 1e6, st.unchanged, st.removed,
+                         st.dropped_checkpoints,
                          std::chrono::duration<double>(Clock::now() - t0).count());
             std::fflush(stderr);
             return st.written + st.unchanged;

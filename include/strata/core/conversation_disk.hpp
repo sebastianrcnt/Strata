@@ -3,6 +3,7 @@
 // usual conversation_snapshot_validate, so a file from another model or
 // geometry is rejected there, never applied.
 //
+// Format 2 stores the checkpoints' GDN/PLE state byte-shuffled and zstd-compressed (lossless) when built with zstd.
 // Format 2 adds deltas: a file may name a parent file (same directory) and hold only what differs from it, the
 // K/V bytes past the longest run of 64 KiB chunks the two share and the checkpoints the parent does not hold.
 // Every format 2 file ends with an index (chunk and checkpoint hashes, the chain's sizes) that a writer reads to
@@ -75,12 +76,17 @@ bool conversation_disk_read(SavedConversation& image, const std::string& path, s
 struct ConversationDiskPolicy {
     uint32_t max_depth = 8;               // a longer chain is written whole instead
     double max_chain_fraction = 0.5;      // ... as is one whose deltas would exceed this share of the base
+    // Checkpoints written (0: all).  Otherwise the root, the two deepest, and any other whose loss would make a
+    // miss there read more than `checkpoint_gap` extra tokens (conversation_disk_keep_checkpoints).
+    uint64_t checkpoint_gap = 0;
 };
 struct ConversationDiskStats {
-    int written = 0, deltas = 0, unchanged = 0, removed = 0, failed = 0;
+    int written = 0, deltas = 0, unchanged = 0, removed = 0, failed = 0, dropped_checkpoints = 0;
     uint64_t bytes = 0;                   // written to disk
     uint64_t image_bytes = 0;             // what writing every written image whole would have cost
 };
+// The image's checkpoints (indices, in its order) a disk image keeps under ConversationDiskPolicy::checkpoint_gap.
+std::vector<size_t> conversation_disk_keep_checkpoints(const SavedConversation& image, uint64_t gap);
 // --conversation-dir's QUIT/PERSIST: `images` least recently active first.  Writes each image not already on disk
 // (a delta where a held or kept file shares enough with it), then the manifest of held files, then removes the
 // conv-* files that are neither held nor an ancestor of a held one.  `log` gets one line per problem.

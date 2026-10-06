@@ -11,6 +11,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#if defined(STRATA_HAVE_ZSTD)
+#include <zstd.h>
+#endif
+
 namespace strata::core {
 namespace {
 
@@ -96,6 +100,55 @@ uint64_t checkpoint_hash(const ConversationCheckpoint& c, uint64_t h, uint64_t& 
         h = checkpoint_hash(p, h, bytes);
     }
     return h;
+}
+
+// ---- checkpoint state codec (format 2): the GDN recurrence and PLE history are fp32 (as the engine holds them)
+// whose low mantissa bytes are noise; split into byte planes, the sign/exponent planes compress and zstd -1 takes
+// ~14% off at ~1 GB/s.  Lossless.
+constexpr uint8_t kRaw = 0, kShuffleZstd = 1;
+constexpr size_t kPackMin = 64 * 1024;
+
+#if defined(STRATA_HAVE_ZSTD)
+void shuffle4(const uint8_t* in, uint8_t* out, size_t n) {
+    const size_t w = n / 4;
+    for (size_t i = 0; i < w; ++i)
+        for (size_t b = 0; b < 4; ++b) out[b * w + i] = in[4 * i + b];
+}
+void unshuffle4(const uint8_t* in, uint8_t* out, size_t n) {
+    const size_t w = n / 4;
+    for (size_t i = 0; i < w; ++i)
+        for (size_t b = 0; b < 4; ++b) out[4 * i + b] = in[b * w + i];
+}
+#endif
+// The packed form of v into out, or false when it stays raw (no zstd, too small, not 4-byte rows, no gain).
+bool pack(const std::vector<uint8_t>& v, std::vector<uint8_t>& out) {
+#if defined(STRATA_HAVE_ZSTD)
+    if (v.size() < kPackMin || v.size() % 4) return false;
+    std::vector<uint8_t> planes(v.size());
+    shuffle4(v.data(), planes.data(), v.size());
+    out.resize(ZSTD_compressBound(v.size()));
+    const size_t n = ZSTD_compress(out.data(), out.size(), planes.data(), planes.size(), 1);
+    if (ZSTD_isError(n) || n >= v.size()) return false;
+    out.resize(n);
+    return true;
+#else
+    (void) v; (void) out;
+    return false;
+#endif
+}
+bool unpack(const std::vector<uint8_t>& packed, std::vector<uint8_t>& v, size_t n) {
+#if defined(STRATA_HAVE_ZSTD)
+    if (n % 4 || ZSTD_getFrameContentSize(packed.data(), packed.size()) != n) return false;
+    std::vector<uint8_t> planes(n);
+    const size_t got = ZSTD_decompress(planes.data(), planes.size(), packed.data(), packed.size());
+    if (ZSTD_isError(got) || got != n) return false;
+    v.resize(n);
+    unshuffle4(planes.data(), v.data(), n);
+    return true;
+#else
+    (void) packed; (void) v; (void) n;
+    return false;   // a file packed by a build with zstd: refused, never misread
+#endif
 }
 
 // ---- the index's byte form
@@ -186,6 +239,7 @@ struct Writer {
     FILE* f;
     bool ok = true;
     uint64_t n = 0;
+    bool packed = false;   // format 2: state blobs carry a codec byte
     void raw(const void* p, size_t c) {
         ok = ok && (c == 0 || std::fwrite(p, 1, c, f) == c);
         n += c;
@@ -203,8 +257,16 @@ struct Writer {
         });
     }
     void buf(const ConversationBuffer& b) { pod<uint64_t>(b.size()); range(b, 0); }
+    void blob(const std::vector<uint8_t>& v) {
+        if (!packed) { vec(v); return; }
+        std::vector<uint8_t> z;
+        if (!pack(v, z)) { pod(kRaw); vec(v); return; }
+        pod(kShuffleZstd);
+        pod<uint64_t>(v.size());
+        vec(z);
+    }
     void checkpoint(const ConversationCheckpoint& c) {
-        vec(c.ids); vec(c.imgs); vec(c.gdn); vec(c.ple); vec(c.tails); vec(c.dead); vec(c.block_pos);
+        vec(c.ids); vec(c.imgs); blob(c.gdn); blob(c.ple); vec(c.tails); vec(c.dead); vec(c.block_pos);
         pod<uint64_t>(c.used);
         pod<uint64_t>(c.stage_parts.size());
         for (const auto& p : c.stage_parts) checkpoint(p);
@@ -215,6 +277,7 @@ struct Reader {
     FILE* f;
     uint64_t left;
     bool ok = true;
+    bool packed = false;
     void raw(void* p, size_t n) {
         ok = ok && n <= left && (n == 0 || std::fread(p, 1, n, f) == n);
         if (ok) left -= n;
@@ -238,8 +301,20 @@ struct Reader {
         });
     }
     void buf(ConversationBuffer& b) { b.resize(count(1)); range(b, 0); }
+    void blob(std::vector<uint8_t>& v) {
+        if (!packed) { vec(v); return; }
+        uint8_t codec = 0;
+        pod(codec);
+        if (!ok || codec == kRaw) { vec(v); return; }
+        uint64_t n = 0;
+        pod(n);
+        std::vector<uint8_t> z;
+        vec(z);
+        // the raw size is checked against the zstd frame's own before anything that size is allocated
+        ok = ok && codec == kShuffleZstd && n <= (16ull << 30) && unpack(z, v, n);
+    }
     void checkpoint(ConversationCheckpoint& c, int depth = 0) {
-        vec(c.ids); vec(c.imgs); vec(c.gdn); vec(c.ple); vec(c.tails); vec(c.dead); vec(c.block_pos);
+        vec(c.ids); vec(c.imgs); blob(c.gdn); blob(c.ple); vec(c.tails); vec(c.dead); vec(c.block_pos);
         pod(c.used);
         const uint64_t parts = count(1);
         if (depth > 0 && parts) ok = false;
@@ -320,13 +395,73 @@ bool plain_name(const std::string& n) {
     return !n.empty() && n.size() < 256 && n.find('/') == std::string::npos && n != "." && n != "..";
 }
 
-bool write_image(const SavedConversation& image, const Index& self, const std::string& path,
-                 const Index* parent, const std::string& parent_name, const Plan* plan, Index& written,
-                 std::string& error) {
+using Checkpoints = std::vector<const ConversationCheckpoint*>;
+Checkpoints all_checkpoints(const SavedConversation& image) {
+    Checkpoints out;
+    for (const auto& c : image.checkpoints) out.push_back(&c);
+    return out;
+}
+
+uint64_t key_of(const SavedConversation& image, const Checkpoints& checkpoints) {
+    uint64_t h = 1469598103934665603ull;
+    h = fnv(h, image.live.ids.data(), image.live.ids.size() * sizeof(int32_t));
+    h = fnv(h, image.live.imgs.data(), image.live.imgs.size() * sizeof(ConversationImageKey));
+    for (const auto* c : checkpoints) {
+        const uint64_t n = c->ids.size();
+        h = fnv(h, &n, sizeof n);
+    }
+    const uint8_t cvec = image.cvec;
+    return fnv(h, &cvec, 1);
+}
+
+std::string name_of(const SavedConversation& image, const Checkpoints& checkpoints) {
+    char name[80];
+    std::snprintf(name, sizeof name, "conv-%016llx-%lld.bin",
+                  (unsigned long long) key_of(image, checkpoints), (long long) image.live.ids.size());
+    return name;
+}
+
+Index index_of(const SavedConversation& image, const Checkpoints& checkpoints) {
+    Index x;
+    x.version = kVersion;
+    x.geometry = image.geometry;
+    x.layer_lo = image.layer_lo;
+    x.layer_hi = image.layer_hi;
+    x.cvec = image.cvec;
+    x.tokens = image.live.ids.size();
+    for (size_t s = 0; s <= checkpoints.size(); ++s) {
+        const auto& c = s == 0 ? image.live : *checkpoints[s - 1];
+        Index::Slot slot;
+        slot.hash = checkpoint_hash(c, 0, slot.bytes);
+        slot.used = c.used;
+        x.image_bytes += slot.bytes;
+        x.slots.push_back(slot);
+    }
+    for (const auto& k : image.kv) {
+        Index::Layer l;
+        l.format = k.format; l.cells = k.cells; l.heads = k.heads; l.head_dim = k.head_dim; l.page_size = k.page_size;
+        l.pooled_rows = k.pooled_rows; l.idx_dim = k.idx_dim;
+        const auto b = buffers(k);
+        for (size_t i = 0; i < 5; ++i) {
+            l.buf[i].size = b[i]->size();
+            l.buf[i].chunks = chunk_hashes(*b[i]);
+            x.image_bytes += b[i]->size();
+        }
+        x.kv.push_back(std::move(l));
+    }
+    const std::string d = describe(x);
+    x.fingerprint = xxh64(d.data(), d.size(), 0);
+    return x;
+}
+
+bool write_image(const SavedConversation& image, const Checkpoints& checkpoints, const Index& self,
+                 const std::string& path, const Index* parent, const std::string& parent_name, const Plan* plan,
+                 Index& written, std::string& error) {
     const std::string tmp = path + ".tmp";
     File file;
     if (!file.open(tmp, "wb")) { error = "cannot create " + tmp + ": " + std::strerror(errno); return false; }
     Writer w{file.f};
+    w.packed = true;
     const bool delta = parent && plan;
     written = self;
     written.delta = delta;
@@ -340,17 +475,17 @@ bool write_image(const SavedConversation& image, const Index& self, const std::s
     w.pod(image.layer_lo);
     w.pod(image.layer_hi);
     w.pod<uint8_t>(image.cvec);
-    const size_t slots = 1 + image.checkpoints.size();
+    const size_t slots = 1 + checkpoints.size();
     // The slot table first (the parent's slot each one takes, or -1), then the slots written here: a reader
     // knows which parent slots are taken twice before it moves any.
     w.pod<uint64_t>(slots);
     for (size_t s = 0; s < slots; ++s) {
-        const auto& c = s == 0 ? image.live : image.checkpoints[s - 1];
+        const auto& c = s == 0 ? image.live : *checkpoints[s - 1];
         w.pod<int64_t>(delta ? plan->slot_ref[s] : -1);
         w.pod<uint64_t>(c.used);
     }
     for (size_t s = 0; s < slots; ++s)
-        if (!delta || plan->slot_ref[s] < 0) w.checkpoint(s == 0 ? image.live : image.checkpoints[s - 1]);
+        if (!delta || plan->slot_ref[s] < 0) w.checkpoint(s == 0 ? image.live : *checkpoints[s - 1]);
     w.pod<uint64_t>(image.kv.size());
     for (size_t l = 0; l < image.kv.size(); ++l) {
         const auto& k = image.kv[l];
@@ -474,6 +609,7 @@ bool read_image(SavedConversation& image, const std::string& path, int depth, In
     }
     uint8_t kind = 0, cvec = 1;
     r.pod(kind);
+    r.packed = true;
     SavedConversation base;
     std::vector<ConversationCheckpoint> pool;
     const bool delta = kind == kDelta;
@@ -589,56 +725,35 @@ bool read_image(SavedConversation& image, const std::string& path, int depth, In
 
 } // namespace
 
-uint64_t conversation_disk_key(const SavedConversation& image) {
-    uint64_t h = 1469598103934665603ull;
-    h = fnv(h, image.live.ids.data(), image.live.ids.size() * sizeof(int32_t));
-    h = fnv(h, image.live.imgs.data(), image.live.imgs.size() * sizeof(ConversationImageKey));
-    for (const auto& c : image.checkpoints) {
-        const uint64_t n = c.ids.size();
-        h = fnv(h, &n, sizeof n);
-    }
-    const uint8_t cvec = image.cvec;
-    return fnv(h, &cvec, 1);
-}
+uint64_t conversation_disk_key(const SavedConversation& image) { return key_of(image, all_checkpoints(image)); }
 
-std::string conversation_disk_name(const SavedConversation& image) {
-    char name[80];
-    std::snprintf(name, sizeof name, "conv-%016llx-%lld.bin",
-                  (unsigned long long) conversation_disk_key(image), (long long) image.live.ids.size());
-    return name;
-}
+std::string conversation_disk_name(const SavedConversation& image) { return name_of(image, all_checkpoints(image)); }
 
 ConversationDiskIndex conversation_disk_index(const SavedConversation& image) {
-    Index x;
-    x.version = kVersion;
-    x.geometry = image.geometry;
-    x.layer_lo = image.layer_lo;
-    x.layer_hi = image.layer_hi;
-    x.cvec = image.cvec;
-    x.tokens = image.live.ids.size();
-    for (size_t s = 0; s <= image.checkpoints.size(); ++s) {
-        const auto& c = s == 0 ? image.live : image.checkpoints[s - 1];
-        Index::Slot slot;
-        slot.hash = checkpoint_hash(c, 0, slot.bytes);
-        slot.used = c.used;
-        x.image_bytes += slot.bytes;
-        x.slots.push_back(slot);
+    return index_of(image, all_checkpoints(image));
+}
+
+std::vector<size_t> conversation_disk_keep_checkpoints(const SavedConversation& image, uint64_t gap) {
+    std::vector<size_t> order(image.checkpoints.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    if (gap == 0 || order.size() <= 3) return order;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return image.checkpoints[a].ids.size() < image.checkpoints[b].ids.size();
+    });
+    // The root (shortest: the system prompt every chat shares) and the two deepest (resume, or regenerate the
+    // last reply) stay.  Between them, oldest first, one is dropped when a request it would have served then
+    // resumes from the last one kept instead, reading at most `gap` more tokens.
+    std::vector<bool> keep(order.size(), false);
+    keep[0] = keep[order.size() - 1] = keep[order.size() - 2] = true;
+    uint64_t last = image.checkpoints[order[0]].ids.size();
+    for (size_t k = 1; k + 2 < order.size(); ++k) {
+        const uint64_t at = image.checkpoints[order[k]].ids.size();
+        if (at - last > gap) { keep[k] = true; last = at; }
     }
-    for (const auto& k : image.kv) {
-        Index::Layer l;
-        l.format = k.format; l.cells = k.cells; l.heads = k.heads; l.head_dim = k.head_dim; l.page_size = k.page_size;
-        l.pooled_rows = k.pooled_rows; l.idx_dim = k.idx_dim;
-        const auto b = buffers(k);
-        for (size_t i = 0; i < 5; ++i) {
-            l.buf[i].size = b[i]->size();
-            l.buf[i].chunks = chunk_hashes(*b[i]);
-            x.image_bytes += b[i]->size();
-        }
-        x.kv.push_back(std::move(l));
-    }
-    const std::string d = describe(x);
-    x.fingerprint = xxh64(d.data(), d.size(), 0);
-    return x;
+    std::vector<size_t> out;
+    for (size_t k = 0; k < order.size(); ++k) if (keep[k]) out.push_back(order[k]);
+    std::sort(out.begin(), out.end());   // the image's own order
+    return out;
 }
 
 bool conversation_disk_read_index(ConversationDiskIndex& index, const std::string& path, std::string& error) {
@@ -659,7 +774,7 @@ bool conversation_disk_write(const SavedConversation& image, const std::string& 
         std::string e;
         delta = read_index_file(pi, parent, e) && plan_delta(self, pi, plan) && plan.reused > 0;
     }
-    if (!write_image(image, self, path, delta ? &pi : nullptr, fs::path(parent).filename().string(),
+    if (!write_image(image, all_checkpoints(image), self, path, delta ? &pi : nullptr, fs::path(parent).filename().string(),
                      delta ? &plan : nullptr, out, error)) return false;
     if (written) *written = {delta, out.depth, out.payload_bytes, delta ? plan.reused : 0, self.image_bytes};
     return true;
@@ -703,7 +818,9 @@ ConversationDiskStats conversation_disk_persist(const std::string& dir, const st
     };
     std::vector<std::string> held;
     for (const SavedConversation* im : images) {
-        const std::string name = conversation_disk_name(*im);
+        Checkpoints cks;
+        for (size_t i : conversation_disk_keep_checkpoints(*im, policy.checkpoint_gap)) cks.push_back(&im->checkpoints[i]);
+        const std::string name = name_of(*im, cks);
         const fs::path path = fs::path(dir) / name;
         held.push_back(name);
         if (disk.count(name) && chain_ok(name, 0)) {
@@ -711,7 +828,7 @@ ConversationDiskStats conversation_disk_persist(const std::string& dir, const st
             fs::last_write_time(path, fs::file_time_type::clock::now(), ec);   // load order = recency
             continue;
         }
-        const Index self = conversation_disk_index(*im);
+        const Index self = index_of(*im, cks);
         // The parent sharing the most bytes with it; a chain grown too long or too heavy is written whole again.
         const std::string* best_name = nullptr;
         Plan best;
@@ -733,7 +850,7 @@ ConversationDiskStats conversation_disk_persist(const std::string& dir, const st
         }
         Index out;
         std::string err;
-        if (!write_image(*im, self, path.string(), parent, best_name ? *best_name : std::string(),
+        if (!write_image(*im, cks, self, path.string(), parent, best_name ? *best_name : std::string(),
                          parent ? &best : nullptr, out, err)) {
             ++st.failed;
             log(err);
@@ -743,6 +860,7 @@ ConversationDiskStats conversation_disk_persist(const std::string& dir, const st
         }
         ++st.written;
         st.deltas += parent != nullptr;
+        st.dropped_checkpoints += (int) (im->checkpoints.size() - cks.size());
         st.bytes += out.payload_bytes;
         st.image_bytes += self.image_bytes;
         disk[name] = {std::move(out), true};

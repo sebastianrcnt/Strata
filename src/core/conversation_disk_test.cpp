@@ -58,7 +58,12 @@ ConversationCheckpoint checkpoint(const std::vector<int32_t>& ids, size_t n, uin
     ConversationCheckpoint c;
     c.ids.assign(ids.begin(), ids.begin() + (std::ptrdiff_t) n);
     const uint64_t h = ids_hash(ids, n);
-    fill(c.gdn, kGdn, h ^ 1);
+    // fp32 state as the engine holds it: small values (rms ~0.016) whose low mantissa bytes are noise
+    c.gdn.resize(kGdn);
+    for (size_t i = 0; i < kGdn / 4; ++i) {
+        const float x = (float) ((int64_t) (splitmix(h ^ (i * 2654435761ull)) % 2001) - 1000) * 1.6e-5f;
+        std::memcpy(c.gdn.data() + 4 * i, &x, 4);
+    }
     fill(c.ple, 4096, h ^ 2);
     fill(c.tails, 1536, h ^ 3);
     fill(c.dead, 64, h ^ 4);
@@ -495,6 +500,52 @@ int main(int argc, char** argv) {
         s = persist({&a2}, pol);
         check(s.deltas == 0 && s.written == 1, "the chain past 15% of the base is written whole");
         check(conv_files(dir).size() == 1, "and the old chain goes");
+    }
+    for (const auto& n : conv_files(dir)) fs::remove(fs::path(dir) / n);
+    {   // the state codec: lossless, and it takes something off
+        SavedConversation small = image(tokens(64, 5), {16, 32, 48}, 1);
+        ConversationDiskWritten w;
+        check(conversation_disk_write(small, P(dir, small), e, {}, &w), "write state-heavy image");
+        std::printf("state-heavy image: %.2f MB on disk for %.2f MB\n", w.file_bytes / 1e6, w.image_bytes / 1e6);
+#if defined(STRATA_HAVE_ZSTD)
+        check(w.file_bytes < w.image_bytes * 0.97, "checkpoint state is stored compressed");
+#endif
+        check(reads_as(P(dir, small), small), "compressed state restores byte for byte");
+        const std::string c = P(dir, small) + ".corrupt.bin";
+        fs::copy_file(P(dir, small), c);
+        corrupt(c, 400000);   // inside the first checkpoint's packed GDN
+        check(rejected(c, ""), "a flipped byte in packed state is rejected");
+        fs::remove(c);
+        fs::remove(P(dir, small));
+    }
+    {   // checkpoint thinning: the positions of a real file (conv-3593...-70768)
+        SavedConversation t;
+        for (size_t n : {69444, 1414, 67547, 67791, 68172, 68901}) {   // not in length order, as LRU leaves them
+            ConversationCheckpoint c;
+            c.ids.resize(n);
+            t.checkpoints.push_back(c);
+        }
+        check(conversation_disk_keep_checkpoints(t, 0).size() == 6, "gap 0 keeps every checkpoint");
+        const auto keep = conversation_disk_keep_checkpoints(t, 4096);
+        check(keep == std::vector<size_t>{0, 1, 2, 5}, "gap 4096: root, 67547 and the two deepest");
+        check(conversation_disk_keep_checkpoints(t, 100000) == std::vector<size_t>{0, 1, 5},
+              "a gap past everything keeps the root and the two deepest");
+        // persisting with a gap writes the thinned image; reading and persisting it again changes nothing
+        const auto ids = tokens(12000, 21);
+        const SavedConversation full = image(ids, {1000, 9000, 9300, 9600, 11000, 11500}, 1);
+        ConversationDiskPolicy pol;
+        pol.checkpoint_gap = 1024;
+        auto st = persist({&full}, pol);
+        check(st.written == 1 && st.dropped_checkpoints == 2, "two middle checkpoints dropped");
+        const auto files = conversation_disk_loadable(dir);
+        check(files.size() == 1, "one file");
+        SavedConversation back, want = full;
+        want.checkpoints = {full.checkpoints[0], full.checkpoints[1], full.checkpoints[4], full.checkpoints[5]};
+        check(conversation_disk_read(back, files[0], e) && same(back, want), "thinned image restores");
+        st = persist({&back}, pol);
+        check(st.unchanged == 1 && st.written == 0, "the reloaded thinned image is the same file");
+        st = persist({&full}, pol);
+        check(st.unchanged == 1, "the in-RAM image maps to that file too");
     }
     check(log.empty(), "no persist errors");
     fs::remove_all(dir);
