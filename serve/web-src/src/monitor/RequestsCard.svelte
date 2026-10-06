@@ -17,6 +17,11 @@
   const requests = $derived(metrics?.requests || []);
   const shown = $derived(monitor.showAll ? requests : requests.slice(0, 5));
   const kept = $derived(metrics?.requests_kept ?? requests.length);
+  const live = $derived(metrics?.live || {});
+  const running = $derived(live.state === "reading" || live.state === "generating");
+  const queued = $derived(live.queued || 0);
+  const phase = $derived(live.state === "reading" ? "Reading input"
+    : live.phase === "thinking" ? "Thinking" : live.phase === "answering" ? "Answering" : "Generating");
   let open = $state(null);   // the open row's start time
 
   function toggleAll() {
@@ -58,6 +63,8 @@
 
 <Panel title="Recent requests" lamp={null} flush>
   {#snippet tools()}
+    {#if running}<Badge tone="on">1 running</Badge>{/if}
+    {#if queued > 0}<Badge tone="warn">{fmt(queued)} queued</Badge>{/if}
     {#if kept > 5}<Button onclick={toggleAll}>{monitor.showAll ? "Show fewer" : `Show all ${kept}`}</Button>{/if}
   {/snippet}
   <div class="wrap" class:all={monitor.showAll}>
@@ -66,6 +73,21 @@
         <th class="num opt"><Tip text={inputMetrics.explanation}>Input prep</Tip></th><th class="num">Output</th>
         <th class="num">Duration</th></tr></thead>
       <tbody>
+        {#if running}
+          <tr class="request-running">
+            <td><Badge tone="on">Running</Badge><span class="sub">{phase}</span></td>
+            <td class="num">{fmt(live.prompt_tokens)}</td>
+            <td class="num opt">{live.state === "reading" && live.prompt_total > 0 && live.prompt_read != null
+              ? `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)}` : "–"}</td>
+            <td class="num">{fmt(live.generated)}{#if live.max_tokens > 0}<span class="sub">of {fmt(live.max_tokens)} max</span>{/if}
+              {#if live.tok_s != null}<span class="sub">{fmt(live.tok_s, 1)} tok/s</span>{/if}</td>
+            <td class="num">{live.elapsed_s == null ? "–" : `${fmt(live.elapsed_s, 1)} s`}</td>
+          </tr>
+        {/if}
+        {#if queued > 0}
+          <tr class="request-queued"><td colspan="5"><Badge tone="warn">{fmt(queued)} queued</Badge>
+            <span class="queue-label">Waiting to run</span></td></tr>
+        {/if}
         {#each shown as r (r.time)}
           {@const input = inputMetrics.summary(r)}
           {@const f = finishOf(r)}
@@ -80,7 +102,7 @@
             <tr class="details"><td colspan="5"><dl>{#each details(r) as [k, v]}<dt>{k}</dt><dd>{v}</dd>{/each}</dl></td></tr>
           {/if}
         {:else}
-          <tr><td colspan="5" class="muted">No requests yet</td></tr>
+          <tr><td colspan="5" class="muted">{running || queued > 0 ? "No completed requests yet" : "No requests yet"}</td></tr>
         {/each}
       </tbody>
     </table>
@@ -91,6 +113,10 @@
 <style>
   .wrap { overflow-x: auto; }
   .wrap.all { max-height: 420px; overflow-y: auto; }
+  .request-running td { background: var(--accent-tint); }
+  .request-running td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+  .request-queued td { background: var(--well); white-space: normal; }
+  .queue-label { margin-left: 8px; color: var(--dim); }
   .row { cursor: pointer; }
   .row:hover td { background: var(--cell); }
   .row.open td { background: var(--value-tint); }
