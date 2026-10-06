@@ -87,7 +87,58 @@ void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, 
     }
 }
 
+namespace {
+
+// ggml's x86 quantize_row_q8_0 (llama.cpp 3cf03257f, ggml/src/ggml-cpu/arch/x86/quants.c; MIT, the notice is in
+// expert.cpp) on AVX2 only: the same operations as `quantize_oracle_q8_0` there, which is compiled for AVX-512 and
+// so cannot be called from a CPU without it.  The scale is the fp16 of amax / 127 and the codes are
+// round(x * 127 / amax), as in the llama.cpp contract the oracle flag selects.
+void quantize_oracle_q8_0_avx2(const float* x, int n, ActQ& a) {
+    a.nchunks = n / QKA;
+    for (int chunk = 0; chunk < a.nchunks; ++chunk) {
+        const float* xb = x + chunk * QKA;
+        __m256 v0 = _mm256_loadu_ps(xb);
+        __m256 v1 = _mm256_loadu_ps(xb + 8);
+        __m256 v2 = _mm256_loadu_ps(xb + 16);
+        __m256 v3 = _mm256_loadu_ps(xb + 24);
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        __m256 maximum = _mm256_andnot_ps(sign, v0);
+        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign, v1));
+        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign, v2));
+        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign, v3));
+        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(maximum, 1), _mm256_castps256_ps128(maximum));
+        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+        const float amax = _mm_cvtss_f32(max4);
+        const float d = amax / 127.0f;
+        const uint16_t half_d = (uint16_t) _mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(d), 0));
+        const __m256 inverse = _mm256_set1_ps(amax != 0.0f ? 127.0f / amax : 0.0f);
+        v0 = _mm256_round_ps(_mm256_mul_ps(v0, inverse), _MM_FROUND_TO_NEAREST_INT);
+        v1 = _mm256_round_ps(_mm256_mul_ps(v1, inverse), _MM_FROUND_TO_NEAREST_INT);
+        v2 = _mm256_round_ps(_mm256_mul_ps(v2, inverse), _MM_FROUND_TO_NEAREST_INT);
+        v3 = _mm256_round_ps(_mm256_mul_ps(v3, inverse), _MM_FROUND_TO_NEAREST_INT);
+        __m256i i0 = _mm256_packs_epi32(_mm256_cvtps_epi32(v0), _mm256_cvtps_epi32(v1));
+        const __m256i i2 = _mm256_packs_epi32(_mm256_cvtps_epi32(v2), _mm256_cvtps_epi32(v3));
+        i0 = _mm256_packs_epi16(i0, i2);
+        i0 = _mm256_permutevar8x32_epi32(i0, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+        int8_t* q = a.q + chunk * QKA;
+        _mm256_storeu_si256((__m256i*) q, i0);
+        int32_t sum = 0;
+        for (int j = 0; j < QKA; ++j) sum += q[j];
+        a.scale[chunk] = h2f((const uint8_t*) &half_d);
+        a.sum[chunk] = sum;
+        a.hx[chunk] = a.scale[chunk] * float(sum);
+    }
+}
+
+}  // namespace
+
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a) {
+    // the llama.cpp contract (`expert_set_oracle_q8_0`): what `act_quant_q8_1` does under the flag on AVX-512
+    if (expert_oracle_q8_0_enabled()) {
+        quantize_oracle_q8_0_avx2(x, n, a);
+        return;
+    }
     a.nchunks = n / QKA;
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
     const __m256 half = _mm256_set1_ps(0.5f), mhalf = _mm256_set1_ps(-0.5f), zero = _mm256_setzero_ps();
