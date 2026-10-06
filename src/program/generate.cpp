@@ -4410,57 +4410,37 @@ int main(int argc, char** argv) {
             return true;
         };
         // --conversation-dir: the parked conversations and the live one go to disk on QUIT / PERSIST, one file per
-        // conversation named by its identity, so an unchanged conversation is never written twice; files of
-        // conversations no longer held are removed (only the conv-* ones: other names are kept and only read).
+        // conversation named by its identity, so an unchanged conversation is never written twice.  A conversation
+        // that shares K/V pages or checkpoints with a file already there (the same conversation a turn back, or a
+        // branch of it) is written as a delta of that file; a chain longer than 8 or heavier than half its base is
+        // written whole again.  Files of conversations no longer held are removed unless a held delta needs them
+        // (only the conv-* ones: other names are kept and only read).
         auto persist_all = [&](const char* why) -> int {
-            namespace fs = std::filesystem;
             if (o.conversation_dir.empty()) return -1;
-            std::error_code ec;
-            fs::create_directories(o.conversation_dir, ec);
             const auto t0 = Clock::now();
-            std::vector<std::string> keep;
-            int written = 0, unchanged = 0;
-            auto store = [&](const strata::core::SavedConversation& im) {
-                char name[80];
-                std::snprintf(name, sizeof name, "conv-%016llx-%lld.bin",
-                              (unsigned long long) strata::core::conversation_disk_key(im), (long long) im.live.ids.size());
-                const fs::path path = fs::path(o.conversation_dir) / name;
-                keep.push_back(name);
-                std::string e;
-                if (fs::exists(path, ec)) {
-                    ++unchanged;
-                    fs::last_write_time(path, fs::file_time_type::clock::now(), ec);   // load order = recency
-                } else if (strata::core::conversation_disk_write(im, path.string(), e)) {
-                    ++written;
-                } else {
-                    std::fprintf(stderr, "strata serve: conversation dir: %s\n", e.c_str());
-                }
-            };
-            for (const auto& im : conversations.entries()) store(im);
+            std::vector<const strata::core::SavedConversation*> images;
+            for (const auto& im : conversations.entries()) images.push_back(&im);
+            strata::core::SavedConversation live_image;
             if (live_ok && !live.empty()) {
                 try {
                     cudaDeviceSynchronize();
-                    strata::core::SavedConversation image;
                     std::string e;
                     const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
-                    if (strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), e)) store(image);
+                    if (strata::core::conversation_snapshot_save(live_image, view, ss, g, mtp.kv_state(), e))
+                        images.push_back(&live_image);
                     else std::fprintf(stderr, "strata serve: conversation dir: capturing the live session: %s\n", e.c_str());
                 } catch (const std::bad_alloc&) {
                     std::fprintf(stderr, "strata serve: conversation dir: no RAM to capture the live session\n");
                 }
             }
-            int removed = 0;
-            for (const auto& de : fs::directory_iterator(o.conversation_dir, ec)) {
-                const std::string n = de.path().filename().string();
-                if (n.rfind("conv-", 0) != 0) continue;
-                if (std::find(keep.begin(), keep.end(), n) != keep.end()) continue;
-                if (fs::remove(de.path(), ec)) ++removed;
-            }
-            std::fprintf(stderr, "strata serve: conversation dir (%s): %d written, %d unchanged, %d removed in %.1f s\n",
-                         why, written, unchanged, removed,
+            const auto st = strata::core::conversation_disk_persist(o.conversation_dir, images, {},
+                [](const std::string& e) { std::fprintf(stderr, "strata serve: conversation dir: %s\n", e.c_str()); });
+            std::fprintf(stderr, "strata serve: conversation dir (%s): %d written (%d deltas, %.0f MB of %.0f MB whole), "
+                                 "%d unchanged, %d removed in %.1f s\n",
+                         why, st.written, st.deltas, st.bytes / 1e6, st.image_bytes / 1e6, st.unchanged, st.removed,
                          std::chrono::duration<double>(Clock::now() - t0).count());
             std::fflush(stderr);
-            return written + unchanged;
+            return st.written + st.unchanged;
         };
         auto load_all = [&] {
             namespace fs = std::filesystem;
@@ -4469,16 +4449,16 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation dir needs --conversation-cache-mib; not loading\n");
                 return;
             }
-            std::error_code ec;
-            std::vector<std::pair<fs::file_time_type, fs::path>> files;
-            for (const auto& de : fs::directory_iterator(o.conversation_dir, ec))
-                if (de.is_regular_file(ec) && de.path().extension() == ".bin")
-                    files.emplace_back(de.last_write_time(ec), de.path());
-            std::sort(files.begin(), files.end());   // oldest first: the newest ends most recent in the LRU
             const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
-            for (const auto& [when, path] : files) {
+            // oldest first, so the newest ends most recent in the LRU; a parent kept only for a delta is left out
+            for (const fs::path path : strata::core::conversation_disk_loadable(o.conversation_dir)) {
                 const auto t0 = Clock::now();
-                const uint64_t size = fs::file_size(path, ec);
+                strata::core::ConversationDiskIndex index;
+                std::string ie;
+                std::error_code ec;
+                // a delta restores to its whole image: admit that, not the file
+                const uint64_t size = strata::core::conversation_disk_read_index(index, path.string(), ie)
+                                          ? index.image_bytes : fs::file_size(path, ec);
                 if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
                                                              (size_t) size, floor)) {
                     std::fprintf(stderr, "strata serve: conversation dir: %s skipped (RAM)\n", path.c_str());
