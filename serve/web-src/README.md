@@ -26,4 +26,8 @@ STRATA_DEPLOY=host:/path/to/serve/web STRATA_URL=http://host:8081 bun run deploy
 (the default install, or one directory mount in Docker): the server reads those files on every request, so no restart
 is needed. It backs the target up next to itself first and checks that the server then serves the new `app.js`.
 
+Recent requests shows the active request and a waiting-count row above the completed history, using the existing
+`/metrics` live fields. Waiting requests are shown as a count: this endpoint does not provide their identities or
+individual wait times. These rows follow the Monitor's live/paused snapshot and disappear when work completes.
+
 `"web_chat": false` in the server config (or `--no-web-chat`) hides the Chat tab; the page reads it from `/health`.
