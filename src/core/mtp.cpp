@@ -122,6 +122,7 @@ MtpDrafter::~MtpDrafter() {
     if (head_logits_) cudaFree(head_logits_);
     if (dhead_) cudaFree(dhead_);
     if (dvocab_) cudaFree(dvocab_);
+    if (draft_bans_) cudaFree(draft_bans_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
@@ -308,7 +309,8 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+            // Reserve up to one banned-row id per subset row as well as the vocabulary map.
+            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + 2 * (uint64_t) size;
         }
     }
     // coupled draft sampling (STRATA_SPEC_COUPLED=1 only): an upper bound - the id -> subset map, the penalty ring,
@@ -398,6 +400,19 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 return false;
             }
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+            std::vector<int32_t> sub((size_t) n_dvocab_);
+            std::memcpy(sub.data(), raw.data(), raw.size());
+            const auto bans = strata::kernels::sampler_subset_bans(sub.data(), (int) sub.size());
+            if (!bans.empty()) {
+                if (cudaMalloc((void**) &draft_bans_, bans.size() * sizeof(int32_t)) != cudaSuccess ||
+                    cudaMemcpy(draft_bans_, bans.data(), bans.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "mtp: the draft head's token bans could not be uploaded";
+                    return false;
+                }
+                n_draft_bans_ = (int) bans.size();
+                vram_ += bans.size() * sizeof(int32_t);
+                std::fprintf(stderr, "strata mtp: %d banned draft-head rows (same token bans as target)\n", n_draft_bans_);
+            }
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
@@ -559,6 +574,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
         native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        // Mask before either draft sampler AND its probability/floor calculation; subset indices are not token ids.
+        if (sub) apply_bans_rows(head_logits_, T, (int) nv, draft_bans_, n_draft_bans_, cs);
+        else apply_bans(head_logits_, T, (int) nv, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)

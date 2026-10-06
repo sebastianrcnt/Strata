@@ -837,6 +837,7 @@ int2* split_scratch(void* stream, size_t entries) {
 namespace {
 int* g_ban_ids = nullptr;
 int g_n_ban = 0;
+std::vector<int32_t> g_host_bans;
 __global__ void ban_kernel(float* __restrict__ logits, int n_vocab, const int* __restrict__ ids, int n) {
     float* row = logits + (size_t) blockIdx.y * n_vocab;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
@@ -846,6 +847,9 @@ __global__ void ban_kernel(float* __restrict__ logits, int n_vocab, const int* _
 
 void sampler_set_bans(const int* ids, int n) {
     if (n <= 0) return;
+    g_host_bans.assign(ids, ids + n);
+    std::sort(g_host_bans.begin(), g_host_bans.end());
+    g_host_bans.erase(std::unique(g_host_bans.begin(), g_host_bans.end()), g_host_bans.end());
     if (cudaMalloc(&g_ban_ids, (size_t) n * sizeof(int)) != cudaSuccess ||
         cudaMemcpy(g_ban_ids, ids, (size_t) n * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
         std::fprintf(stderr, "sampler_set_bans: upload of %d ids failed\n", n);
@@ -855,9 +859,21 @@ void sampler_set_bans(const int* ids, int n) {
 }
 
 void apply_bans(float* logits, int n_tokens, int n_vocab, void* stream) {
-    if (g_n_ban <= 0 || n_tokens <= 0) return;
-    const dim3 grid((unsigned) std::min(64, (g_n_ban + 255) / 256), (unsigned) n_tokens);
-    ban_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(logits, n_vocab, g_ban_ids, g_n_ban);
+    apply_bans_rows(logits, n_tokens, n_vocab, g_ban_ids, g_n_ban, stream);
+}
+
+std::vector<int32_t> sampler_subset_bans(const int32_t* sub_to_id, int n_sub) {
+    std::vector<int32_t> rows;
+    if (g_host_bans.empty()) return rows;
+    for (int i = 0; i < n_sub; ++i)
+        if (std::binary_search(g_host_bans.begin(), g_host_bans.end(), sub_to_id[i])) rows.push_back(i);
+    return rows;
+}
+
+void apply_bans_rows(float* logits, int n_tokens, int n_vocab, const int32_t* rows, int n_rows, void* stream) {
+    if (n_rows <= 0 || n_tokens <= 0) return;
+    const dim3 grid((unsigned) std::min(64, (n_rows + 255) / 256), (unsigned) n_tokens);
+    ban_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(logits, n_vocab, rows, n_rows);
 }
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
