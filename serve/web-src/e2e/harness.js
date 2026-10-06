@@ -4,7 +4,6 @@
 //   own build (bunx playwright-core install chromium).
 import {chromium} from "playwright-core";
 import metrics from "./fixtures/metrics.json";
-import mcp from "./fixtures/mcp.json";
 
 const WEB = new URL("../../web/", import.meta.url);
 
@@ -15,7 +14,6 @@ export function fakeServer() {
     stream: {state: "idle", request: null, phase: null, tail: "", prompt_preview: "", generated: 0, prompt_tokens: null,
              prompt_read: null, prompt_total: null, tok_s: null},
     settings: {shared: false, defaults: {}},
-    mcp,
     experts: {available: false},
     polls: 0,
   };
@@ -32,7 +30,6 @@ export function fakeServer() {
       if (path === "/health") return json(state.health);
       if (path === "/metrics") { state.polls++; return json(state.metrics); }
       if (path === "/api/current-stream") return json(state.stream);
-      if (path === "/mcp") return json(state.mcp);
       if (path === "/experts") return json(state.experts);
       if (path === "/settings") {
         if (req.method === "POST") { const b = await req.json(); state.settings = {shared: !!b.defaults, defaults: b.defaults || {}}; }

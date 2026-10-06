@@ -74,18 +74,3 @@ export function markdown(text) {
   return html;
 }
 
-// the answer's text cut where the model called tools: [{html}, {tool, k}, {html}, ...]
-export function answerParts(m) {
-  const text = m.text || "";
-  if (!m.tools || !m.tools.length) return [{html: markdown(text)}];
-  const parts = [];
-  let pos = 0;
-  m.tools.forEach((t, k) => {
-    const at = Math.min(Math.max(t.at || 0, pos), text.length);
-    if (at > pos) parts.push({html: markdown(text.slice(pos, at))});
-    pos = at;
-    parts.push({tool: t, k});
-  });
-  parts.push({html: markdown(text.slice(pos))});
-  return parts;
-}

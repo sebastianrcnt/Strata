@@ -184,4 +184,4 @@ START-HERE.bat --check                          only check this PC
 ```
 
 On Linux the same options go to `./setup.sh`. `START-HERE.bat --help` lists them all. The server's own settings
-(sharing the GPU with games, MCP tools, CORS, API keys, the API itself) are in the [details](DETAILS.md#using-it).
+(sharing the GPU with games, CORS, API keys, the API itself) are in the [details](DETAILS.md#using-it).

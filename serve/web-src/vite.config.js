@@ -6,7 +6,7 @@ import {readFileSync} from "node:fs";
 
 // `bun run dev` proxies the API to a running Strata server (default: this PC's)
 const SERVER = process.env.STRATA_URL || "http://127.0.0.1:8081";
-const API = ["/health", "/metrics", "/api", "/mcp", "/settings", "/v1", "/web", "/fonts"];
+const API = ["/health", "/metrics", "/api", "/settings", "/v1", "/web", "/fonts"];
 
 export default defineConfig({
   plugins: [

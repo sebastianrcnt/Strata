@@ -1,11 +1,11 @@
-// The Chat tab: one conversation kept in this browser, streamed from /v1/chat/completions. Tools from the server's
-// MCP servers are offered per request ("strata_mcp": true, which only this page sends).
+// The Chat tab: one conversation kept in this browser, streamed from /v1/chat/completions. Pictures go inline as
+// data: URLs (the server takes no other kind).
 import {store} from "./storage.js";
 import {fmt} from "./format.js";
 import {toast} from "./ui.svelte.js";
 import {server, headers, projectionLoaded} from "./server.svelte.js";
 
-export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: false};
+export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true};
 
 class Chat {
   settings = $state({...DEFAULTS, ...store.get("sampling", {})});
@@ -35,52 +35,19 @@ function userText(m) {
   const files = (m.files || []).filter((f) => f.text != null);
   return [m.text, ...files.map(fileBlock)].filter((s) => s).join("\n\n");
 }
-// An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and
-// their results (as the model read them), then the rest - so the next question can build on what the tools found.
-function assistantMessages(m) {
-  const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
-  if (!ran.length) return m.text ? [{role: "assistant", content: m.text}] : [];
-  const out = [];
-  let pos = 0;
-  for (const r of [...new Set(ran.map((t) => t.round))]) {
-    const calls = ran.filter((t) => t.round === r);
-    const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
-    out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
-              tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
-    for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
-    pos = at;
-  }
-  const rest = m.text.slice(pos).trim();
-  if (rest) out.push({role: "assistant", content: rest});
-  return out;
-}
 function apiMessages(messages) {
   const out = [];
   for (const m of messages) {
     if (m.role === "user") {
-      const imgs = (m.images || []).filter((i) => i.url);
+      const imgs = (m.images || []).filter((i) => i.url?.startsWith("data:"));
       const text = userText(m);
       out.push({role: "user", content: imgs.length ? [{type: "text", text},
         ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
-    } else if (!m.error) {
-      out.push(...assistantMessages(m));
+    } else if (!m.error && m.text) {
+      out.push({role: "assistant", content: m.text});
     }
   }
   return out;
-}
-
-// a tool event from the stream (the `strata_mcp` field of a chunk)
-function onTool(m, x, textLen, reasoningLen) {
-  if (x.event === "limit") { m.limit = x.max_rounds; return; }
-  m.tools = m.tools || [];
-  let t = m.tools.find((y) => y.id === x.id);
-  if (!t) { m.tools.push({id: x.id, name: x.name, at: textLen, rat: reasoningLen, state: "writing"}); t = m.tools[m.tools.length - 1]; }
-  if (x.event === "call") {
-    Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
-  } else if (x.event === "result") {
-    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
-                      state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
-  }
 }
 
 // ------------------------------------------------------------------ send
@@ -103,7 +70,6 @@ export async function send(question) {
   if (s.seed) body.seed = +s.seed;
   if (s.max) body.max_tokens = +s.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!s.esp;
-  if (s.mcp !== false && server.mcp.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
   // the stream is gathered here and handed to the view once per frame
   // m.live while it streams: the tokens so far (one per streamed piece) and the rate over the last two seconds
@@ -144,20 +110,16 @@ export async function send(question) {
         try { j = JSON.parse(data); } catch (e) { continue; }
         if (j.error) throw new Error(j.error.message || "the engine reported an error");
         if (j.usage) usage = j.usage;
-        if (j.strata_mcp) { paint(); onTool(m, j.strata_mcp, text.length, reasoning.length); }
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
-        const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
         if (d.reasoning_content || d.content) { pieces++; recent.push(performance.now()); }
         if (d.reasoning_content) {
           if (!firstAt) firstAt = performance.now();
           if (!thinkStart) thinkStart = performance.now();
-          if (lastTool && reasoning && lastTool.rat === reasoning.length) reasoning += "\n\n";
           reasoning += d.reasoning_content;
         }
         if (d.content) {
           if (!firstAt) firstAt = performance.now();
           if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
-          if (lastTool && text && lastTool.at === text.length) text += "\n\n";
           text += d.content;
         }
         if (!frame) frame = requestAnimationFrame(paint);
@@ -180,10 +142,6 @@ export async function send(question) {
   } else if (m.stopped) {
     meta = "Stopped";
   }
-  for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
-  const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
-  if (ran) meta = `${meta ? `${meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
-  if (m.limit) meta = `${meta} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
   m.meta = meta;
   m.live = null;
   chat.busy = null;
@@ -198,7 +156,7 @@ export function retry() {
   const i = chat.messages.findLastIndex((m) => m.role === "user");
   if (i < 0) return;
   const q = chat.messages[i];
-  const attachments = [...(q.images || []).filter((x) => x.url).map((x) => ({kind: "image", ...x})),
+  const attachments = [...(q.images || []).filter((x) => x.url?.startsWith("data:")).map((x) => ({kind: "image", ...x})),
                        ...(q.files || []).filter((f) => f.text != null).map((f) => ({kind: "file", ...f}))];
   if (!q.text?.trim() && !attachments.length) return;
   chat.messages = chat.messages.slice(0, i);
@@ -218,11 +176,8 @@ export function newChat() {
 export function exportChat() {
   const messages = chat.messages;
   if (!messages.length) { toast("info", "Nothing to save yet"); return; }
-  const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
-    `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
-    `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("");
   const md = messages.map((m) => m.role === "user" ? `## You\n\n${m.text}\n` :
-    `## ${server.health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
+    `## ${server.health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
   a.download = `strata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;

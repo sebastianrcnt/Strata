@@ -1,5 +1,5 @@
 // Everything read from this Strata server: /health, /metrics (every second), /api/current-stream (5 times a second
-// while the Monitor shows it), /mcp. Each poll replaces its object whole ($state.raw), so the views update only
+// while the Monitor shows it). Each poll replaces its object whole ($state.raw), so the views update only
 // the values that changed.
 import {store} from "./storage.js";
 import {mergeHistory} from "./history.js";
@@ -26,7 +26,6 @@ class Server {
   reachable = $state(true);
   stream = $state.raw({state: "idle"}); // the last /api/current-stream
   streamStatus = $state("");            // "API key needed", "Disconnected", ... when the preview cannot be read
-  mcp = $state.raw({servers: [], tools: 0});
 }
 export const server = new Server();
 
@@ -100,22 +99,6 @@ async function pollStream() {
   setTimeout(pollStream, 200);
 }
 
-// ------------------------------------------------------------------ /mcp (server states change rarely)
-let mcpRetry = null;
-export async function loadMcp() {
-  try {
-    const r = await fetch("mcp", {headers: headers()});
-    if (!r.ok) return;
-    server.mcp = await r.json();
-  } catch (e) { return; /* an older server: no MCP */ }
-  clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
-  if ((server.mcp.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
-}
-function pollMcp() {
-  if (ui.tab === "monitor" && !document.hidden) loadMcp();
-  setTimeout(pollMcp, 10000);
-}
-
 // the engine was started with the experimental-speed-projection control vector (INFO cvec=...)
 export const projectionLoaded = () => {
   const c = server.metrics?.engine?.cvec;
@@ -124,8 +107,7 @@ export const projectionLoaded = () => {
 
 export function start() {
   addEventListener("pagehide", () => { if (history) store.set("history", history); });
-  loadHealth().then(loadMcp);
+  loadHealth();
   pollMetrics();
   pollStream();
-  setTimeout(pollMcp, 10000);
 }

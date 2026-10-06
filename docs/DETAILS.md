@@ -6,7 +6,7 @@ New here? Start with the [README](../README.md); installing step by step is in [
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
 > [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
-> [MCP tools](#tools-from-mcp-servers) · [MCP server](#manage-strata-from-your-ai-assistant-mcp-server) ·
+> [MCP server](#manage-strata-from-your-ai-assistant-mcp-server) ·
 > [Images](#images-vision) ·
 > [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
@@ -428,7 +428,6 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (single slot, busy or idle) |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
-| The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
@@ -494,11 +493,11 @@ print(r.choices[0].message.content)
   `cloudflared tunnel --url http://127.0.0.1:8080`. **Set a key first**, or anyone with the link can use your PC:
   add `"api_key": "some-long-secret"` to `strata-<model>.json` (or set the `STRATA_API_KEY` environment variable);
   clients then send it as their API key. Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass
-  each token on at once. The web app's settings and MCP tools only answer Strata's own page: when you open it through
+  each token on at once. The web app's settings only answer Strata's own page: when you open it through
   a proxy or tunnel whose address differs, add that address, e.g. `"trusted_origins": ["https://strata.example.com"]`.
 - **From web apps in a browser (CORS).** Off by default. `"cors_origins": ["https://chat.example.com"]` lets pages of
   those origins call `/v1/*` from the browser (Open WebUI's direct connections, browser extensions); `["*"]` lets any
-  page do it - only sensible with an API key. It never opens `/settings`, `/unload` or the MCP tools.
+  page do it - only sensible with an API key. It never opens `/settings` or `/unload`.
 
 **Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
 live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
@@ -566,46 +565,6 @@ without penalties, so more of its guesses are now rejected. Requests without pen
 
 ---
 
-## Tools from MCP servers
-
-The chat page can give the model tools from [MCP](https://modelcontextprotocol.io) servers, as LM Studio and Claude
-Desktop do: reading your files, fetching web pages, searching, anything an MCP server offers. List the servers in
-`strata-<model>.json` under `"mcp_servers"` - the same shape as Claude Desktop's `mcpServers` block, which you can
-also paste as it is (key `"mcpServers"`):
-
-```json
-"mcp_servers": {
-  "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\me\\Documents\\notes"]},
-  "search": {"url": "http://127.0.0.1:3000/mcp", "headers": {"Authorization": "Bearer ..."}}
-},
-"mcp": {"timeout_s": 60, "max_result_chars": 20000, "max_rounds": 8}
-```
-
-Or keep them in their own file and start the server with `--mcp-config path\to\claude_desktop_config.json` (a file
-with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change.
-
-- **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
-  stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
-  servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
-  transport is not supported). `"disabled": true` leaves an entry out.
-- The servers start with Strata, in the background; the server window says what each one offers
-  (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
-  without them. The Monitor tab lists them, and the chat's settings have **Use tools from MCP servers** (on by
-  default). A server that stops later is started again at its next call.
-- In the chat each call shows as a small block (tool, arguments, result); the model reads the result and goes on,
-  up to `max_rounds` calls in a row per answer. A tool that fails or takes longer than `timeout_s` (default 60 s)
-  gives the model an `error: ...` result instead of ending the chat. Results longer than `max_result_chars`
-  (default 20,000 characters) are cut, with a note, before the model reads them. Stop stops a running tool too.
-- Only the chat page uses them. API clients (omp, Claude Code, OpenAI and Anthropic SDKs) see the API exactly as
-  before and keep their own tools; a request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then
-  gets `strata_mcp` tool events in the stream).
-
-**Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them** - also
-because of what it reads (a web page or a file can contain instructions). Give a filesystem server only the folders
-it needs, prefer read-only tools, and don't add servers you don't trust. The tools can only be used from the chat
-page itself (a request with another site's Origin or without a JSON content type is refused); if Strata is reachable
-from other devices, set an API key.
-
 **Context extension past 262K (rope scaling, EXPERIMENTAL, off unless you pick it).** The model was trained on
 262,144 positions (rotary base 1e7). Rope scaling rescales the rotation angles so that longer contexts stay usable,
 with llama.cpp's types and flag names. `linear` is Position Interpolation: every angle is shrunk by the factor.
@@ -663,8 +622,7 @@ for your OK. Start and stop work like the run scripts and the server's own unloa
 processes it started itself. It uses only Python's standard library, so it works before `.venv` exists.
 
 The config snippets for every client, the tool arguments and the safety rules are in
-[docs/MCP_SERVER.md](MCP_SERVER.md). This is the opposite direction from
-[Tools from MCP servers](#tools-from-mcp-servers) above, where the Strata model calls *your* MCP tools.
+[docs/MCP_SERVER.md](MCP_SERVER.md).
 
 ---
 
@@ -698,7 +656,7 @@ you> /image C:\Users\me\Pictures\receipt.jpg
 you> What is the total on this receipt?
 ```
 
-**OpenAI API** (an `image_url` part: a `data:` URL, an `http(s)://` URL or a local file path):
+**OpenAI API** (an `image_url` part with a `data:` URL):
 
 ```python
 import base64
@@ -711,7 +669,12 @@ r = client.chat.completions.create(model="strata", messages=[{"role": "user", "c
 print(r.choices[0].message.content)
 ```
 
-**Anthropic API:** an `image` block with a `base64` (or `url`) source, as usual.
+**Anthropic API:** an `image` block with a `base64` source, as usual.
+
+Pictures are only taken inline. The server never downloads an `http(s)://` URL or reads a file path that a request
+names (that would let anyone who can reach the API make your PC fetch addresses or read its files); such a request
+gets a 400 `images must be sent inline as data: URLs`. Read or download the picture in the client and send its
+bytes, as above. The terminal chat and the web app already do.
 
 JPEG, PNG, BMP, GIF, WebP, TIFF and AVIF work (the last ones are converted to PNG first; agents such as omp send
 WebP). Chat apps with image upload work the same way.
@@ -883,7 +846,7 @@ This is **schema prompting followed by server validation**, not grammar-constrai
 is made per request, with no hidden retry. Successful responses contain a validated JSON object. Malformed JSON,
 duplicate keys, non-finite numbers, schema violations and incomplete generations return **502** with
 `error.code: structured_output_failed`; invalid request schemas return **400**. JSON formats combined with
-tools/MCP are refused explicitly. Without `response_format`, ordinary text and tool behavior stays the same.
+tools are refused explicitly. Without `response_format`, ordinary text and tool behavior stays the same.
 
 Structured SSE buffers the answer while sending keep-alive comments. It emits content only after validation,
 then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without invalid content deltas.

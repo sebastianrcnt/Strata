@@ -15,9 +15,8 @@ The assistant calls the server's tools. The tools run Strata's own setup and sta
 scripts do. It is one Python file that uses only the standard library, so it works before setup has created
 `.venv`. It needs Python 3.10 or newer, 64-bit on Windows.
 
-It is not the same thing as [Tools from MCP servers](DETAILS.md#tools-from-mcp-servers). That feature
-(`serve/mcp.py`) lets the *Strata model* call tools from your MCP servers in its chat page. This page is the other
-direction: *your assistant* manages Strata.
+It is a separate program for *your assistant* to manage Strata. The Strata server itself does not speak MCP: the
+model cannot call tools from MCP servers (that feature was removed).
 
 ## Add it
 
@@ -160,7 +159,7 @@ Two cases are refused:
 VRAM and pinned RAM itself, as when you close the window. Then the server ends:
 
 - Linux: SIGTERM, which runs the server's own Ctrl+C path.
-- Windows: the process ends. Its job object ends the vision encoder and the MCP servers it started.
+- Windows: the process ends. Its job object ends the vision encoder it started.
 
 While a request is running, the tool refuses unless you pass `force: true`.
 

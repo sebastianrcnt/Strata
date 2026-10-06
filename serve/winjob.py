@@ -1,7 +1,7 @@
 """serve/winjob.py - on Windows, tie the processes Strata starts to the server's own lifetime.
 
-Closing the console window, Task Manager or a crash end the server without running its cleanup, and the engine,
-the vision encoder and the MCP servers kept running on their own. `contain(proc)` puts a child in a job object that
+Closing the console window, Task Manager or a crash end the server without running its cleanup, and the engine
+and the vision encoder kept running on their own. `contain(proc)` puts a child in a job object that
 is set to kill everything in it when its last handle closes - and the only handle is this process's, which the OS
 closes however the server ends. Processes the child starts later join the same job. The server itself stays out of
 the job, so a browser that `--open` starts is not tied to it. Elsewhere, and if the job cannot be made, a no-op.

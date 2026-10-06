@@ -5,12 +5,11 @@
   import ContextCard from "./ContextCard.svelte";
   import RequestsCard from "./RequestsCard.svelte";
   import ConversationCard from "./ConversationCard.svelte";
-  import McpCard from "./McpCard.svelte";
 
   const m = $derived(monitor.view);
 </script>
 
-<!-- Wide screens: the tracks over two columns (context and MCP beside the requests and the cache). Phones: one column,
+<!-- Wide screens: the tracks over two columns (context beside the requests and the cache). Phones: one column,
      the requests right after "now", the long tracks after them. -->
 <div class="monitor">
   <div class="slot slot--now"><NowCard metrics={m} /></div>
@@ -18,7 +17,6 @@
   <div class="cols">
     <div class="col col--side">
       <div class="slot slot--context"><ContextCard metrics={m} /></div>
-      <div class="slot slot--mcp"><McpCard /></div>
     </div>
     <div class="col col--main">
       <div class="slot slot--requests"><RequestsCard metrics={m} /></div>
@@ -40,6 +38,5 @@
     .slot--tracks { order: 3; }
     .slot--context { order: 4; }
     .slot--cache { order: 5; }
-    .slot--mcp { order: 6; }
   }
 </style>

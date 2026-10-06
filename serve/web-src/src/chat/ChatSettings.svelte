@@ -2,9 +2,8 @@
   // This chat's own thinking and sampling settings (kept in this browser), in a side sheet. Server-wide defaults
   // for other apps are in Setup.
   import {chat, saveSettings, exportChat, DEFAULTS} from "../lib/chat.svelte.js";
-  import {server, projectionLoaded} from "../lib/server.svelte.js";
+  import {projectionLoaded} from "../lib/server.svelte.js";
   import {toast} from "../lib/ui.svelte.js";
-  import {fmt} from "../lib/format.js";
   import Sheet from "../ui/Sheet.svelte";
   import Button from "../ui/Button.svelte";
   import Check from "../ui/Check.svelte";
@@ -18,8 +17,6 @@
     wasOpen = open;
   });
   const dirty = $derived(JSON.stringify(draft) !== JSON.stringify(chat.settings));
-  const tools = $derived(server.mcp.tools || 0);
-  const readyNames = $derived((server.mcp.servers || []).filter((s) => s.status === "ready" || s.status === "stopped").map((s) => s.name));
 
   function apply() {
     saveSettings({...draft, max: String(draft.max ?? "").trim(), seed: String(draft.seed ?? "").trim()});
@@ -31,10 +28,6 @@
 <Sheet bind:open title="Chat settings">
   <SamplingFields bind:s={draft} projection={projectionLoaded()} id="chat" />
   <Check id="chat-show" checked={!!draft.show} onchange={(v) => (draft.show = v)} label="Show thinking" hint="expanded while it streams" />
-  {#if (server.mcp.servers || []).length}
-    <Check id="chat-mcp" checked={draft.mcp !== false} onchange={(v) => (draft.mcp = v)} label="Use tools from MCP servers"
-           hint={tools ? `${fmt(tools)} tools from ${readyNames.join(", ")}; the model calls them when it decides to` : "no server is connected yet (see the Monitor)"} />
-  {/if}
   <Button icon="download" onclick={exportChat} disabled={!chat.messages.length}>Save this chat as Markdown</Button>
   <p class="muted small">Only this page's chat uses these. Defaults for other apps (omp, Pi, scripts) are under Setup.</p>
   <div class="actions">

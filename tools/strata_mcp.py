@@ -16,8 +16,7 @@ background processes this server starts itself; it keeps their process id and st
 ever stops a process it started (a Strata started elsewhere, e.g. from its own window, is only asked over its API to
 unload the model).
 
-Not to be confused with serve/mcp.py: that is Strata's MCP *client* (the model calling your tools from the chat page).
-This file is an MCP *server* for the AI assistant you already use.
+This file is an MCP *server* for the AI assistant you already use; the Strata server itself does not speak MCP.
 """
 from __future__ import annotations
 

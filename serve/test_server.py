@@ -1015,7 +1015,7 @@ class SharedSettings(unittest.TestCase):
 
     def test_proxy_headers_do_not_make_a_page_strata_s_own(self):
         # #321: X-Forwarded-*, CF-Ray or CF-Connecting-IP say nothing about the page that sent the request - any web
-        # page behind any proxy would otherwise change the settings (or run MCP tools)
+        # page behind any proxy would otherwise change the settings
         for extra in ({"X-Forwarded-Host": "proxy.example.com"}, {"CF-Ray": "1234567890"},
                       {"X-Forwarded-For": "203.0.113.9"}, {"CF-Connecting-IP": "203.0.113.9"}):
             code, _ = self.req("/settings", {"defaults": {"temperature": 1}},
@@ -1998,6 +1998,31 @@ class AmdTelemetry(unittest.TestCase):
             self.tree(d)
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
+
+
+
+class NoMcp(unittest.TestCase):
+    """MCP support was removed: no /mcp route, and --mcp-config is an unknown argument."""
+
+    def test_the_route_is_gone(self):
+        tok = ByteTokenizer()
+        httpd = serve(Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja")),
+                      port=0)
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/mcp", timeout=10)
+            self.assertEqual(e.exception.code, 404)
+            e.exception.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_the_flag_is_refused(self):
+        import subprocess
+        p = subprocess.run([sys.executable, "-m", "serve.server", "--engine", "mock", "--mcp-config", "mcp.json"],
+                           cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("unrecognized arguments: --mcp-config", p.stderr)
 
 
 if __name__ == "__main__":

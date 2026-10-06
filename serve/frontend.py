@@ -63,6 +63,7 @@ def _text_of(content) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+IMAGES_INLINE = "images must be sent inline as data: URLs (OpenAI image_url) or base64 blocks (Anthropic)"
 
 # Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
 # enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
@@ -96,19 +97,22 @@ def _has_image(content) -> bool:
 
 
 def _image_source(part: dict) -> str:
-    """An image part's source as one string: a data: URL, an http(s) URL or a local file path.
-    OpenAI: {"type": "image_url", "image_url": {"url": ...}} (or "image_url": "..."), Responses-style
-    {"type": "input_image", "image_url": ...}; Anthropic: {"type": "image", "source": {"type": "base64",
-    "media_type": ..., "data": ...}} or {"source": {"type": "url", "url": ...}}."""
+    """An image part's source as a data: URL - the only kind taken (an http(s) URL or a file path in a request is a
+    ValueError, a 400: the server never fetches a URL or reads a file for a client).
+    OpenAI: {"type": "image_url", "image_url": {"url": "data:..."}} (or "image_url": "data:..."), Responses-style
+    {"type": "input_image", "image_url": "data:..."}; Anthropic: {"type": "image", "source": {"type": "base64",
+    "media_type": ..., "data": ...}}."""
     if part.get("type") == "image":
         src = part.get("source") or {}
-        if src.get("type") == "base64":
-            return f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"
-        return src.get("url") or src.get("path") or ""
+        if not isinstance(src, dict) or src.get("type") != "base64":
+            raise ValueError(IMAGES_INLINE)
+        return f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"
     url = part.get("image_url")
     if isinstance(url, dict):
         url = url.get("url")
-    return url or ""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        raise ValueError(IMAGES_INLINE)
+    return url
 
 
 def _parts_of(content):

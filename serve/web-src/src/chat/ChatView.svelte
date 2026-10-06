@@ -1,7 +1,7 @@
 <script>
   import {tick} from "svelte";
   import {chat, send, newChat} from "../lib/chat.svelte.js";
-  import {server, loadMcp} from "../lib/server.svelte.js";
+  import {server} from "../lib/server.svelte.js";
   import Message from "./Message.svelte";
   import Composer from "./Composer.svelte";
   import ChatSettings from "./ChatSettings.svelte";
@@ -14,7 +14,7 @@
   const nearBottom = () => scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120;
   $effect.pre(() => {
     const last = chat.messages[chat.messages.length - 1];
-    last?.text; last?.reasoning; last?.tools?.length; chat.messages.length;
+    last?.text; last?.reasoning; chat.messages.length;
     if (!nearBottom()) return;
     tick().then(() => { if (scroller) scroller.scrollTop = scroller.scrollHeight; });
   });
@@ -24,7 +24,7 @@
   const startQuestion = new URLSearchParams(location.search).get("q");
   if (startQuestion) {
     history.replaceState(null, "", location.pathname + location.hash);
-    loadMcp().then(() => send(startQuestion));
+    send(startQuestion);
   }
 </script>
 
@@ -47,7 +47,7 @@
     {/each}
   </div>
 </div>
-<Composer {active} onSettings={() => { settingsOpen = true; loadMcp(); }} />
+<Composer {active} onSettings={() => (settingsOpen = true)} />
 <ChatSettings bind:open={settingsOpen} />
 
 <style>

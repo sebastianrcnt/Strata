@@ -1,18 +1,17 @@
 <script>
   import {chat, retry} from "../lib/chat.svelte.js";
   import {server} from "../lib/server.svelte.js";
-  import {answerParts} from "../lib/markdown.js";
+  import {markdown} from "../lib/markdown.js";
   import {fmt} from "../lib/format.js";
   import {copyText} from "../lib/ui.svelte.js";
   import Icon from "../ui/Icon.svelte";
-  import ToolCall from "./ToolCall.svelte";
 
   let {m, streaming = false, last = false} = $props();
 
   const thinkingNow = $derived(streaming && !m.text);
   // open while it streams (if wanted), closed once the answer starts - unless the user toggled it themselves
   const thinkOpen = $derived(m.thinkTouched ? !!m.thinkOpen : thinkingNow && chat.settings.show);
-  const parts = $derived(m.role === "assistant" && !m.error ? answerParts(m) : []);
+  const html = $derived(m.role === "assistant" && !m.error ? markdown(m.text || "") : "");
   // before the first token: what the engine is busy with (one engine: another request may be ahead of this one)
   const waiting = $derived.by(() => {
     const l = server.metrics?.live || {};
@@ -34,7 +33,7 @@
       <div class="attached">
         {#each m.files || [] as f}<span class="chip"><Icon name="attach" small />{f.name}</span>{/each}
         {#each m.images || [] as im}
-          {#if im.url}<img src={im.url} alt={im.name || "image"}>{:else}<span class="chip"><Icon name="image" small />{im.name || "image"}</span>{/if}
+          {#if im.url?.startsWith("data:")}<img src={im.url} alt={im.name || "image"}>{:else}<span class="chip"><Icon name="image" small />{im.name || "image"}</span>{/if}
         {/each}
       </div>
     {/if}
@@ -50,13 +49,13 @@
       </details>
     {/if}
     <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-    <div class="answer" class:cursor={streaming && (m.text || m.tools?.length)} onclick={onAnswerClick}>
+    <div class="answer" class:cursor={streaming && m.text} onclick={onAnswerClick}>
       {#if m.error}
         <div class="msg-error">{m.error}</div>
-      {:else if !m.text && streaming && !m.tools?.length}
+      {:else if !m.text && streaming}
         {#if m.reasoning}<span class="muted cursor">Writing</span>{:else}<span class="muted cursor">{waiting}</span>{/if}
       {:else}
-        {#each parts as p}{#if p.tool}<ToolCall t={p.tool} />{:else}{@html p.html}{/if}{/each}
+        {@html html}
       {/if}
     </div>
     <div class="meta">
