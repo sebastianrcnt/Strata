@@ -403,6 +403,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             std::vector<int32_t> sub((size_t) n_dvocab_);
             std::memcpy(sub.data(), raw.data(), raw.size());
             const auto bans = strata::kernels::sampler_subset_bans(sub.data(), (int) sub.size());
+            // the request bias (logit_bias) on the draft head's own rows, so the draft sees what the target sees
+            strata::kernels::sampler_set_draft_subset(sub.data(), (int) sub.size());
             if (!bans.empty()) {
                 if (cudaMalloc((void**) &draft_bans_, bans.size() * sizeof(int32_t)) != cudaSuccess ||
                     cudaMemcpy(draft_bans_, bans.data(), bans.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -575,7 +577,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
         native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         // Mask before either draft sampler AND its probability/floor calculation; subset indices are not token ids.
-        if (sub) apply_bans_rows(head_logits_, T, (int) nv, draft_bans_, n_draft_bans_, cs);
+        // The request bias rides on the same launch: the draft set (rows) with a subset head, the target set (ids)
+        // without one - either way the draft picks from the logits the verify head will judge it by.
+        if (sub) apply_bans_rows(head_logits_, T, (int) nv, draft_bans_, n_draft_bans_, cs, BiasRows::Draft);
         else apply_bans(head_logits_, T, (int) nv, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft

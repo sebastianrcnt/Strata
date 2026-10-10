@@ -852,7 +852,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         SamplerParams sp;
         sp.greedy = true;
         sp.temperature = 0.0f;
-        apply_bans(head_logits_, T, (int) n_vocab_, cs);   // --ban-tokens; the sampled re-pick below reads these too
+        apply_bans(head_logits_, T, (int) n_vocab_, cs);   // --ban-tokens + the request logit bias; the sampled re-pick reads these too
         sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
     }
     stamp(g.n_layers, 1, 0);

@@ -567,6 +567,18 @@ the speculative decoding checks at once, exactly as if it decoded one token at a
 each batch got them). That makes requests with penalties 1-11% slower than in 0.1.18: the draft layer guesses
 without penalties, so more of its guesses are now rejected. Requests without penalties are unchanged. `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
 
+**`logit_bias`** (OpenAI, `/v1/chat/completions` only; `/v1/messages` ignores it) maps token ids to a value in
+[-100, 100] that is added to that token's logit before the penalties and the rest of the chain, at every generated
+token (thinking and tool-call text included); -100 bans the token, +100 all but forces it. **The ids are this model's
+tokenizer's (the pack's `tokenizer/vocab.json`), not OpenAI's.** At most 300 entries; anything else is a 400. The
+server's own bans (`--ban-tokens`) stay banned whatever a request asks. The engine takes it as the `GEN` key
+`bias=<id>:<value>,...` and writes it into one fixed device buffer before the request's first window (the verify
+and draft graphs read the count from that buffer on every replay, so no graph is recaptured) and clears it after;
+the MTP draft head gets the same values on its own rows, so drafts stay what the verifier accepts. A request without
+it is computed exactly as before. Structured output is prompt-and-validate (no constrained decoding), so a bias
+applies there too and can make the validation fail; biasing `<|im_end|>` or `<tool_call>` changes how a reply ends
+or whether it can call a tool.
+
 ---
 
 **Context extension past 262K (rope scaling, EXPERIMENTAL, off unless you pick it).** The model was trained on

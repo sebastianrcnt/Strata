@@ -1973,6 +1973,8 @@ int main(int argc, char** argv) {
         strata::kernels::sampler_set_bans(ban.data(), (int) ban.size());
         std::fprintf(stderr, "strata generate: %zu banned token ids (%s)\n", ban.size(), o.ban_tokens.c_str());
     }
+    // the per-request logit bias (GEN key bias=): its fixed device buffer, before any window or draft graph is captured
+    strata::kernels::sampler_init_request_bias();
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
@@ -5089,6 +5091,10 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            // bias=<id>:<value>,<id>:<value>,...: the request's logit bias (OpenAI logit_bias, sampler.hpp): each
+            // value in [-100, 100] is added to that token's logit (-100: banned), on top of --ban-tokens
+            std::string req_bias_spec;
+            bool req_bias_given = false;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -5113,6 +5119,7 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "bias") { req_bias_spec = tok.substr(eq + 1); req_bias_given = true; }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -5229,6 +5236,33 @@ int main(int argc, char** argv) {
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
+            // the logit bias, checked whole here, before anything of the session changes (set below, before the prompt)
+            std::vector<int32_t> req_bias_ids;
+            std::vector<float> req_bias_vals;
+            if (req_bias_given) {
+                std::string be;
+                const char* q = req_bias_spec.c_str();
+                while (be.empty() && *q != '\0') {
+                    char* e1 = nullptr;
+                    char* e2 = nullptr;
+                    const long long id = std::strtoll(q, &e1, 10);
+                    const float v = (e1 != q && *e1 == ':') ? std::strtof(e1 + 1, &e2) : 0.0f;
+                    if (e1 == q || *e1 != ':' || e2 == e1 + 1 || (*e2 != ',' && *e2 != '\0'))
+                        be = "bias: expected <id>:<value>[,<id>:<value>...]";
+                    else if (id < 0 || id >= n_vocab)
+                        be = "bias: token id " + std::to_string(id) + " is outside the vocabulary";
+                    else if (!(v >= -100.0f && v <= 100.0f))
+                        be = "bias: the value for token " + std::to_string(id) + " is not in [-100, 100]";
+                    else if ((int) req_bias_ids.size() >= strata::kernels::kMaxRequestBias)
+                        be = "bias: more than " + std::to_string(strata::kernels::kMaxRequestBias) + " entries";
+                    else {
+                        req_bias_ids.push_back((int32_t) id);
+                        req_bias_vals.push_back(v);
+                        q = *e2 == ',' ? e2 + 1 : e2;
+                    }
+                }
+                if (!be.empty()) { std::printf("ERR bad request: %s\n", be.c_str()); std::fflush(stdout); continue; }
+            }
             std::array<int64_t, 3> remote_before{};
             std::array<int64_t, 3> launches_before{};
             std::array<uint64_t, 3> compact_before{}, full_before{};
@@ -5656,6 +5690,23 @@ int main(int argc, char** argv) {
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
             mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            // the logit bias: written before the first window (the prompt's own windows discard their picks, so it is
+            // harmless there) and cleared when this request ends, whichever way it ends.  None: nothing is written.
+            struct BiasScope {
+                bool on = false;
+                ~BiasScope() { if (on) strata::kernels::sampler_clear_request_bias(); }
+            } bias_scope;
+            if (!req_bias_ids.empty()) {
+                if (!strata::kernels::sampler_set_request_bias(req_bias_ids.data(), req_bias_vals.data(),
+                                                               (int) req_bias_ids.size(), err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                bias_scope.on = true;
+                std::fprintf(stderr, "strata serve: logit bias: %d entries (%d in effect, %d draft-head rows)\n",
+                             (int) req_bias_ids.size(), strata::kernels::sampler_request_bias_entries(),
+                             strata::kernels::sampler_request_bias_draft_entries());
+            }
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)

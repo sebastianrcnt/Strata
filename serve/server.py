@@ -5,6 +5,8 @@
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health. One sequence at a time behind a FIFO (plan: one resident sequence).
+OpenAI `logit_bias` is honoured on /v1/chat/completions (token ids of THIS model's tokenizer, not OpenAI's; values
+-100..100 added to the logits, -100 bans; frontend.parse_logit_bias), checked to a 400; /v1/messages ignores it.
 Every chat/messages response carries X-Request-Id (its own chatcmpl-/msg_ id); GET /v1/usage/{id} gives that request's
 token counts, also after a client hung up mid-stream (UsageLog: counts only, no content).
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts with a data: URL and Anthropic base64
@@ -48,8 +50,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (IMAGES_INLINE, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            check_supported, explicit_budget, images_of, openai_to_messages, parse_stop)
+from serve.frontend import (IMAGES_INLINE, LOGIT_BIAS_KEY, MAX_LOGIT_BIAS, ChatTemplate, Event,  # noqa: E402
+                            OutputParser, anthropic_to_messages, check_supported, explicit_budget, images_of,
+                            openai_to_messages, parse_logit_bias, parse_stop)
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 
@@ -448,7 +451,22 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.bias_key(sampling) + StrataEngine.projection_key(sampling)
+
+    @staticmethod
+    def bias_key(sampling: dict) -> str:
+        """`bias=<id>:<value>,...`: the request's logit_bias (frontend.parse_logit_bias), which the OpenAI handler
+        checked and put under LOGIT_BIAS_KEY - never the raw field, so /v1/messages (no such parameter) cannot pass one
+        on.  Each value is added to that token's logit before sampling, -100 bans (an engine built before logit_bias
+        skips the key).  Re-checked here so nothing else can reach the engine; none (or empty): no key, exactly the
+        line of before."""
+        lb = sampling.get(LOGIT_BIAS_KEY)
+        if not isinstance(lb, dict) or not lb or len(lb) > MAX_LOGIT_BIAS:
+            return ""
+        ok = [(k, float(v)) for k, v in lb.items() if isinstance(k, int) and not isinstance(k, bool) and k >= 0
+              and isinstance(v, (int, float)) and not isinstance(v, bool) and -100 <= float(v) <= 100]
+        parts = [f"{k}:{v!r}" for k, v in sorted(ok)]
+        return f" bias={','.join(parts)}" if parts else ""
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1386,6 +1404,13 @@ class Service:
             except OSError as e:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
+
+    def vocab_size(self) -> int:
+        """The tokenizer's vocabulary (the engine's head has as many rows): the bound on a logit_bias token id."""
+        tokens = getattr(self.tok, "tokens", None)
+        if tokens is not None:
+            return len(tokens)
+        return 256 + len(getattr(self.tok, "SPECIALS", ()))   # ByteTokenizer (tests): bytes, then its specials
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
@@ -2625,6 +2650,8 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "openai")
             check_supported(req, "openai")                   # n, logprobs, forced tool_choice, ...: a 400, not ignored
             stop = parse_stop(req, "openai")                 # a bad `stop` is a 400 too, before the engine loads
+            req = dict(req)                                  # logit_bias, checked (a 400 if bad), for the engine line
+            req[LOGIT_BIAS_KEY] = parse_logit_bias(req, svc.vocab_size())
             messages, tools, kw = openai_to_messages(req)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and tools:
@@ -2679,6 +2706,8 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             check_supported(req, "anthropic")                # as in _openai: before the engine loads
             stop = parse_stop(req, "anthropic")
+            req = dict(req)                                  # Anthropic has no logit_bias: ignored, never sent on
+            req.pop(LOGIT_BIAS_KEY, None)
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)

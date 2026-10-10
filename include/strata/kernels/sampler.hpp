@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace strata::kernels {
@@ -29,13 +30,48 @@ struct SamplerParams {
 };
 
 // --ban-tokens (local): token ids whose logits are set to -inf before every verify-window pick.  Set once at start,
-// before any graph capture; apply_bans is a no-op without a list.
+// before any graph capture; apply_bans is a no-op without a list (and without a request bias, below).
 void sampler_set_bans(const int* ids, int n);
+// The bans, then the request bias of the target set (token ids): the verify head, and a draft head over the whole
+// vocabulary.
 void apply_bans(float* logits, int n_tokens, int n_vocab, void* stream);
 // Map the same bans to a draft head's vocabulary. `sub_to_id` is a HOST array; the returned ids index its rows.
 // Called once before graph capture. The row list passed to apply_bans_rows is a DEVICE array, owned by the caller.
 std::vector<int32_t> sampler_subset_bans(const int32_t* sub_to_id, int n_sub);
-void apply_bans_rows(float* logits, int n_tokens, int n_vocab, const int32_t* rows, int n_rows, void* stream);
+// Which request bias set (below) a ban launch also applies: none, the target's token ids, or the draft head's rows.
+enum class BiasRows { None, Target, Draft };
+void apply_bans_rows(float* logits, int n_tokens, int n_vocab, const int32_t* rows, int n_rows, void* stream,
+                     BiasRows bias = BiasRows::None);
+
+// Per-request logit bias (OpenAI `logit_bias`), on top of the --ban-tokens base.
+//
+// CUDA-GRAPH SAFE BY CONSTRUCTION.  The verify window and the MTP draft step are captured graphs, which bake in every
+// kernel argument - so a request's count or pointer can never be passed in.  Instead each set (target, draft) is ONE
+// device buffer allocated once, before any capture, at a fixed address: [count, pad, (id, value) x capacity].  The
+// ban kernel reads the count from that buffer on every replay and adds the entries after the bans.  A request writes
+// its entries (and count) before its first window and the count goes back to 0 after it; with count 0 the kernel
+// writes nothing, so a request without a bias gets exactly today's logits (no new launch either: the ban launch
+// carries it).
+//
+// Semantics, as OpenAI's: value in [-100, 100] is ADDED to the logit before the sampler chain (penalties, top_k,
+// top_p, min_p, temperature); -100 is a hard ban (-inf); +100 all but forces the token.  A banned token (--ban-tokens)
+// stays banned: its entries are dropped on the host, so a request can never un-ban one (and no entry ever shares an
+// address with a ban write).  Ids repeated in one request: the last value wins.  0 is a no-op and dropped.
+constexpr int kMaxRequestBias = 1024;       // entries per request (the server allows OpenAI's 300)
+constexpr float kRequestBiasBan = -100.0f;  // this value or below: -inf
+// Allocate both fixed buffers (the draft's only once a subset is known).  Once, before any graph capture.
+void sampler_init_request_bias();
+// The draft head's row -> token id map (a HOST array), so the draft sees the same bias on its own rows.  Once, before
+// the draft graphs are captured.
+void sampler_set_draft_subset(const int32_t* sub_to_id, int n_sub);
+// This request's entries (HOST arrays; ids are token ids, already checked against the vocabulary).  n = 0 clears.
+// Synchronous: the buffers hold the entries when it returns, so the next window launched on any stream sees them;
+// call it between requests only (no window or draft in flight).  false (and `err`) on bad input or a CUDA error.
+bool sampler_set_request_bias(const int32_t* ids, const float* values, int n, std::string& err);
+void sampler_clear_request_bias();
+// Entries in effect now: the target set (after dropping banned and 0 entries) and the draft set (rows).
+int sampler_request_bias_entries();
+int sampler_request_bias_draft_entries();
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
 //

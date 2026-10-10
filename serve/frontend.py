@@ -168,6 +168,49 @@ def tools_dropped(req: dict) -> bool:
 
 
 MAX_STOPS_OPENAI = 4        # OpenAI's limit on `stop`
+MAX_LOGIT_BIAS = 300        # OpenAI's limit on `logit_bias` entries
+LOGIT_BIAS_KEY = "_logit_bias"   # where the OpenAI handler puts the checked map for the engine (StrataEngine.sampling_keys)
+
+
+def parse_logit_bias(req: dict, vocab_size: int) -> dict[int, float] | None:
+    """OpenAI `logit_bias` -> {token id: value}, or None when it is absent, null or empty.
+
+    THE IDS ARE THIS MODEL'S TOKENIZER'S (the Qwen vocabulary of the pack being served), NOT OpenAI's: ids a client
+    computed with tiktoken name unrelated tokens here.  Each value, a number in [-100, 100], is added to that token's
+    logit in the engine before the sampler chain (penalties, top_k / top_p / min_p, temperature) at every generated
+    token - the thinking and tool-call text included - and by the speculative draft head alike, so drafts stay what
+    the target accepts.  -100 bans the token outright (-inf), +100 all but forces it (greedy picks it every step;
+    the server ends a reply that repeats one token 256 times).  A token the server itself bans (--ban-tokens) stays
+    banned whatever the value.  Biasing structural tokens changes structure: -100 on <|im_end|> means the reply only
+    ends at max_tokens, -100 on <tool_call> means no tool call can be written.  Structured output (response_format)
+    is prompt-and-validate, not constrained decoding, so a bias works there too, and can make validation fail.
+
+    Keys are decimal token ids (JSON object keys are strings) in [0, vocab_size), each at most once; at most 300
+    entries (OpenAI's limit).  Anything else is a ValueError (a 400).  /v1/messages has no such parameter (Anthropic
+    has none): there it is ignored like any other unknown field."""
+    value = req.get("logit_bias")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("logit_bias must be an object mapping token ids to numbers, e.g. {\"1234\": -100}")
+    if len(value) > MAX_LOGIT_BIAS:
+        raise ValueError(f"logit_bias can have at most {MAX_LOGIT_BIAS} entries ({len(value)} sent)")
+    out: dict[int, float] = {}
+    for key, v in value.items():
+        k = key.strip() if isinstance(key, str) else key
+        if isinstance(k, bool) or not (isinstance(k, int) or (isinstance(k, str) and k.isascii() and k.isdigit())):
+            raise ValueError(f"logit_bias key {key!r} is not a token id (a whole number in [0, {vocab_size - 1}], "
+                             "as a string; ids are this model's tokenizer's, not OpenAI's)")
+        tid = int(k)
+        if not 0 <= tid < vocab_size:
+            raise ValueError(f"logit_bias token id {tid} is outside the vocabulary (0..{vocab_size - 1}; ids are "
+                             "this model's tokenizer's, not OpenAI's)")
+        if tid in out:
+            raise ValueError(f"logit_bias names token id {tid} more than once")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not -100 <= float(v) <= 100:
+            raise ValueError(f"logit_bias[{key!r}]={v!r}: expected a number in [-100, 100]")
+        out[tid] = float(v)
+    return out or None
 
 
 def parse_stop(req: dict, api: str) -> list[str]:

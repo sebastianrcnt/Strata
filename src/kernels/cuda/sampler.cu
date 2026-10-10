@@ -24,11 +24,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::kernels {
@@ -838,10 +841,74 @@ namespace {
 int* g_ban_ids = nullptr;
 int g_n_ban = 0;
 std::vector<int32_t> g_host_bans;
-__global__ void ban_kernel(float* __restrict__ logits, int n_vocab, const int* __restrict__ ids, int n) {
+
+// The request bias (sampler.hpp): one device buffer per set at a fixed address, [count, pad, entries...].
+struct BiasEntry {
+    int32_t id;   // a token id (target set) or a draft-head row (draft set)
+    float value;  // <= kRequestBiasBan: -inf; otherwise added
+};
+struct BiasSet {
+    int* dev = nullptr;   // [0] count, [1] pad, then `cap` BiasEntry
+    int cap = 0;
+    int live = 0;         // the count the device holds now
+    int device = -1;
+    cudaStream_t stream = nullptr;
+};
+BiasSet g_bias_target, g_bias_draft;
+std::vector<std::pair<int32_t, int32_t>> g_draft_rows;   // (token id, draft row), sorted: the draft head's subset
+
+__global__ void ban_kernel(float* __restrict__ logits, int n_vocab, const int* __restrict__ ids, int n,
+                           const int* __restrict__ bias) {
     float* row = logits + (size_t) blockIdx.y * n_vocab;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
+    for (int i = i0; i < n; i += stride)
         if (ids[i] >= 0 && ids[i] < n_vocab) row[ids[i]] = __int_as_float(0xff800000);
+    if (bias == nullptr) return;
+    // The request bias: its count is read here, on every replay (a captured graph keeps only the buffer's address).
+    // No entry is a banned id (dropped on the host), so these writes never meet the ban writes above.
+    const int nb = bias[0];
+    const BiasEntry* e = reinterpret_cast<const BiasEntry*>(bias + 2);
+    for (int i = i0; i < nb; i += stride) {
+        const int id = e[i].id;
+        if (id < 0 || id >= n_vocab) continue;
+        const float v = e[i].value;
+        row[id] = v <= kRequestBiasBan ? __int_as_float(0xff800000) : row[id] + v;
+    }
+}
+
+bool bias_alloc(BiasSet& s, int cap) {
+    if (s.dev != nullptr) return true;
+    const size_t bytes = 2 * sizeof(int) + (size_t) cap * sizeof(BiasEntry);
+    if (cudaGetDevice(&s.device) != cudaSuccess || cudaMalloc((void**) &s.dev, bytes) != cudaSuccess ||
+        cudaMemset(s.dev, 0, bytes) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        std::fprintf(stderr, "sampler: the request bias buffer (%zu bytes) could not be allocated\n", bytes);
+        std::exit(1);
+    }
+    s.cap = cap;
+    return true;
+}
+
+// Writes the set's count and entries and waits for the copy: the next launch, on any stream, reads them.
+bool bias_upload(BiasSet& s, const std::vector<BiasEntry>& e, std::string& err) {
+    if (s.dev == nullptr) return true;
+    if (e.empty() && s.live == 0) return true;          // nothing to write: a request without a bias does no work
+    std::vector<int> buf(2 + 2 * e.size(), 0);
+    buf[0] = (int) e.size();
+    if (!e.empty()) std::memcpy(buf.data() + 2, e.data(), e.size() * sizeof(BiasEntry));
+    int prev = -1;
+    cudaGetDevice(&prev);
+    if (prev != s.device) cudaSetDevice(s.device);
+    const cudaError_t ce = cudaMemcpyAsync(s.dev, buf.data(), buf.size() * sizeof(int), cudaMemcpyHostToDevice, s.stream);
+    const cudaError_t se = ce == cudaSuccess ? cudaStreamSynchronize(s.stream) : ce;
+    if (prev != s.device) cudaSetDevice(prev);
+    if (se != cudaSuccess) {
+        err = std::string("logit bias upload: ") + cudaGetErrorString(se);
+        return false;
+    }
+    s.live = (int) e.size();
+    return true;
 }
 }  // namespace
 
@@ -859,7 +926,7 @@ void sampler_set_bans(const int* ids, int n) {
 }
 
 void apply_bans(float* logits, int n_tokens, int n_vocab, void* stream) {
-    apply_bans_rows(logits, n_tokens, n_vocab, g_ban_ids, g_n_ban, stream);
+    apply_bans_rows(logits, n_tokens, n_vocab, g_ban_ids, g_n_ban, stream, BiasRows::Target);
 }
 
 std::vector<int32_t> sampler_subset_bans(const int32_t* sub_to_id, int n_sub) {
@@ -870,11 +937,78 @@ std::vector<int32_t> sampler_subset_bans(const int32_t* sub_to_id, int n_sub) {
     return rows;
 }
 
-void apply_bans_rows(float* logits, int n_tokens, int n_vocab, const int32_t* rows, int n_rows, void* stream) {
-    if (n_rows <= 0 || n_tokens <= 0) return;
-    const dim3 grid((unsigned) std::min(64, (n_rows + 255) / 256), (unsigned) n_tokens);
-    ban_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(logits, n_vocab, rows, n_rows);
+void apply_bans_rows(float* logits, int n_tokens, int n_vocab, const int32_t* rows, int n_rows, void* stream,
+                     BiasRows bias) {
+    const int* b = bias == BiasRows::Target ? g_bias_target.dev : bias == BiasRows::Draft ? g_bias_draft.dev : nullptr;
+    if ((n_rows <= 0 && b == nullptr) || n_tokens <= 0) return;
+    const dim3 grid((unsigned) std::max(1, std::min(64, (n_rows + 255) / 256)), (unsigned) n_tokens);
+    ban_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(logits, n_vocab, rows, std::max(n_rows, 0), b);
 }
+
+void sampler_init_request_bias() {
+    bias_alloc(g_bias_target, kMaxRequestBias);
+}
+
+void sampler_set_draft_subset(const int32_t* sub_to_id, int n_sub) {
+    g_draft_rows.clear();
+    for (int i = 0; i < n_sub; ++i)
+        if (sub_to_id[i] >= 0) g_draft_rows.emplace_back(sub_to_id[i], i);
+    std::sort(g_draft_rows.begin(), g_draft_rows.end());
+    // a token listed twice in the subset has two rows: room for both of every entry
+    bias_alloc(g_bias_draft, 2 * kMaxRequestBias);
+}
+
+bool sampler_set_request_bias(const int32_t* ids, const float* values, int n, std::string& err) {
+    if (n < 0 || n > kMaxRequestBias) {
+        err = "logit bias: " + std::to_string(n) + " entries (at most " + std::to_string(kMaxRequestBias) + ")";
+        return false;
+    }
+    if (n > 0 && g_bias_target.dev == nullptr) {
+        err = "logit bias: not initialised (sampler_init_request_bias)";
+        return false;
+    }
+    std::vector<BiasEntry> target;
+    target.reserve((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        const float v = values[i];
+        if (ids[i] < 0 || !(v >= -100.0f && v <= 100.0f)) {   // NaN fails the range test too
+            err = "logit bias: entry " + std::to_string(i) + " is out of range (id >= 0, value in [-100, 100])";
+            return false;
+        }
+        target.push_back({ids[i], v});
+    }
+    // the last value of an id wins; 0 is a no-op; a banned id stays banned (and never shares an address with a ban)
+    std::stable_sort(target.begin(), target.end(), [](const BiasEntry& a, const BiasEntry& b) { return a.id < b.id; });
+    std::vector<BiasEntry> kept;
+    for (size_t i = 0; i < target.size(); ++i) {
+        if (i + 1 < target.size() && target[i + 1].id == target[i].id) continue;
+        if (target[i].value == 0.0f) continue;
+        if (std::binary_search(g_host_bans.begin(), g_host_bans.end(), target[i].id)) continue;
+        kept.push_back(target[i]);
+    }
+    // the draft head's rows of the same tokens (a token outside its subset has no row: the draft cannot propose it)
+    std::vector<BiasEntry> draft;
+    if (g_bias_draft.dev != nullptr)
+        for (const BiasEntry& e : kept) {
+            auto it = std::lower_bound(g_draft_rows.begin(), g_draft_rows.end(), std::make_pair(e.id, INT32_MIN));
+            for (; it != g_draft_rows.end() && it->first == e.id && (int) draft.size() < g_bias_draft.cap; ++it)
+                draft.push_back({it->second, e.value});
+        }
+    return bias_upload(g_bias_target, kept, err) && bias_upload(g_bias_draft, draft, err);
+}
+
+void sampler_clear_request_bias() {
+    std::string err;
+    const std::vector<BiasEntry> none;
+    if (!bias_upload(g_bias_target, none, err) || !bias_upload(g_bias_draft, none, err)) {
+        // a request after this one would read the stale entries: never carry on
+        std::fprintf(stderr, "sampler: clearing the request bias failed (%s)\n", err.c_str());
+        std::exit(1);
+    }
+}
+
+int sampler_request_bias_entries() { return g_bias_target.live; }
+int sampler_request_bias_draft_entries() { return g_bias_draft.live; }
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream) {
