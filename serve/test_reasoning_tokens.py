@@ -197,6 +197,35 @@ class OpenAI(Base):
                 self.assertEqual(u["completion_tokens_details"]["reasoning_tokens"], self.n(THOUGHT))
 
 
+class UsageRecord(Base):
+    """GET /v1/usage/{id} (what a gateway reads after an aborted stream) has the same reasoning_tokens."""
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=30) as r:
+            return json.loads(r.read())
+
+    def rid(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), headers={
+            "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+            return r.headers["X-Request-Id"]
+
+    def test_chat(self):
+        rid = self.rid("/v1/chat/completions", {"model": "m", "max_tokens": 400,
+                                                "messages": [{"role": "user", "content": "2+2?"}]})
+        u = self.get("/v1/usage/" + rid)
+        self.assertEqual(u["reasoning_tokens"], self.n(THOUGHT))
+        self.assertEqual(u["usage"]["completion_tokens_details"], {"reasoning_tokens": self.n(THOUGHT)})
+
+    def test_messages_usage_stays_anthropic(self):
+        rid = self.rid("/v1/messages", {"model": "m", "max_tokens": 400,
+                                        "messages": [{"role": "user", "content": "2+2?"}]})
+        u = self.get("/v1/usage/" + rid)
+        self.assertEqual(u["reasoning_tokens"], self.n(THOUGHT))
+        self.assertEqual(set(u["usage"]), {"input_tokens", "cache_read_input_tokens", "output_tokens"})
+
+
 class Tokens(Base):
     """Multi-character tokens (and </think> one token, as in the model's tokenizer): tokens are counted, not
     characters, and the closing tag is not thinking."""

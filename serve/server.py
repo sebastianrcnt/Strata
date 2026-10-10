@@ -1091,7 +1091,9 @@ class UsageLog:
     - cached_tokens), completion_tokens what the model generated, the end-of-turn token included, as the response
     counts it (= Anthropic output_tokens).  A cancelled request (the client hung up, #430 #431) or one the engine
     failed in the middle of keeps what was generated up to then.  cached_tokens is null until the engine's own
-    figures for this request arrive (with its DONE), and stays null if they never do."""
+    figures for this request arrive (with its DONE), and stays null if they never do.  reasoning_tokens: the thinking's
+    share of completion_tokens (the response's completion_tokens_details.reasoning_tokens), null until the request is
+    settled (then also in the chat completion `usage` here)."""
 
     def __init__(self, keep=USAGE_KEEP):
         self.lock, self.keep, self.entries = threading.Lock(), keep, collections.OrderedDict()
@@ -1101,7 +1103,7 @@ class UsageLog:
             self.entries[rid] = {"id": rid, "endpoint": endpoint, "model": None, "state": "queued",
                                  "prompt_tokens": None, "cached_tokens": None, "completion_tokens": 0,
                                  "finish_reason": None, "engine_finish": None,
-                                 "started_at": time.time(), "finished_at": None}
+                                 "started_at": time.time(), "finished_at": None, "reasoning_tokens": None}
             while len(self.entries) > self.keep:
                 self.entries.popitem(last=False)
 
@@ -1133,6 +1135,8 @@ class UsageLog:
                       "prompt_tokens_details": {"cached_tokens": cached}} \
             if e["endpoint"] == "/v1/chat/completions" else \
             {"input_tokens": pt - cached, "cache_read_input_tokens": cached, "output_tokens": ct}
+        if e["endpoint"] == "/v1/chat/completions" and e.get("reasoning_tokens") is not None:
+            e["usage"]["completion_tokens_details"] = {"reasoning_tokens": e["reasoning_tokens"]}
         return {"object": "strata.usage", **e}
 
 
@@ -1902,7 +1906,7 @@ class Service:
                         # (GeneratorExit) or an engine error never reaches the "done" below: n is what was generated
                         # up to the stop, cached_tokens the response's own (timings' cache_n: this request's DONE)
                         self.usage.update(rid, completion_tokens=n, engine_finish=finish,
-                                          cached_tokens=(timings or {}).get("cache_n"))
+                                          cached_tokens=(timings or {}).get("cache_n"), reasoning_tokens=reasoning_n)
                         self.usage.end(rid, "cancelled" if finish in ("cancel", "disconnect") else
                                        "error" if finish == "error" else "done")
         finally:
