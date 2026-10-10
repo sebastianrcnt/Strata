@@ -7,6 +7,9 @@ Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/m
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health. One sequence at a time behind a FIFO (plan: one resident sequence).
 OpenAI `logit_bias` is honoured on /v1/chat/completions (token ids of THIS model's tokenizer, not OpenAI's; values
 -100..100 added to the logits, -100 bans; frontend.parse_logit_bias), checked to a 400; /v1/messages ignores it.
+/v1/chat/completions usage has completion_tokens_details.reasoning_tokens: the generated tokens of the thinking (what
+goes to reasoning_content, a budget's wrap-up included; not the </think> token), part of completion_tokens as in OpenAI's;
+/v1/messages usage stays Anthropic's (no such field there).
 Every chat/messages response carries X-Request-Id (its own chatcmpl-/msg_ id); GET /v1/usage/{id} gives that request's
 token counts, also after a client hung up mid-stream (UsageLog: counts only, no content).
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts with a data: URL and Anthropic base64
@@ -1712,6 +1715,7 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         sf = StopFilter(stop)                           # stop sequences: over the answer text only
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        reasoning_n = 0                                 # the tokens of n inside the thinking (usage.reasoning_tokens)
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -1772,8 +1776,11 @@ class Service:
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
+                                    reasoning_n += parser.state == "reasoning"
                                     break
                                 evs = sf.feed(parser.feed(detok.push(t)))
+                                if parser.state == "reasoning":   # a token of the thinking (reasoning_content):
+                                    reasoning_n += 1            # </think> itself ends it and is not one
                                 self._note(n, evs)
                                 last_print = self._progress(last_print)
                                 for ev in evs:
@@ -1817,6 +1824,8 @@ class Service:
                             n += 1
                             raw_ids.append(t)
                             evs = parser.feed(detok.push(t))
+                            if parser.state == "reasoning":     # the wrap-up's text is thinking, its </think> not
+                                reasoning_n += 1
                             self._note(n, evs)
                             for ev in evs:
                                 yield "event", ev
@@ -1905,7 +1914,7 @@ class Service:
             if sf.hit and finish == "length":
                 finish = "stop"                         # (n and the usage entry are what was generated, as ever)
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                       "timings": timings, "stop_sequence": sf.hit}
+                       "timings": timings, "stop_sequence": sf.hit, "reasoning_tokens": reasoning_n}
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
@@ -1990,7 +1999,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
                              "total_tokens": pt + x["completion_tokens"],
                              # the part of the prompt the conversation cache already held (OpenAI's field)
-                             "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+                             "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0},
+                             # OpenAI's field: the thinking's share of completion_tokens (0 without thinking)
+                             "completion_tokens_details": {"reasoning_tokens": x.get("reasoning_tokens") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             yield last
