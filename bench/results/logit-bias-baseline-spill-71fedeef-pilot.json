@@ -1,0 +1,144 @@
+{
+ "when": "2026-10-11T01:47:09+0900",
+ "url": "http://127.0.0.1:8081",
+ "prompt": "Explain how TCP congestion control works: slow start, congestion avoidance, fast retransmit and fast recovery. Use a few short sections with plain prose.",
+ "runs": [
+  {
+   "http": 200,
+   "text": "TCP congestion control is a set of algorithms designed to prevent network overload by adjusting the amount of data a sender transmits based on network feedback. It operates primarily through a variable called the **congestion window (cwnd)**, which limits the number of bytes in flight.\n\n### Slow Start\nWhen a connection begins, TCP does not immediately send data at full speed. Instead, it enters the **Slow Start** phase. The congestion window starts small (often just one or two segments) and doubles in size every round-trip time (RTT) as acknowledgments (ACKs) arrive. This exponential growth allows the sender to quickly probe the network’s capacity. Slow Start continues until the congestion window reaches a threshold called the **slow start threshold (ssthresh)**, or until packet loss occurs.\n\n### Congestion Avoidance\nOnce the congestion window reaches the ssthresh, TCP switches to **Congestion Avoidance**. In this phase, growth becomes linear rather than exponential. For every RTT, the congestion window increases by only one segment (or a fraction thereof, depending on the specific algorithm like Reno or Cubic). This cautious, linear increase helps the sender find the network’s maximum capacity without overshooting it and causing congestion. If packet loss is detected, TCP assumes the network is congested, reduces the ssthresh to half the current window size, and resets the congestion window to start Slow Start again.\n\n### Fast Retransmit and Fast Recovery\nPacket loss is typically detected by timeouts, which are slow and cause the sender to halt transmission entirely. **Fast Retransmit** improves this by using duplicate ACKs. If the sender receives three duplicate ACKs for the same segment, it infers that the next segment was lost and immediately retransmits it without waiting for a timeout. \n\nFollowing a fast retransmit, TCP enters **Fast Recovery**. Instead of dropping the congestion window back to one segment (as in standard Slow Start), it sets the congestion window to half the previous value (minus a few segments) and continues sending data. This allows the connection to maintain higher throughput during recovery, avoiding the drastic slowdown associated with a full timeout event.",
+   "finish": "stop",
+   "usage": {
+    "prompt_tokens": 43,
+    "completion_tokens": 439,
+    "total_tokens": 482,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 43,
+    "prompt_ms": 1013.2,
+    "prompt_per_token_ms": 23.563,
+    "prompt_per_second": 42.4,
+    "predicted_n": 439,
+    "predicted_ms": 5882.8,
+    "predicted_per_token_ms": 13.4,
+    "predicted_per_second": 74.6,
+    "draft_n": 398,
+    "draft_n_accepted": 247
+   },
+   "wall_s": 6.9,
+   "decode_tok_s": 74.6,
+   "prefill_tok_s": 42.4
+  },
+  {
+   "http": 200,
+   "text": "TCP congestion control is a set of algorithms designed to prevent network overload by adjusting the amount of data a sender transmits based on network feedback. It operates primarily through a variable called the **congestion window (cwnd)**, which limits the number of bytes in flight.\n\n### Slow Start\nWhen a connection begins, TCP does not immediately send data at full speed. Instead, it enters the **Slow Start** phase. The congestion window starts small (often just one or two segments) and doubles in size every round-trip time (RTT). This exponential growth allows the sender to quickly probe the network’s capacity. The process continues until the window reaches a threshold called the **slow start threshold (ssthresh)** or until packet loss occurs. Despite its name, \"slow\" start is actually quite fast due to this exponential growth.\n\n### Congestion Avoidance\nOnce the congestion window reaches the ssthresh, TCP switches to **Congestion Avoidance**. In this phase, the window grows linearly rather than exponentially. For every RTT, the window increases by only one segment (or a fraction thereof). This cautious, linear growth helps the sender find the network’s maximum capacity without overshooting it and causing congestion. If packet loss is detected, TCP assumes the network is congested, halves the ssthresh, and resets the congestion window to restart the cycle.\n\n### Fast Retransmit and Fast Recovery\nPacket loss is typically detected by timeouts, which are slow and cause the sender to stop transmitting entirely. To improve efficiency, TCP uses **Fast Retransmit**. If the sender receives three duplicate acknowledgments (ACKs) for the same segment, it infers that the next segment was lost. Instead of waiting for a timeout, it immediately retransmits the missing segment.\n\nFollowing Fast Retransmit, the sender enters **Fast Recovery**. It halves the congestion window and sets the ssthresh to this new value. The sender then continues to transmit new data as long as it receives duplicate ACKs, effectively keeping the pipeline full while recovering from the loss. Once a new ACK arrives for the retransmitted data, the sender exits Fast Recovery and returns to Congestion Avoidance.",
+   "finish": "stop",
+   "usage": {
+    "prompt_tokens": 43,
+    "completion_tokens": 446,
+    "total_tokens": 489,
+    "prompt_tokens_details": {
+     "cached_tokens": 36
+    }
+   },
+   "timings": {
+    "cache_n": 36,
+    "prompt_n": 7,
+    "prompt_ms": 105.5,
+    "prompt_per_token_ms": 15.071,
+    "prompt_per_second": 66.4,
+    "predicted_n": 446,
+    "predicted_ms": 4660.6,
+    "predicted_per_token_ms": 10.45,
+    "predicted_per_second": 95.7,
+    "draft_n": 406,
+    "draft_n_accepted": 257
+   },
+   "wall_s": 4.77,
+   "decode_tok_s": 95.7,
+   "prefill_tok_s": 66.4
+  },
+  {
+   "http": 200,
+   "text": "TCP congestion control is a set of algorithms designed to prevent network overload by adjusting the amount of data a sender transmits based on network feedback. It operates primarily through a variable called the **congestion window (cwnd)**, which limits the number of bytes in flight.\n\n### Slow Start\nWhen a connection begins, TCP does not immediately send data at full speed. Instead, it enters the **Slow Start** phase. The congestion window starts small (often just one or two segments) and doubles in size every round-trip time (RTT) as acknowledgments (ACKs) arrive. This exponential growth allows the sender to quickly probe the network’s capacity. Slow Start continues until the congestion window reaches a threshold called the **slow start threshold (ssthresh)**, or until packet loss occurs.\n\n### Congestion Avoidance\nOnce the congestion window reaches the ssthresh, TCP switches to **Congestion Avoidance**. In this phase, growth becomes linear rather than exponential. For every RTT, the congestion window increases by only one segment (or a fraction thereof, depending on the specific algorithm like Reno or Cubic). This cautious, linear increase helps the sender find the network’s maximum capacity without overshooting it and causing congestion. If packet loss is detected, TCP assumes the network is congested, reduces the ssthresh to half the current window size, and resets the congestion window to start Slow Start again.\n\n### Fast Retransmit and Fast Recovery\nPacket loss is typically detected by timeouts, which are slow and cause the sender to halt transmission entirely. **Fast Retransmit** improves this by using duplicate ACKs. If the sender receives three duplicate ACKs for the same segment, it infers that the next segment was lost and immediately retransmits it without waiting for a timeout.\n\nFollowing Fast Retransmit, TCP enters **Fast Recovery**. Instead of dropping the congestion window back to one segment (as in standard Slow Start), it sets the congestion window to half the previous value (minus a few segments) and continues sending data. This allows the connection to maintain higher throughput during recovery, avoiding the drastic slowdown associated with a full timeout and Slow Start restart.",
+   "finish": "stop",
+   "usage": {
+    "prompt_tokens": 43,
+    "completion_tokens": 441,
+    "total_tokens": 484,
+    "prompt_tokens_details": {
+     "cached_tokens": 36
+    }
+   },
+   "timings": {
+    "cache_n": 36,
+    "prompt_n": 7,
+    "prompt_ms": 108.3,
+    "prompt_per_token_ms": 15.471,
+    "prompt_per_second": 64.6,
+    "predicted_n": 441,
+    "predicted_ms": 4730.4,
+    "predicted_per_token_ms": 10.727,
+    "predicted_per_second": 93.2,
+    "draft_n": 404,
+    "draft_n_accepted": 248
+   },
+   "wall_s": 4.84,
+   "decode_tok_s": 93.2,
+   "prefill_tok_s": 64.6
+  }
+ ],
+ "prefill": {
+  "http": 200,
+  "text": "The windmills of the first district with windmills (district 4",
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 4035,
+   "completion_tokens": 16,
+   "total_tokens": 4051,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  },
+  "timings": {
+   "cache_n": 0,
+   "prompt_n": 4035,
+   "prompt_ms": 2304.1,
+   "prompt_per_token_ms": 0.571,
+   "prompt_per_second": 1751.2,
+   "predicted_n": 16,
+   "predicted_ms": 331.7,
+   "predicted_per_token_ms": 20.731,
+   "predicted_per_second": 48.2,
+   "draft_n": 12,
+   "draft_n_accepted": 11
+  },
+  "wall_s": 2.65,
+  "decode_tok_s": 48.2,
+  "prefill_tok_s": 1751.2
+ },
+ "health": {
+  "status": "ok",
+  "max_context": 262144,
+  "model": "orca-local",
+  "images": true,
+  "api_key": false,
+  "loaded": true,
+  "service": "strata",
+  "web_chat": false
+ },
+ "summary": {
+  "decode_tok_s_median": 93.2,
+  "decode_tok_s_all": [
+   74.6,
+   95.7,
+   93.2
+  ],
+  "prefill_heavy_tok_s": 1751.2,
+  "prefill_heavy_prompt_n": 4035,
+  "outputs_identical_across_runs": false
+ }
+}
