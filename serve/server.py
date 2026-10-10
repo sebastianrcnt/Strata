@@ -5,6 +5,8 @@
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health. One sequence at a time behind a FIFO (plan: one resident sequence).
+Every chat/messages response carries X-Request-Id (its own chatcmpl-/msg_ id); GET /v1/usage/{id} gives that request's
+token counts, also after a client hung up mid-stream (UsageLog: counts only, no content).
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts with a data: URL and Anthropic base64
 image blocks go through `strata-vision` (the model's mmproj file) and reach the engine as embeddings (`GENI`).  Images
 are only taken inline: the server never fetches an http(s) URL or reads a file path a request names (a 400 instead).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
@@ -47,7 +49,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (IMAGES_INLINE, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, openai_to_messages)
+                            check_supported, explicit_budget, images_of, openai_to_messages, parse_stop)
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 
@@ -990,6 +992,129 @@ class Detokenizer:
         return delta
 
 
+class StopFilter:
+    """Stop sequences (OpenAI `stop`, Anthropic `stop_sequences`) over the parser's events, between OutputParser and
+    the API layers.  Only the ANSWER text (Event kind "content") is searched: reasoning/thinking and tool-call events
+    pass through untouched, so a stop string can neither cut the thinking short nor match inside tool-call JSON, and
+    one that would only match across the reasoning -> answer boundary cannot match (the text searched starts at the
+    first answer character).  The text is searched as characters (the Detokenizer already joins a multibyte character
+    split across tokens), so a stop string may span any number of tokens and chunks.
+
+    A match ends the output right there: the text before it is emitted, the stop string and everything after it never
+    is, and `hit` is the string that matched (run() then stops the engine through its stop-token path).  Several
+    strings can match: the one that COMPLETES first wins, the longest on a tie - the same whatever the chunking, as
+    when the text arrives one character at a time.  Until then the longest tail of the text that is a proper prefix of
+    some stop string is held back, so no partial stop string is ever sent; it is flushed when the next text shows it
+    is not one, before any non-answer event (a tool call), and at the end of the generation (flush()).  The parser
+    itself holds the newlines at the end of the text back until a character follows (it may be a tool call's), so a
+    stop string made of newlines is seen one token late."""
+
+    def __init__(self, stops):
+        self.stops, self.buf, self.hit = list(stops or []), "", None
+
+    def _held(self) -> int:
+        best = 0
+        for s in self.stops:
+            for k in range(min(len(s) - 1, len(self.buf)), best, -1):
+                if self.buf.endswith(s[:k]):
+                    best = k
+                    break
+        return best
+
+    def flush(self) -> list[Event]:
+        out = [Event("content", self.buf)] if self.buf else []
+        self.buf = ""
+        return out
+
+    def feed(self, evs: list[Event]) -> list[Event]:
+        if not self.stops or not evs:
+            return evs
+        out: list[Event] = []
+        for ev in evs:
+            if ev.kind != "content":
+                out += self.flush()                     # what was held is answer text that came before this event
+                out.append(ev)
+                continue
+            self.buf += ev.text
+            hits = [(i + len(s), i, s) for s in self.stops if (i := self.buf.find(s)) >= 0]
+            if hits:
+                _, i, self.hit = min(hits)
+                if i:
+                    out.append(Event("content", self.buf[:i]))
+                self.buf = ""
+                break                                   # the rest of this batch is after the stop: dropped
+            keep = self._held()
+            if len(self.buf) > keep:
+                out.append(Event("content", self.buf[:len(self.buf) - keep]))
+                self.buf = self.buf[len(self.buf) - keep:]
+        return out
+
+
+# ------------------------------------------------------------------------------------------------ usage by request id
+USAGE_KEEP = 10000          # GET /v1/usage/{id}: the last this many requests' counts (~1 KB each: a few MB at most)
+USAGE_DONE = ("done", "cancelled", "error")
+
+
+class UsageLog:
+    """GET /v1/usage/{id}: one request's exact token counts, for a gateway in front of Strata that aborted a stream
+    (its own client hung up) and so never saw the final usage chunk.  The id is the response's own id, sent as the
+    X-Request-Id header of every /v1/chat/completions and /v1/messages response (stream or not, error or not):
+    "chatcmpl-<24 hex>" (OpenAI; the body's "id") or "msg_<24 hex>" (Anthropic; message_start's "id").  The API
+    monitor's record (#332) has the same id.  Kept apart from the monitor so it works with that off, and holding
+    counts, states and times only: never a prompt, an answer or who asked.  Bounded (the oldest goes past
+    USAGE_KEEP), in memory, gone on restart.
+
+    The counts are the ones the response's `usage` has (or would have had): prompt_tokens is the whole prompt
+    (OpenAI prompt_tokens), cached_tokens the part the conversation cache already held (OpenAI
+    prompt_tokens_details.cached_tokens = Anthropic cache_read_input_tokens; Anthropic input_tokens is prompt_tokens
+    - cached_tokens), completion_tokens what the model generated, the end-of-turn token included, as the response
+    counts it (= Anthropic output_tokens).  A cancelled request (the client hung up, #430 #431) or one the engine
+    failed in the middle of keeps what was generated up to then.  cached_tokens is null until the engine's own
+    figures for this request arrive (with its DONE), and stays null if they never do."""
+
+    def __init__(self, keep=USAGE_KEEP):
+        self.lock, self.keep, self.entries = threading.Lock(), keep, collections.OrderedDict()
+
+    def begin(self, rid, endpoint):
+        with self.lock:
+            self.entries[rid] = {"id": rid, "endpoint": endpoint, "model": None, "state": "queued",
+                                 "prompt_tokens": None, "cached_tokens": None, "completion_tokens": 0,
+                                 "finish_reason": None, "engine_finish": None,
+                                 "started_at": time.time(), "finished_at": None}
+            while len(self.entries) > self.keep:
+                self.entries.popitem(last=False)
+
+    def update(self, rid, **values):
+        with self.lock:
+            e = self.entries.get(rid)
+            if e is not None:
+                e.update(values)
+
+    def end(self, rid, state, force=False):
+        """A final state: the first one stays (a request that ran to its end and then could not be written to a
+        gone client is still "done"), except that an error response after it (force: a 4xx/5xx, a structured
+        output that failed validation) makes it "error".  Counts are kept either way."""
+        with self.lock:
+            e = self.entries.get(rid)
+            if e is not None and (force or e["state"] not in USAGE_DONE):
+                e["state"] = state
+                e["finished_at"] = e["finished_at"] or time.time()
+
+    def get(self, rid) -> dict | None:
+        with self.lock:
+            e = dict(self.entries[rid]) if rid in self.entries else None
+        if e is None:
+            return None
+        pt, ct = e["prompt_tokens"] or 0, e["completion_tokens"] or 0
+        cached = min(e["cached_tokens"] or 0, pt)
+        # the same counts, as this endpoint's own response `usage` writes them
+        e["usage"] = {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct,
+                      "prompt_tokens_details": {"cached_tokens": cached}} \
+            if e["endpoint"] == "/v1/chat/completions" else \
+            {"input_tokens": pt - cached, "cache_read_input_tokens": cached, "output_tokens": ct}
+        return {"object": "strata.usage", **e}
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -1014,6 +1139,13 @@ class Service:
         # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
         # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
         self.api_monitor = False
+        # ... and "api_monitor_content": false (--no-api-monitor-content) keeps it to timing, state and token counts:
+        # no request body, output, reasoning or response text is ever put in a record (on by default, as before)
+        self.api_monitor_content = True
+        # GET /v1/usage/{id}: every request's token counts by its X-Request-Id, monitor or not (UsageLog); the
+        # current request's id per handler thread, as request_trace, so run() can count into it
+        self.usage = UsageLog()
+        self.usage_rid = threading.local()
         # the web app's Chat tab; "web_chat": false (or --no-web-chat) leaves the page to Monitor and Setup
         self.web_chat = True
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
@@ -1069,9 +1201,13 @@ class Service:
     def reasoning_budget(self, req) -> int | None:
         """Explicit token budget wins; otherwise map the requested effort to a thinking cap.
         Omitted effort keeps the configured default. Zero means no separate thinking cap.
+        Precedence: 1. an explicit cap - reasoning_budget_tokens, else its aliases thinking_budget (Qwen),
+        thinking.budget_tokens (Anthropic, type "enabled") and reasoning.max_tokens (OpenRouter), in that order
+        (frontend.explicit_budget); 2. the effort's cap; 3. the config's reasoning_budget_tokens.  max_tokens stays
+        the overall cap on the whole completion, thinking included.
         """
         req = req if isinstance(req, dict) else {}
-        value = req.get("reasoning_budget_tokens")
+        name, value = explicit_budget(req) or ("reasoning_budget_tokens", None)
         if value is None:
             ctk = req.get("chat_template_kwargs")
             ctk = ctk if isinstance(ctk, dict) else {}
@@ -1088,7 +1224,7 @@ class Service:
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
+            raise ValueError(f"{name}={value!r}: expected a whole number of tokens (0: no budget)")
         return value if value > 0 else None
 
     def _vision_down(self) -> bool:
@@ -1311,19 +1447,23 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
-    def begin_request(self, path, req):
-        """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
+    def begin_request(self, path, req, rid=None):
+        """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then).  `rid`:
+        the request's X-Request-Id, so the monitor and GET /v1/usage/{id} name it alike.  With api_monitor_content
+        off the record never holds the request body, output or reasoning ("content": false says so to the page)."""
         if not self.api_monitor:
             return None
-        raw = json.dumps(req, ensure_ascii=False, indent=2)
-        record = {"id": uuid.uuid4().hex[:12], "path": path, "model": req.get("model") or self.model,
+        record = {"id": rid or uuid.uuid4().hex[:12], "path": path, "model": req.get("model") or self.model,
                   "started_at": time.time(), "state": "queued", "stream": bool(req.get("stream")),
                   "response_format": (req.get("response_format") or {}).get("type")
                   if isinstance(req.get("response_format"), dict) else None,
-                  "input": raw[:262144], "input_truncated": len(raw) > 262144,
-                  "output": "", "reasoning": "", "output_truncated": False, "reasoning_truncated": False,
+                  "content": self.api_monitor_content,
                   "queue_s": 0.0, "load_s": 0.0, "first_token_s": None,
                   "_clock": time.perf_counter()}
+        if self.api_monitor_content:
+            raw = json.dumps(req, ensure_ascii=False, indent=2)
+            record.update(input=raw[:262144], input_truncated=len(raw) > 262144, output="", reasoning="",
+                          output_truncated=False, reasoning_truncated=False)
         with self.status_lock:
             self.api_requests.append(record)
         self.request_trace.record = record
@@ -1512,6 +1652,9 @@ class Service:
                 elif ev.kind == "tool_call":
                     s["phase"] = "tool call complete"
                 s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-4096:]
+        rid = getattr(self.usage_rid, "id", None)
+        if rid:                                         # GET /v1/usage/{id} while it runs: the count so far
+            self.usage.update(rid, completion_tokens=n)
 
     def _progress(self, last_print, every=1.0):
         """A progress line in the server window every `every` seconds while a request runs."""
@@ -1531,14 +1674,18 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, stop=()) -> Iterator[tuple[str, object]]:
+        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+        `stop`: the request's stop strings (frontend.parse_stop); when the answer text contains one the output ends
+        before it, the engine is stopped (the stop-token path: STOP and drain in the finally below) and "done" has
+        "finish": "stop" and "stop_sequence": the string that matched - a normal completion, not a cancel."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        sf = StopFilter(stop)                           # stop sequences: over the answer text only
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -1548,6 +1695,9 @@ class Service:
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
         trace = getattr(self.request_trace, "record", None)
+        rid = getattr(self.usage_rid, "id", None)       # its GET /v1/usage/{id} entry (None: not an HTTP request)
+        if rid:
+            self.usage.update(rid, prompt_tokens=len(ids))
         waiting = time.perf_counter()
         with self.status_lock:
             self.status["queued"] += 1
@@ -1559,6 +1709,8 @@ class Service:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
                         self.status["queued"] -= 1
+                    if rid:
+                        self.usage.update(rid, state="running")
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     self.ensure_loaded()
                     prompt_preview = self.tok.decode(ids[-1024:])[-4096:]
@@ -1596,11 +1748,14 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
-                                evs = parser.feed(detok.push(t))
+                                evs = sf.feed(parser.feed(detok.push(t)))
                                 self._note(n, evs)
                                 last_print = self._progress(last_print)
                                 for ev in evs:
                                     yield "event", ev
+                                if sf.hit:
+                                    finish = "stop"     # a stop sequence: the same early end as the stop token
+                                    break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
@@ -1650,6 +1805,9 @@ class Service:
                               "same, restart the server and report it (#606)", flush=True)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
+                    raise
+                except Exception:                       # anything else (the engine would not start, ...) is an
+                    finish = "error"                    # error, not the "length" it was initialised to
                     raise
                 finally:
                     # #266: settle this request's status, history and totals while still holding the fifo: once
@@ -1705,13 +1863,24 @@ class Service:
                         self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
                         self.status.pop("tool", None)
                         self.status.pop("prompt_preview", None)
+                    if rid:
+                        # GET /v1/usage/{id}: settled here, with the totals above, because a disconnect
+                        # (GeneratorExit) or an engine error never reaches the "done" below: n is what was generated
+                        # up to the stop, cached_tokens the response's own (timings' cache_n: this request's DONE)
+                        self.usage.update(rid, completion_tokens=n, engine_finish=finish,
+                                          cached_tokens=(timings or {}).get("cache_n"))
+                        self.usage.end(rid, "cancelled" if finish in ("cancel", "disconnect") else
+                                       "error" if finish == "error" else "done")
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-        for ev in parser.finish():
-            yield "event", ev
+        if not sf.hit:                                  # the end: what the parser held may complete a stop string,
+            for ev in sf.feed(parser.finish()) + sf.flush():   # and what the filter held is not one: flushed
+                yield "event", ev
+            if sf.hit and finish == "length":
+                finish = "stop"                         # (n and the usage entry are what was generated, as ever)
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                       "timings": timings}
+                       "timings": timings, "stop_sequence": sf.hit}
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
@@ -1750,8 +1919,9 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
-    cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, rid=None, stop=()):
+    # rid: the handler's X-Request-Id, so the body's id is the header's (and GET /v1/usage/{id}'s key)
+    cid, created = rid or "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model_for(req)
 
     def chunk(delta, finish=None):
@@ -1762,7 +1932,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, stop):
         if kind == "ping":
             yield None
         elif kind == "event":
@@ -1790,6 +1960,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             whole = calls and streamed.keys() <= finished
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
+            svc.usage.update(cid, finish_reason=finish)   # the reason as this response says it
             pt = x.get("prompt_tokens", len(ids))
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
                              "total_tokens": pt + x["completion_tokens"],
@@ -1865,8 +2036,8 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
-    mid = "msg_" + uuid.uuid4().hex[:24]
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, rid=None, stop=()):
+    mid = rid or "msg_" + uuid.uuid4().hex[:24]       # rid: the X-Request-Id, as in openai_chunks
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
         "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
@@ -1876,7 +2047,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, stop):
         if kind == "ping":
             yield None
             continue
@@ -1920,12 +2091,18 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         else:
             if open_kind is not None:
                 yield close()
+            # a stop sequence is "stop_sequence" (+ the string that matched); finished tool calls still win, as for
+            # OpenAI's "tool_calls": the client has calls to run, and the model stops after a call anyway
+            matched = x.get("stop_sequence")
             stop = "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
+                "stop_sequence" if matched is not None and x["finish"] == "stop" else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
+            svc.usage.update(mid, finish_reason=stop)
             # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
             # which is cache_read_input_tokens (message_start could only say the whole prompt)
             reused = min(x.get("reused") or 0, len(ids))
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
+                                                           "stop_sequence": matched if stop == "stop_sequence" else None},
                                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
                                               "output_tokens": x["completion_tokens"]}}
             yield "message_stop", {"type": "message_stop"}
@@ -1957,6 +2134,7 @@ def anthropic_collect(events) -> dict:
                 blocks.pop()
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
+            msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
     msg["content"] = blocks
     return msg
@@ -1968,6 +2146,8 @@ def make_handler(svc: Service):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
+        usage_id = None                                     # its X-Request-Id and GET /v1/usage/{id} key (UsageLog)
+        gone = False                                        # its client hung up (the watcher or a failed write)
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
 
         def log_message(self, fmt, *args):
@@ -1999,10 +2179,26 @@ def make_handler(svc: Service):
             threading.Thread(target=watch, daemon=True, name="strata-client-watch").start()
 
         def _note(self, **values):
-            """#332: what the monitor shows about this request (nothing when the monitor is off)."""
+            """#332: what the monitor shows about this request (nothing when the monitor is off).  An error also ends
+            its GET /v1/usage/{id} entry (after the answer ran too: "error").  A hang-up does NOT end it here: the
+            watcher sees it while the engine is still stopping, and a gateway polling for a final state must not get
+            a count that still grows - run() settles it once the engine has stopped (do_POST if run() never did)."""
+            if values.get("outcome") == "disconnected":
+                self.gone = True
+            if self.usage_id and "error" in values:
+                svc.usage.end(self.usage_id, "error", force=True)
             if self.record is not None:
+                if "error" in values:
+                    values["error"] = self._safe_error(values["error"])
                 with svc.status_lock:
                     self.record.update(values)
+
+        def _safe_error(self, error):
+            """With api_monitor_content off, a structured-output failure's message (it can quote the model's output,
+            e.g. the value a JSON Schema rejected) is not kept; the other errors are the server's own words."""
+            if svc.api_monitor_content or not isinstance(error, dict) or error.get("type") != "structured_output_failed":
+                return error
+            return {**error, "message": "structured output failed (message not recorded: api_monitor_content is off)"}
 
         def _cors(self):
             """#321: CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
@@ -2032,18 +2228,42 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        # Anthropic's error envelope for /v1/messages*: {"type": "error", "error": {"type": <its type names>, ...}}.
+        # The OpenAI-style {"error": {...}} the rest of the file builds is rewritten here, in one place, so every
+        # status path (400 validation, 401, 404, 409 busy, 503 starting) answers an Anthropic SDK in its own shape.
+        ANTHROPIC_ERROR_TYPES = {"invalid_request_error": "invalid_request_error", "authentication_error":
+                                 "authentication_error", "model_busy": "overloaded_error", "server_error": "api_error",
+                                 "structured_output_failed": "api_error"}
+        ANTHROPIC_STATUS_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+                                  404: "not_found_error", 409: "overloaded_error", 413: "request_too_large",
+                                  415: "invalid_request_error", 429: "rate_limit_error", 503: "overloaded_error"}
+
+        def _anthropic_error(self, code, obj):
+            err = obj.get("error") if isinstance(obj, dict) else None
+            if not isinstance(err, dict) or obj.get("type") == "error":
+                return obj
+            kind = self.ANTHROPIC_ERROR_TYPES.get(err.get("type")) or self.ANTHROPIC_STATUS_TYPES.get(code, "api_error")
+            return {"type": "error", "error": {"type": kind, "message": err.get("message", "")}}
+
         def _json(self, code, obj):
+            if code >= 400 and self.path.split("?")[0].rstrip("/").startswith("/v1/messages"):
+                obj = self._anthropic_error(code, obj)
+            if self.usage_id and code >= 400:
+                svc.usage.end(self.usage_id, "error", force=True)
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
-                    raw = json.dumps(obj, ensure_ascii=False, indent=2)
-                    self.record.update(response=raw[:262144], response_truncated=len(raw) > 262144)
+                    if svc.api_monitor_content:             # the response body is the answer: content
+                        raw = json.dumps(obj, ensure_ascii=False, indent=2)
+                        self.record.update(response=raw[:262144], response_truncated=len(raw) > 262144)
                     for key in ("error", "usage", "timings"):
                         if key in obj:
-                            self.record[key] = obj[key]
+                            self.record[key] = self._safe_error(obj[key]) if key == "error" else obj[key]
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            if self.usage_id:
+                self.send_header("X-Request-Id", self.usage_id)
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -2110,7 +2330,17 @@ def make_handler(svc: Service):
                     self._json(404 if records is None else 200,
                                {"error": {"message": "request no longer retained"}} if records is None else
                                records if request_id else {"requests": records, "retention": 100, "persistent": False,
+                                                          "content": svc.api_monitor_content,
                                                           "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
+                return
+            if path.startswith("/v1/usage/"):
+                # a request's token counts by its X-Request-Id (UsageLog): state "queued"/"running" while it runs,
+                # then "done", "cancelled" or "error"; 404 for an id never seen or no longer kept
+                if self._authorized():
+                    entry = svc.usage.get(path[len("/v1/usage/"):])
+                    self._json(200 if entry else 404, entry or
+                               {"error": {"type": "not_found_error", "message": "unknown request id (or no longer "
+                                                                                f"kept: the last {svc.usage.keep} are)"}})
                 return
             if path == "/experts":
                 # the expert usage counters (engines that report USAGE lines): the web app's Experts tab
@@ -2189,6 +2419,12 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path in ("/v1/chat/completions", "/v1/messages"):
+                # the id of this request's response, its X-Request-Id and its GET /v1/usage/{id} (UsageLog): made
+                # before the body is read, so even a 400 for bad JSON carries one
+                self.usage_id = ("chatcmpl-" if path == "/v1/chat/completions" else "msg_") + uuid.uuid4().hex[:24]
+                svc.usage.begin(self.usage_id, path)
+                svc.usage_rid.id = self.usage_id
             if path == "/settings":
                 self._settings()
                 return
@@ -2242,7 +2478,8 @@ def make_handler(svc: Service):
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages"):
-                    self.record = svc.begin_request(path, req)
+                    svc.usage.update(self.usage_id, model=svc.model_for(req))   # the name the response answers with
+                    self.record = svc.begin_request(path, req, self.usage_id)
                 if path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/messages":
@@ -2271,6 +2508,9 @@ def make_handler(svc: Service):
             finally:
                 if self.watch_done is not None:
                     self.watch_done.set()
+                if self.usage_id:                            # never run (or cut short before run() settled it)
+                    svc.usage.end(self.usage_id, "cancelled" if self.gone else "error")
+                    svc.usage_rid.id = None
                 record = self.record
                 if record is not None:
                     with svc.status_lock:
@@ -2342,6 +2582,8 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
+            if self.usage_id:
+                self.send_header("X-Request-Id", self.usage_id)   # before the first event: GET /v1/usage/{id}
             self._cors()
             self.end_headers()
 
@@ -2367,7 +2609,7 @@ def make_handler(svc: Service):
                             usage, timings = event.get("usage"), None
                         with svc.status_lock:
                             for name, value in (("output", content), ("reasoning", reasoning)):
-                                if value:
+                                if value and self.record["content"]:     # api_monitor_content off: counts only
                                     combined = self.record[name] + value
                                     self.record[name] = combined[:262144]
                                     self.record[name + "_truncated"] |= len(combined) > 262144
@@ -2381,6 +2623,8 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            check_supported(req, "openai")                   # n, logprobs, forced tool_choice, ...: a 400, not ignored
+            stop = parse_stop(req, "openai")                 # a bad `stop` is a 400 too, before the engine loads
             messages, tools, kw = openai_to_messages(req)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and tools:
@@ -2392,7 +2636,7 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # includes image preparation
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, self.usage_id, stop)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -2433,6 +2677,8 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.tok.encode(prompt, parse_special=True))})
 
         def _anthropic(self, req):
+            check_supported(req, "anthropic")                # as in _openai: before the engine loads
+            stop = parse_stop(req, "anthropic")
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
@@ -2442,7 +2688,7 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # includes image preparation
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, self.usage_id, stop)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -2674,6 +2920,9 @@ def main() -> int:
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
+    ap.add_argument("--no-api-monitor-content", action="store_true",
+                    help="the API request monitor keeps timing, state and token counts only, never the prompts, "
+                         "answers or responses (also \"api_monitor_content\": false in the config)")
     ap.add_argument("--no-web-chat", action="store_true",
                     help="hide the web app's Chat tab, leaving Monitor and Setup (also \"web_chat\": false in the "
                          "config); the API is unchanged")
@@ -2769,8 +3018,12 @@ def main() -> int:
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+    svc.api_monitor_content = not a.no_api_monitor_content and cfg.get("api_monitor_content") is not False
     svc.web_chat = not a.no_web_chat and cfg.get("web_chat") is not False
-    if svc.api_monitor:
+    if svc.api_monitor and not svc.api_monitor_content:
+        print("[strata] API request monitor on (/api-monitor), metadata only (api_monitor_content: false): the last "
+              "100 requests' timing, state and token counts, no prompts or answers", flush=True)
+    elif svc.api_monitor:
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)

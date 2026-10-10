@@ -92,6 +92,107 @@ def budget_effort(tokens) -> dict:
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
 
 
+def explicit_budget(req) -> tuple[str, object] | None:
+    """-> (field name, raw value) of the request's explicit thinking cap, or None (then the effort, then the config's
+    default decide: Service.reasoning_budget).  The Strata field and the names other clients already send, in this
+    one fixed order when several are given (the first that is not null wins; they are not combined):
+      1. reasoning_budget_tokens          (Strata's own)
+      2. thinking_budget                  (Qwen)
+      3. thinking.budget_tokens           (Anthropic; only {"type": "enabled", ...}: "disabled" turns thinking off
+                                           instead, see anthropic_to_messages, and has no cap to give)
+      4. reasoning.max_tokens             (OpenRouter)
+    The value is not checked here (Service.reasoning_budget does: a whole number, 0 = no cap)."""
+    req = req if isinstance(req, dict) else {}
+    thinking = req.get("thinking") if isinstance(req.get("thinking"), dict) else {}
+    reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+    for name, value in (("reasoning_budget_tokens", req.get("reasoning_budget_tokens")),
+                        ("thinking_budget", req.get("thinking_budget")),
+                        ("thinking.budget_tokens", thinking.get("budget_tokens") if thinking.get("type") == "enabled" else None),
+                        ("reasoning.max_tokens", reasoning.get("max_tokens"))):
+        if value is not None:
+            return name, value
+    return None
+
+
+def thinking_off(req: dict) -> bool:
+    """Qwen's top-level `enable_thinking`: false = no thinking, as chat_template_kwargs.enable_thinking=false and
+    Anthropic's thinking {"type": "disabled"} do.  true or absent changes nothing (a request that asks for no
+    thinking is the only one that says anything).  Anything else is a 400, not a guess."""
+    value = req.get("enable_thinking")
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(f"enable_thinking={value!r}: expected true or false")
+    return value is False
+
+
+def tool_mode(value) -> str | None:
+    """tool_choice -> its kind, lower-cased: OpenAI "auto" | "none" | "required" | {"type": "function", ...}; Anthropic
+    {"type": "auto" | "none" | "any" | "tool", ...}.  None: absent.  Never raises (count_tokens uses it too)."""
+    if value is None:
+        return None
+    kind = value.get("type") if isinstance(value, dict) else value
+    return kind.strip().lower() if isinstance(kind, str) else "?"
+
+
+def check_supported(req: dict, api: str) -> None:
+    """Parameters the model server cannot honour are a 400, not a silent no-op (a client that asked for n=2, forced
+    tool calls or logprobs would otherwise get an answer that quietly is not what it asked for).  `api`: "openai" |
+    "anthropic".  Only what cannot be guaranteed: other unknown fields (user, metadata, store, stream_options, ...) are
+    ignored as ever.  tool_choice "none" is supported (the tools are dropped, see tools_dropped)."""
+    if api == "openai":
+        n = req.get("n")
+        if n is not None and (isinstance(n, bool) or n != 1):
+            raise ValueError(f"n={n!r} is not supported: Strata returns exactly one choice per request (send n=1 or leave it out)")
+        if req.get("logprobs") or req.get("top_logprobs") is not None:
+            raise ValueError("logprobs and top_logprobs are not supported: Strata does not return token log probabilities")
+        if req.get("parallel_tool_calls") is False:
+            raise ValueError("parallel_tool_calls=false is not supported: Strata cannot guarantee at most one tool call "
+                             "per turn (send true or leave it out)")
+    choice = req.get("tool_choice")
+    mode = tool_mode(choice)
+    if mode in ("required", "any"):
+        raise ValueError(f"tool_choice={mode!r} is not supported: Strata cannot force a tool call "
+                         "(use \"auto\", or \"none\" to offer no tools)")
+    if mode in ("function", "tool"):
+        raise ValueError(f"tool_choice forcing a specific {mode} is not supported: Strata cannot force a tool call "
+                         "(use \"auto\", or \"none\" to offer no tools)")
+    if mode not in (None, "auto", "none"):
+        raise ValueError(f"tool_choice={choice!r} is not recognised (supported: \"auto\", \"none\")")
+    if api == "anthropic" and isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True:
+        raise ValueError("tool_choice.disable_parallel_tool_use=true is not supported: Strata cannot guarantee at most "
+                         "one tool call per turn (send false or leave it out)")
+
+
+def tools_dropped(req: dict) -> bool:
+    """tool_choice "none": the model is not offered the tools at all (they stay out of the prompt)."""
+    return tool_mode(req.get("tool_choice")) == "none"
+
+
+MAX_STOPS_OPENAI = 4        # OpenAI's limit on `stop`
+
+
+def parse_stop(req: dict, api: str) -> list[str]:
+    """The request's stop strings -> a list (empty: none).  OpenAI `stop`: a string or up to 4 strings; Anthropic
+    `stop_sequences`: a list of strings.  Each must be a non-empty string; anything else is a ValueError (a 400)."""
+    if api == "openai":
+        name, value = "stop", req.get("stop")
+        if isinstance(value, str):
+            value = [value]
+    else:
+        name, value = "stop_sequences", req.get("stop_sequences")
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be {'a string or ' if api == 'openai' else ''}an array of strings")
+    if api == "openai" and len(value) > MAX_STOPS_OPENAI:
+        raise ValueError(f"{name} can have at most {MAX_STOPS_OPENAI} strings ({len(value)} sent)")
+    for i, x in enumerate(value):
+        if not isinstance(x, str):
+            raise ValueError(f"{name}[{i}] must be a string")
+        if not x:
+            raise ValueError(f"{name}[{i}] must not be an empty string")
+    return list(dict.fromkeys(value))               # a repeated string is one
+
+
 def _has_image(content) -> bool:
     return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
 
@@ -187,6 +288,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         messages.append(out)
     tools = [t.get("function", t) if isinstance(t, dict) and t.get("type") == "function" else t
              for t in req.get("tools") or []] or None
+    if tools_dropped(req):
+        tools = None                                    # tool_choice "none": not offered, so not in the prompt
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
@@ -197,6 +300,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    if thinking_off(req):                               # Qwen's top-level enable_thinking=false: as in the kwargs
+        kwargs = {"enable_thinking": False}
     return _late_system_to_user(messages), tools, kwargs
 
 
@@ -237,24 +342,27 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             messages.append(out)
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in req.get("tools") or []] or None
+    if tools_dropped(req):
+        tools = None                                    # tool_choice {"type": "none"}: not offered
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
-    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        kwargs["enable_thinking"] = False
+    if (isinstance(thinking, dict) and thinking.get("type") == "disabled") or thinking_off(req):
+        kwargs["enable_thinking"] = False               # (thinking_off: Qwen's top-level enable_thinking=false)
     elif effort:
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
-    elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
+    elif thinking is None and not (explicit_budget(req) or (None, 0))[1] and not think_unasked:
         # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
         # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
-        # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
+        # request that gives its own reasoning_budget_tokens (#123) or an alias of it (thinking_budget,
+        # reasoning.max_tokens; explicit_budget) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
     return _late_system_to_user(messages), tools, kwargs
 
