@@ -126,6 +126,52 @@ inline bool gr_unfused() {
     return v;
 }
 
+// STRATA_PREFILL_SUMS=FILE (steering vectors, tools/steer_build.py): every layer's output residual on the prompt
+// rows, summed over the tokens and the hc streams and over all of the run's chunks.  FILE is rewritten after each
+// chunk: int64 tokens, then (n_layers, N) float64.  Off unless set; it keeps every hyper-connection write unfused,
+// so R holds the layer's output when it is read.
+struct LayerSums {
+    std::string path;
+    std::vector<double> acc;
+    std::vector<float> host;
+    int64_t tokens = 0;
+};
+
+LayerSums* layer_sums() {
+    static LayerSums* s = []() -> LayerSums* {
+        const char* e = std::getenv("STRATA_PREFILL_SUMS");
+        if (e == nullptr || *e == 0) return nullptr;
+        auto* p = new LayerSums;
+        p->path = e;
+        return p;
+    }();
+    return s;
+}
+
+bool layer_sums_add(LayerSums& s, int64_t layers, int64_t l, const float* R, int64_t T, cudaStream_t cs) {
+    s.acc.resize((size_t) (layers * N), 0.0);
+    s.host.resize((size_t) (T * D));
+    if (cudaMemcpyAsync(s.host.data(), R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+        cudaStreamSynchronize(cs) != cudaSuccess)
+        return false;
+    double* a = s.acc.data() + (size_t) (l * N);
+    for (int64_t t = 0; t < T; ++t)
+        for (int64_t c = 0; c < HC; ++c) {
+            const float* r = s.host.data() + (size_t) (t * D + c * N);
+            for (int64_t j = 0; j < N; ++j) a[j] += r[j];
+        }
+    return true;
+}
+
+void layer_sums_write(LayerSums& s, int64_t T) {
+    s.tokens += T;
+    if (std::FILE* f = std::fopen(s.path.c_str(), "wb")) {
+        std::fwrite(&s.tokens, sizeof s.tokens, 1, f);
+        std::fwrite(s.acc.data(), sizeof(double), s.acc.size(), f);
+        std::fclose(f);
+    }
+}
+
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
@@ -1838,7 +1884,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 // control vector)
                 const int64_t nl = half == 0 ? l : l + 1;
                 const bool fuse = !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on) &&
-                                  !(half == 1 && strata::kernels::cvec().covers(l));
+                                  !(half == 1 && strata::kernels::cvec().covers(l)) && layer_sums() == nullptr;
                 const core::WeightRef* wnn = nullptr;
                 if (fuse) {
                     const core::LayerView vn(*m.wt, nl);
@@ -1854,6 +1900,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 }
                 if (half == 1 && strata::kernels::cvec().covers(l))   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+                if (half == 1 && layer_sums() != nullptr &&
+                    !layer_sums_add(*layer_sums(), g.n_layers, l, m.R, T, m.cs)) {
+                    err = "prefill: STRATA_PREFILL_SUMS: cannot read the residual";
+                    return false;
+                }
             }
         }
         if (issuer.joinable()) {
@@ -1863,6 +1914,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             stats_.experts_dma += iss_dma;
         }
         stats_.tokens += T;
+        if (LayerSums* ls = layer_sums()) layer_sums_write(*ls, T);
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
