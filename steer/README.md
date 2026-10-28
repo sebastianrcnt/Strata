@@ -24,7 +24,7 @@ graph, which the layer dump turns off.
 ## Rebuild
 
 ```
-python tools/steer_build.py tokens steer/profanity-ko.tsv steer/run
+python tools/steer_build.py tokens steer/profanity-ko.tsv steer/run --tokenizer <pack>/tokenizer
 STRATA_PREFILL_SUMS=/work/run/pos.sums steer/engine.sh --prefill 512 --spec 4 --tokens-file /work/run/pos.txt --max-new 1   # and neg
 python tools/steer_build.py build steer/run/pos.sums steer/run/neg.sums steer/profanity-ko.gguf
 steer/serve_steer.sh 0.15 8 32
@@ -40,3 +40,26 @@ steer/serve_steer.sh 0.15 8 32
 
 Off, answers are the stock model's; they vary between requests by themselves (the first of three identical greedy
 requests differed), so off-vs-stock is not compared token for token here. Not measured: KL / perplexity cost.
+
+## Model-written contrast set (`profanity-ko-gen.*`)
+
+`tools/gen_pairs.py --style "욕을 섞은 거친 반말" --n 72` had the stock model (orca-local, vector off) write 72
+questions, answer each plainly, rewrite the answer in the style with the content kept, and judge the rewrite: 56 pairs
+kept (3,230 / 3,672 tokens). Same build, same 5 prompts:
+
+| Vector | Scale 8-32 | Profanity words in the 5 answers | Note |
+| --- | --- | ---: | --- |
+| hand-written 48 pairs | 0.15 | 2 | rough, coherent; code answer terse |
+| hand-written | 0.2 | 7 | first broken words |
+| model-written 56 pairs | 0.15 | 0 | plain 반말 only |
+| model-written | 0.25 | 0 | 반말, curt |
+| model-written | 0.35 | 5 | rambling starts; the code answer stays useful |
+
+The model-written vector is ~30% smaller (|diff| at layer 16: 0.119 vs 0.175) and points elsewhere in part (cosine
+with the hand-written one 0.55-0.66 per layer). Its rewrites carry 65 profanity words in 56 longer answers against 95
+in 48 short lines, so it learned "rough casual tone" more than profanity. The service keeps the hand-written vector.
+
+The reference (gguf-neuron-explorer `gne direction --positions response`) differs again: persona and neutral system
+prompts, replies generated independently, the conversation prefilled with the system prompt kept, and only the reply
+tokens averaged, each conversation on a cleared context. Not tried here: the sums hook has no per-position mask, and
+the streams here are concatenated, so later turns see earlier ones.
