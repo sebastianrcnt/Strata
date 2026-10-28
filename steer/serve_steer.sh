@@ -1,7 +1,7 @@
 #!/bin/sh
 # serve_steer.sh SCALE FIRST LAST [VECTOR]: (re)start the strata service with a steering vector loaded, off by default.
-# Requests turn it on with "experimental_speed_projection": true; STEER_DEFAULT=on loads it on for every request
-# that does not say false.
+# Requests turn it on with "model": "orca-yok" (STEER_MODEL=name for another) or "experimental_speed_projection": true;
+# STEER_DEFAULT=on switches it on for every request that does not say false.
 set -e
 D=/home/coolguy/ml/strata/deploy/docker
 S=/home/coolguy/ml/strata-steering/steer
@@ -17,6 +17,7 @@ src, dst, vec, first, last = sys.argv[1:]
 c = json.load(open(src))
 c["args"] += ["--control-vector-scaled", vec, "--control-vector-layer-range", first, last, "--cvec-mode", "add"]
 c.setdefault("sampling", {})["experimental_speed_projection"] = os.environ.get("STEER_DEFAULT") == "on"
+c.setdefault("model_presets", {})[os.environ.get("STEER_MODEL", "orca-yok")] = {"experimental_speed_projection": True}
 json.dump(c, open(dst, "w"), indent=2)
 EOF
 cat > "$S/compose.steer.yaml" <<EOF

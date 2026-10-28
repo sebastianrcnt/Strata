@@ -1015,6 +1015,18 @@ class SharedSettings(unittest.TestCase):
         self.assertEqual(self.svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
         self.assertEqual(self.svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
 
+    def test_model_preset(self):
+        self.svc.presets = {"m-yok": {"experimental_speed_projection": True}}
+        try:
+            self.chat(model="m-yok")                                   # the preset's name switches it on
+            self.assertIs(self.engine.last_sampling["experimental_speed_projection"], True)
+            self.chat(model="m-yok", experimental_speed_projection=False)   # the request's own field still wins
+            self.assertIs(self.engine.last_sampling["experimental_speed_projection"], False)
+            self.chat()                                                # any other name: no preset
+            self.assertNotIn("experimental_speed_projection", self.engine.last_sampling)
+        finally:
+            self.svc.presets = {}
+
     def test_off_again(self):
         self.req("/settings", {"defaults": {"temperature": 0.3}})
         code, b = self.req("/settings", {"defaults": None})

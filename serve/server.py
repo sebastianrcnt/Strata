@@ -1148,6 +1148,7 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.presets: dict[str, dict] = {}            # the config's `model_presets`: name -> sampling defaults
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
@@ -1712,7 +1713,8 @@ class Service:
         before it, the engine is stopped (the stop-token path: STOP and drain in the finally below) and "done" has
         "finish": "stop" and "stop_sequence": the string that matched - a normal completion, not a cancel."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
-        defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
+        # the config's, then the Chat settings shared with apps, then the preset the request names as its model
+        defaults = {**self.sampling_defaults, **self.shared, **self.presets.get((sampling or {}).get("model"), {})}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
@@ -3046,10 +3048,19 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    presets = cfg.get("model_presets") or {}
+    if not isinstance(presets, dict) or not all(isinstance(v, dict) for v in presets.values()):
+        raise SystemExit("[strata] config model_presets: expected {\"name\": {sampling fields}}")
+    # a preset is an alias whose requests get its own sampling defaults, e.g. a loaded control vector switched on
+    svc.presets = {name: sampling_defaults_from_config({"sampling": v}) for name, v in presets.items()}
     try:
-        svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
+        aliases = cfg.get("aliases") or []
+        svc.set_aliases([*(aliases.split(",") if isinstance(aliases, str) else aliases), *svc.presets])   # #297
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}")
+    for name, v in svc.presets.items():
+        print(f"[strata] model preset {name}: {', '.join(f'{k}={x}' for k, x in v.items()) or 'no changes'}",
+              flush=True)
     if svc.aliases:
         print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
     if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
