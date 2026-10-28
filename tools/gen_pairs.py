@@ -37,7 +37,9 @@ class Model:
 
 
 def one_line(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+    """For the TSV: a line break becomes a literal \\n, which tools/steer_build.py turns back."""
+    lines = [re.sub(r"[ \t]+", " ", x).strip() for x in text.strip().splitlines()]
+    return "\\n".join(lines)
 
 
 def questions(m: Model, n: int) -> list[str]:
@@ -61,6 +63,11 @@ def main():
     ap.add_argument("--n", type=int, default=60, help="questions to ask (some pairs get dropped)")
     ap.add_argument("--url", default="http://127.0.0.1:8081")
     ap.add_argument("--model", default="orca-local", help="a name with no steering preset")
+    ap.add_argument("--system", default="두세 문장으로 짧게 답해. 목록이나 마크다운 없이 평범한 문장으로.",
+                    help="how the plain answers are asked for ('' = the model's own length and format)")
+    ap.add_argument("--answer-tokens", type=int, default=200)
+    ap.add_argument("--rewrite", default="", help="added to the rewrite instruction, e.g. '문장마다 욕을 하나 이상'")
+    ap.add_argument("--require", help="a regex the rewrite must match at least once per 200 characters")
     a = ap.parse_args()
     m = Model(a.url, a.model)
 
@@ -69,17 +76,21 @@ def main():
     kept = dropped = 0
     with open(a.out, "w", encoding="utf-8") as f:
         for i, q in enumerate(qs):
-            plain = one_line(m.ask(q, 200, system="두세 문장으로 짧게 답해. 목록이나 마크다운 없이 평범한 문장으로."))
-            styled = one_line(m.ask(f"다음 글을 내용은 그대로 두고 말투만 {a.style}(으)로 바꿔 써. 바꾼 글만 출력해.\n\n"
-                                    f"{plain}", 300))
+            raw = m.ask(q, a.answer_tokens, system=a.system or None)
+            styled_raw = m.ask(f"다음 글을 내용과 길이와 형식(문단, 목록, 코드)은 그대로 두고 말투만 {a.style}(으)로 바꿔 써. "
+                               f"{a.rewrite} 바꾼 글만 출력해.\n\n{raw}", int(a.answer_tokens * 1.6))
+            plain, styled = one_line(raw), one_line(styled_raw)
             ratio = len(styled) / max(1, len(plain))
+            hits = len(re.findall(a.require, styled)) if a.require else 0
+            enough = not a.require or hits >= max(1, len(styled) // 200)
             verdict = ""
-            if 0.5 <= ratio <= 2.0 and styled != plain:
-                verdict = m.ask(f"글 A와 글 B가 있다.\nA: {plain}\nB: {styled}\n\n"
+            if 0.5 <= ratio <= 2.0 and styled != plain and enough:
+                verdict = m.ask(f"글 A와 글 B가 있다.\nA: {raw}\nB: {styled_raw}\n\n"
                                 f"B가 A와 같은 내용을 담고 있고, 말투는 '{a.style}'인가? '예' 또는 '아니오'로만 답해.",
                                 4, temperature=0)
             ok = verdict.startswith("예")
-            print(f"[{i + 1}/{len(qs)}] {'keep' if ok else 'drop'} ratio={ratio:.2f} {verdict!r}", file=sys.stderr)
+            print(f"[{i + 1}/{len(qs)}] {'keep' if ok else 'drop'} ratio={ratio:.2f} hits={hits} len={len(plain)} "
+                  f"{verdict!r}", file=sys.stderr)
             if ok:
                 f.write(f"{plain}\t{styled}\n")
                 f.flush()

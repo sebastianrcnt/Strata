@@ -8,12 +8,14 @@ Strata already applies such a vector after every steered layer's FFN write, on e
 
     python tools/steer_build.py tokens PAIRS.tsv OUTDIR              # OUTDIR/pos.txt, neg.txt (engine token ids)
     STRATA_PREFILL_SUMS=OUTDIR/pos.sums strata --tokens-file OUTDIR/pos.txt --max-new 1 ...   (and neg)
-    python tools/steer_build.py build OUTDIR/pos.sums OUTDIR/neg.sums OUT.gguf
+    python tools/steer_build.py build OUTDIR/pos.sums OUTDIR/neg.sums OUT.gguf [--also POS NEG ...]
 
 PAIRS.tsv is one pair per line, `negative<TAB>positive`: the same content without and with the behaviour. Each side
 is fed as one stream of assistant turns through the batched prompt path, which with STRATA_PREFILL_SUMS sums every
 layer's output residual over the tokens and the hc streams (`src/prefill/prefill.cpp`). `direction.<l>` is the mean
-of side + minus the mean of side - at layer l's output; the engine adds it there times the file's scale.
+of side + minus the mean of side - at layer l's output; the engine adds it there times the file's scale. With
+`--also`, each set's difference is taken on its own and the differences are averaged, so a set of long answers does
+not outweigh a set of short ones by its token count. A `\\n` in PAIRS.tsv is a line break.
 """
 from __future__ import annotations
 
@@ -45,7 +47,8 @@ def cmd_tokens(a):
     out = Path(a.outdir)
     out.mkdir(parents=True, exist_ok=True)
     for side, name in ((0, "neg"), (1, "pos")):
-        text = "".join(f"<|im_start|>assistant\n{p[side].strip()}<|im_end|>\n" for p in pairs)
+        text = "".join(f"<|im_start|>assistant\n{p[side].strip().replace(chr(92) + 'n', chr(10))}<|im_end|>\n"
+                       for p in pairs)
         ids = tok.encode(text, parse_special=True)
         (out / f"{name}.txt").write_text(",".join(map(str, ids)))
         print(f"{name}: {len(pairs)} turns, {len(ids)} tokens")
@@ -60,17 +63,20 @@ def layer_means(path: Path) -> tuple[np.ndarray, int]:
 
 
 def cmd_build(a):
-    pos, tp = layer_means(Path(a.pos))
-    neg, tn = layer_means(Path(a.neg))
-    diff = pos - neg
-    print(f"positions: + {tp}, - {tn}")
+    sets = [(a.pos, a.neg), *(a.also or [])]
+    diffs = []
+    for p, n in sets:
+        (pos, tp), (neg, tn) = layer_means(Path(p)), layer_means(Path(n))
+        diffs.append(pos - neg)
+        print(f"{p}: positions + {tp}, - {tn}")
+    diff = np.mean(diffs, axis=0)
     print("layer  |diff|   |mean|   ratio")
     for l in range(1, N_LAYERS):
         d, m = np.linalg.norm(diff[l]), np.linalg.norm((pos[l] + neg[l]) / 2)
         print(f"{l:5d} {d:8.3f} {m:8.3f} {d / m:7.3f}")
     sys.path.insert(0, str(ROOT / "third_party/llama.cpp/gguf-py"))
     import gguf   # llama.cpp's gguf-py: that checkout's, or PYTHONPATH / pip install gguf
-    w =gguf.GGUFWriter(a.out, "controlvector")
+    w = gguf.GGUFWriter(a.out, "controlvector")
     w.add_string("controlvector.model_hint", "qwen4exp")
     w.add_uint32("controlvector.layer_count", N_LAYERS - 1)
     for l in range(1, N_LAYERS):
@@ -93,6 +99,7 @@ def main():
     b.add_argument("pos")
     b.add_argument("neg")
     b.add_argument("out")
+    b.add_argument("--also", nargs=2, action="append", metavar=("POS", "NEG"), help="another set, averaged in")
     a = ap.parse_args()
     {"tokens": cmd_tokens, "build": cmd_build}[a.cmd](a)
 

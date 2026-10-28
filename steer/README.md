@@ -63,3 +63,24 @@ The reference (gguf-neuron-explorer `gne direction --positions response`) differ
 prompts, replies generated independently, the conversation prefilled with the system prompt kept, and only the reply
 tokens averaged, each conversation on a cleared context. Not tried here: the sums hook has no per-position mask, and
 the streams here are concatenated, so later turns see earlier ones.
+
+## Short + long mix (`profanity-ko-long.*`, `profanity-ko-mix.gguf`) - the served vector
+
+The hand-written pairs are one-liners, so the vector also learned "curt chat": answers got 30-60% shorter and a
+"briefly" request came back as one line. `gen_pairs.py --system "" --answer-tokens 350 --rewrite "문장마다 ... 욕을
+하나 이상" --require ...` made 48 long, formatted answer pairs (16,200 / 18,869 tokens); `steer_build.py build ...
+--also` averages the short and the long set's differences with equal weight (cosine short vs long 0.49-0.71, the mix
+at layer 16 is 0.113 against the short set's 0.175). `tools/steer_len.py`, 7 prompts, greedy, max 800 tokens:
+
+| Vector, layers 8-32 | Tokens, all 7 | Profanity words | Black hole / code question |
+| --- | ---: | ---: | --- |
+| stock | 2,131 | 0 | 800 / 323 |
+| short set 0.12 | 1,412 | 3 | |
+| short set 0.15 | 903 | 5 | 205 / 93 |
+| mix 0.12 | 1,786 | 0 | |
+| mix 0.18 | 1,256 | 3 | |
+| **mix 0.22** | **1,480** | **7** | **705 / 37** |
+
+Mix 0.22 swears more than the short set at 0.15 and keeps explanations long; a "briefly" request is still one line,
+and the code question got shorter. The long rewrites insert some profanity mechanically (the model was told to put
+one in every sentence). Served: `steer/serve_steer.sh 0.22 8 32 profanity-ko-mix.gguf`.
