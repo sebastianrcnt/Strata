@@ -47,6 +47,15 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
 /// it runs on).  No-op without a vector or when this device has them already.
 bool cvec_replicate(std::string& err);
 
+/// --serve CVEC_LOAD: another vector's tables (the loaded one's sizes and mode) into the same device buffers, so the
+/// captured graphs stay valid.  The layers it steers are still the ones `covers` names: a direction elsewhere is
+/// never applied.
+bool cvec_rewrite(const std::vector<float>& dir, const std::vector<float>& s, std::string& err);
+/// --cvec-cover FIRST LAST: the layers a vector loaded later may steer, at start (each costs its unfused write).
+void cvec_cover(int first, int last);
+/// The host copy of the tables now on the devices.
+void cvec_tables(std::vector<float>& dir, std::vector<float>& s);
+
 /// The per-request switch, on every device that holds the vector.  Synchronizes them when it changes, so call it
 /// between requests.
 void cvec_set_enabled(bool on);

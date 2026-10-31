@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace strata::kernels {
@@ -133,6 +134,40 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
 }
 
 bool cvec_replicate(std::string& err) { return !g_cvec.loaded() || upload_here(err); }
+
+bool cvec_rewrite(const std::vector<float>& dir, const std::vector<float>& s, std::string& err) {
+    if (!g_cvec.loaded()) { err = "no control vector was loaded at start"; return false; }
+    if (dir.size() != g_dir_host.size() || s.size() != g_s_host.size()) { err = "control vector: bad table sizes"; return false; }
+    int prev = 0;   // the same buffers on every device: the graphs keep their addresses
+    cudaGetDevice(&prev);
+    for (int d = 0; d < kDevices; ++d) {
+        if (g_dev[d].dir == nullptr) continue;
+        cudaSetDevice(d);
+        cudaDeviceSynchronize();
+        if (cudaMemcpy(g_dev[d].dir, dir.data(), dir.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(g_dev[d].s, s.data(), s.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaSetDevice(prev);
+            err = "control vector: device copy failed";
+            return false;
+        }
+    }
+    cudaSetDevice(prev);
+    g_dir_host = dir;
+    g_s_host = s;
+    return true;
+}
+
+void cvec_cover(int first, int last) {
+    if (!g_cvec.loaded()) return;
+    for (int l = std::max(first, 1); l <= last && l < (int) g_cvec.steered.size(); ++l) g_cvec.steered[(size_t) l] = true;
+    g_cvec.first = std::min(g_cvec.first, std::max(first, 1));
+    g_cvec.last = std::max(g_cvec.last, std::min(last, (int) g_cvec.steered.size() - 1));
+}
+
+void cvec_tables(std::vector<float>& dir, std::vector<float>& s) {
+    dir = g_dir_host;
+    s = g_s_host;
+}
 
 void cvec_set_enabled(bool on) {
     if (!g_cvec.loaded() || on == g_on_host) return;

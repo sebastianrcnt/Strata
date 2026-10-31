@@ -436,6 +436,7 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    int cvec_cover_first = 0, cvec_cover_last = -1;   ///< --cvec-cover: more layers a CVEC_LOAD vector may steer
 };
 
 void usage() {
@@ -547,6 +548,7 @@ void usage() {
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
+                 "  --cvec-cover FIRST LAST  --serve: layers a vector loaded later (CVEC_LOAD) may steer as well\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -1248,6 +1250,10 @@ int main(int argc, char** argv) {
             if (m == "project") o.cvec_mode = 0;
             else if (m == "add") o.cvec_mode = 1;
             else { std::fprintf(stderr, "--cvec-mode: add or project, got '%s'\n", m.c_str()); return 2; }
+        }
+        else if (a == "--cvec-cover") {
+            o.cvec_cover_first = std::atoi(next("--cvec-cover"));
+            o.cvec_cover_last = std::atoi(next("--cvec-cover"));
         }
         else if (a == "--cvec-dir") {
             const std::string d = next("--cvec-dir");
@@ -2030,6 +2036,11 @@ int main(int argc, char** argv) {
         if (!load_control_vectors(o, g, cvec_summary, ce)) {
             std::fprintf(stderr, "strata generate: control vector: %s\n", ce.c_str());
             return 2;
+        }
+        if (o.cvec_cover_last >= o.cvec_cover_first) {
+            strata::kernels::cvec_cover(o.cvec_cover_first, o.cvec_cover_last);
+            std::fprintf(stderr, "strata generate: control vector: layers %d..%d may be steered\n",
+                         strata::kernels::cvec().first, strata::kernels::cvec().last);
         }
     }
     if (o.max_context < (int64_t) o.tokens.size() + o.max_new) {
@@ -4382,7 +4393,12 @@ int main(int argc, char** argv) {
         bool live_ok = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
-        bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        uint8_t cvec_cached = 1;   // the control vector the live session and the checkpoints were read with (0 off)
+        // CVEC_LOAD: the vectors a request may name (cvec=id), each as the tables cvec_rewrite takes; 1 is the one
+        // loaded at start, and cvec_uploaded the one on the devices now
+        std::map<int, std::pair<std::vector<float>, std::vector<float>>> cvec_bank;
+        uint8_t cvec_uploaded = 1;
+        if (strata::kernels::cvec().loaded()) strata::kernels::cvec_tables(cvec_bank[1].first, cvec_bank[1].second);
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
@@ -4407,6 +4423,7 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double>(Clock::now() - t0).count());
                 if (o.conversation_spill && o.prompt_cache > 0 && conversations.enabled())
                     conversations.on_evict([&store](strata::core::SavedConversation&& im) {
+                        if (im.cvec > 1) return;   // a CVEC_LOAD id means nothing to another run
                         std::fprintf(stderr, "strata serve: conversation cache: evicted %zu tokens to the disk tier\n",
                                      im.live.ids.size());
                         store.spill(std::move(im));
@@ -4495,9 +4512,10 @@ int main(int argc, char** argv) {
             if (o.conversation_dir.empty()) return -1;
             const auto t0 = Clock::now();
             std::vector<const strata::core::SavedConversation*> images;
-            for (const auto& im : conversations.entries()) images.push_back(&im);
+            for (const auto& im : conversations.entries())
+                if (im.cvec <= 1) images.push_back(&im);   // a CVEC_LOAD id means nothing to another run
             strata::core::SavedConversation live_image;
-            if (live_ok && !live.empty()) {
+            if (live_ok && !live.empty() && cvec_cached <= 1) {
                 try {
                     cudaDeviceSynchronize();
                     std::string e;
@@ -5059,6 +5077,65 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            // CVEC_LOAD <id> <scale> <first> <last> <file>: a vector requests may name with cvec=<id> (2..255), from
+            // FILE = n_layers * n_embd float32 directions (row l: layer l's output; tools/steer_build.py's
+            // `direction.<l>` raw), times scale over layers first..last - only those the vector loaded at start
+            // covers (--control-vector-layer-range, --cvec-cover) are applied.  An id loaded again replaces its
+            // vector, and the conversations read with the old one are dropped.  CVEC_DROP <id> forgets one.
+            if (line.rfind("CVEC_LOAD ", 0) == 0 || line.rfind("CVEC_DROP ", 0) == 0) {
+                const bool drop = line[5] == 'D';
+                int id = 0, first = 0, last = 0;
+                float scale = 0.0f;
+                char path[4096] = {0};
+                const int got = drop ? std::sscanf(line.c_str() + 10, "%d", &id)
+                                     : std::sscanf(line.c_str() + 10, "%d %f %d %d %4095s", &id, &scale, &first, &last, path);
+                const auto& cv = strata::kernels::cvec();
+                const int64_t L = g.n_layers, N = g.n_embd;
+                std::string e;
+                if (!cv.loaded()) e = "no control vector was loaded at start (--control-vector-scaled)";
+                else if (got != (drop ? 1 : 5) || id < 2 || id > 255) e = "expected CVEC_LOAD <id 2..255> <scale> <first> <last> <file> or CVEC_DROP <id>";
+                std::vector<float> dir, s;
+                int steered = 0;
+                if (e.empty() && !drop) {
+                    std::vector<float> data((size_t) (L * N));
+                    std::FILE* f = std::fopen(path, "rb");
+                    const size_t read = f ? std::fread(data.data(), sizeof(float), data.size(), f) : 0;
+                    if (f) std::fclose(f);
+                    if (read != data.size()) e = std::string("cannot read ") + path + " (" + std::to_string(L * N) + " float32 expected)";
+                    dir.assign((size_t) (L * N), 0.0f);
+                    s.assign((size_t) L, 0.0f);
+                    for (int64_t l = std::max(first, 1); e.empty() && l <= last && l < L; ++l) {
+                        if (!cv.covers(l)) continue;
+                        const float* d = data.data() + (size_t) (l * N);
+                        double nrm = 0.0;
+                        for (int64_t j = 0; j < N; ++j) nrm += (double) d[j] * d[j];
+                        if (nrm <= 0.0 || !std::isfinite(nrm)) continue;
+                        if (cv.mode == 0) {   // project: the unit direction, |scale d| as the strength
+                            nrm = std::sqrt(nrm);
+                            s[(size_t) l] = (float) (scale * nrm);
+                            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / nrm);
+                        } else {
+                            s[(size_t) l] = 1.0f;
+                            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = scale * d[j];
+                        }
+                        ++steered;
+                    }
+                }
+                if (e.empty()) {
+                    const size_t dropped = conversations.drop_cvec((uint8_t) id);
+                    if (cvec_cached == id) { live_ok = false; checks.clear(); }
+                    if (cvec_uploaded == id) cvec_uploaded = 0;   // the next request with it uploads it again
+                    if (drop) cvec_bank.erase(id);
+                    else cvec_bank[id] = {std::move(dir), std::move(s)};
+                    std::fprintf(stderr, "strata serve: control vector %d %s (%d layers steered, x%.3f, %d..%d); %zu "
+                                 "conversations dropped\n", id, drop ? "dropped" : "loaded", steered, scale, first, last, dropped);
+                    std::printf("CVEC_OK %d %d\n", id, steered);
+                } else {
+                    std::printf("ERR %s\n", e.c_str());
+                }
+                std::fflush(stdout);
+                continue;
+            }
             if (line == "PERSIST") {
                 const int n = persist_all("PERSIST");
                 std::printf("PERSISTED %d\n", n);
@@ -5087,7 +5164,10 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
-            int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            int req_cvec = 1;   // cvec=0|1|id: a loaded control vector for this request (on when absent; CVEC_LOAD ids)
+            // sums=FILE: this request's prompt read whole through the batched path (no cache), with the stock model,
+            // every layer's residual summed into FILE (prefill_sums_arm) - the steering studio's measurement
+            std::string req_sums;
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -5120,6 +5200,7 @@ int main(int argc, char** argv) {
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "bias") { req_bias_spec = tok.substr(eq + 1); req_bias_given = true; }
+                    else if (key == "sums") req_sums = tok.substr(eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -5133,6 +5214,10 @@ int main(int argc, char** argv) {
             std::string pe;
             if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
+                continue;
+            }
+            if (req_cvec > 1 && cvec_bank.find(req_cvec) == cvec_bank.end()) {
+                std::printf("ERR no control vector %d (CVEC_LOAD it first)\n", req_cvec);
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
@@ -5289,7 +5374,12 @@ int main(int argc, char** argv) {
                     if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
-            const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            // the vector this request is read with, also the caches' key (0 off, 1 the one loaded at start, 2.. a
+            // CVEC_LOAD id); a measurement (sums=) reads the stock model from token 0, nothing restored
+            const uint8_t want_cvec = !strata::kernels::cvec().loaded() ? 1
+                                      : (!req_sums.empty() || req_cvec <= 0) ? 0 : (uint8_t) std::min(req_cvec, 255);
+            const bool reuse_ok = req_sums.empty();
+            const bool disk_ok = want_cvec <= 1;   // a CVEC_LOAD id names another vector in another run
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
@@ -5299,7 +5389,7 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
-            if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+            if (o.prompt_cache > 0 && reuse_ok && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -5308,20 +5398,21 @@ int main(int argc, char** argv) {
                     }
             }
             // a request on a conversation the background preload is still reading waits for it, not a second read
-            if (preloading.valid() && store.enabled()) {
+            if (preloading.valid() && store.enabled() && disk_ok && reuse_ok) {
                 const auto dm = store.best(std::vector<int32_t>(ids.begin(), ids.end()), req_imgs, want_cvec);
                 if (!dm.name.empty() && std::find(preload_names.begin(), preload_names.end(), dm.name) != preload_names.end()) {
                     std::fprintf(stderr, "strata serve: conversation dir: waiting for the preload of %s\n", dm.name.c_str());
                     adopt_preload(true);
                 }
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            const auto parked = reuse_ok ? conversations.best(ids, req_imgs, want_cvec)
+                                         : strata::core::ConversationCache::Match{};
             int64_t in_tokens = parked.tokens;
             bool in_live = parked.live;
             std::optional<strata::core::SavedConversation> incoming;
             // The disk tier: a conversation the RAM cache evicted (or a past run left), taken when restoring it beats
             // reading again what it adds; a spilled one still waiting for its write is taken back without a read.
-            if (store.enabled() && o.prompt_cache > 0) {
+            if (store.enabled() && o.prompt_cache > 0 && disk_ok && reuse_ok) {
                 const std::vector<int32_t> ids32(ids.begin(), ids.end());
                 const int64_t have = std::max<int64_t>(resume, parked.tokens);
                 for (int attempt = 0; attempt < 2 && !incoming; ++attempt) {
@@ -5428,7 +5519,22 @@ int main(int argc, char** argv) {
                 checks.clear();
                 cvec_cached = want_cvec;
             }
-            if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+            if (strata::kernels::cvec().loaded()) {
+                if (want_cvec != 0 && want_cvec != cvec_uploaded) {   // another vector's tables into the buffers
+                    const auto& t = cvec_bank.at(want_cvec);
+                    if (!strata::kernels::cvec_rewrite(t.first, t.second, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    cvec_uploaded = want_cvec;
+                }
+                strata::kernels::cvec_set_enabled(want_cvec != 0);
+            }
+            if (!req_sums.empty()) strata::prefill::prefill_sums_arm(req_sums);
+            struct SumsScope {   // whichever way the request ends
+                bool on;
+                ~SumsScope() { if (on) strata::prefill::prefill_sums_disarm(); }
+            } sums_scope{!req_sums.empty()};
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
@@ -5506,7 +5612,7 @@ int main(int argc, char** argv) {
             // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > o.short_read) return false;
+                if (no_short || !req_sums.empty() || b - a > o.short_read) return false;   // sums: the batched path
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;

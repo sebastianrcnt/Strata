@@ -43,7 +43,7 @@ struct ConversationDiskIndex {
     // The image description; the fingerprint hashes it (every byte of the image, through the hashes).
     std::array<int64_t, 18> geometry{};
     int64_t layer_lo = 0, layer_hi = 0;
-    bool cvec = true;
+    uint8_t cvec = 1;   // the control vector it was read with: 0 off, 1 the one loaded at start, 2.. --serve CVEC_LOAD ids
     struct Slot {
         uint64_t hash = 0, bytes = 0, used = 0;   // checkpoint payload hash without `used`
         uint64_t ids_len = 0, ids_hash = 0;       // its tokens, for matching a prompt without reading the file
@@ -161,7 +161,7 @@ public:
     ConversationDiskStats persist(const std::vector<const SavedConversation*>& images);
     void flush();                          // until every queued write is done
     ConversationStoreMatch best(const std::vector<int32_t>& prompt, const std::vector<ConversationImageKey>& images,
-                                bool cvec) const;
+                                uint8_t cvec) const;
     // whether restoring `m` beats reading again what it adds to the `have` tokens a request has already
     bool worth(const ConversationStoreMatch& m, int64_t have) const;
     // The image of a match: a queued one is taken back (after its write, if that has begun), a file is read.

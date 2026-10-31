@@ -34,6 +34,12 @@ struct PrefillStats {
     double ms_ple = 0;
 };
 
+/// The prompt path's per-layer residual sums (steering vectors): from here on every batched run sums each layer's
+/// output residual into FILE (int64 tokens, then (n_layers, n_embd) float64), as STRATA_PREFILL_SUMS does for a
+/// whole run.  --serve arms it for one request (GEN sums=FILE) and disarms it after.
+void prefill_sums_arm(const std::string& path);
+void prefill_sums_disarm();
+
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {

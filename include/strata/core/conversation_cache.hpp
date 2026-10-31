@@ -69,7 +69,7 @@ struct SavedConversation {
     ConversationCheckpoint live;
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
-    bool cvec = true;
+    uint8_t cvec = 1;   // the control vector it was read with: 0 off, 1 the one loaded at start, 2.. --serve CVEC_LOAD ids
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
@@ -129,7 +129,7 @@ public:
     }
 
     template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, uint8_t cvec) const {
         Match best;
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
@@ -144,6 +144,17 @@ public:
             for (const auto& c : e.checkpoints) consider(c, false);
         }
         return best;
+    }
+
+    // --serve CVEC_LOAD: the conversations read under a vector id that now names another vector
+    size_t drop_cvec(uint8_t cvec) {
+        size_t n = 0;
+        for (size_t i = entries_.size(); i-- > 0;)
+            if (entries_[i].cvec == cvec) {
+                take(i);
+                ++n;
+            }
+        return n;
     }
 
     SavedConversation take(size_t index) {
@@ -175,7 +186,7 @@ public:
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+                           const std::vector<ConversationCheckpoint>& checkpoints, uint8_t cvec) {
         auto held = [&](const ConversationCheckpoint& c) {
             if (c.ids == ids && c.imgs == images) return true;
             for (const auto& k : checkpoints)

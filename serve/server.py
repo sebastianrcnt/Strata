@@ -57,6 +57,7 @@ from serve.frontend import (IMAGES_INLINE, LOGIT_BIAS_KEY, MAX_LOGIT_BIAS, ChatT
                             OutputParser, anthropic_to_messages, check_supported, explicit_budget, images_of,
                             openai_to_messages, parse_logit_bias, parse_stop)
 from serve.winjob import contain  # noqa: E402
+from serve.steering import STEER_ID_KEY, STEER_SUMS_KEY, Steering  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -474,7 +475,15 @@ class StrataEngine:
     @staticmethod
     def projection_key(sampling: dict) -> str:
         """`cvec=0|1`: the experimental-speed-projection control vector for this request, when the engine was
-        started with one (--control-vector-scaled; an engine without one ignores the key).  Absent = on."""
+        started with one (--control-vector-scaled; an engine without one ignores the key).  Absent = on.
+        `cvec=<id>`: a steering vector the studio loaded (serve/steering.py; Service.run resolves the request's
+        name to STEER_ID_KEY), and `sums=FILE` a measurement (Steering.measure only)."""
+        sums = sampling.get(STEER_SUMS_KEY)
+        if isinstance(sums, str) and sums and " " not in sums:
+            return f" cvec=0 sums={sums}"
+        sid = sampling.get(STEER_ID_KEY)
+        if isinstance(sid, int) and not isinstance(sid, bool) and 2 <= sid <= 255:
+            return f" cvec={sid}"
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
@@ -623,6 +632,22 @@ class StrataEngine:
                 raise EngineDied("the engine refused to save conversations: " + line[4:].strip())
             if line.startswith("PERSISTED"):
                 return int(line.split()[1])
+
+    def command(self, line: str, ok: str, timeout: float = 120) -> str:
+        """One command line between requests (CVEC_LOAD, ...): its reply starting with `ok`, ValueError for ERR.
+        The caller holds the service's fifo."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+        while True:
+            reply = self.lines.get(timeout=timeout)
+            if reply is None:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            if reply.startswith("ERR"):
+                raise ValueError(reply[4:].strip())
+            if reply.startswith(ok):
+                return reply.strip()
 
 
 class Vision:
@@ -1149,6 +1174,7 @@ class Service:
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.presets: dict[str, dict] = {}            # the config's `model_presets`: name -> sampling defaults
+        self.steer: Steering | None = None            # the config's `steering`: vectors the studio makes (/steer/*)
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
@@ -1216,7 +1242,7 @@ class Service:
         self.aliases = names
 
     def model_names(self) -> list[str]:
-        return [self.model, *self.aliases]
+        return [self.model, *self.aliases, *(self.steer.models() if self.steer else [])]
 
     def model_for(self, req) -> str:
         """The name to answer with: the request's own when it is the model's name or an alias (#297), else the model's.
@@ -1327,6 +1353,8 @@ class Service:
                   "(a minute or two) ...", flush=True)
         self.engine.restart()
         print("[strata] the engine is running again", flush=True)
+        if self.steer is not None:
+            self.steer.replay()
 
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
@@ -1718,6 +1746,10 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # the engine-side steering keys are set here only, never taken from a request
+        sampling = {k: v for k, v in (sampling or {}).items() if k not in (STEER_ID_KEY, STEER_SUMS_KEY)}
+        if self.steer is not None:
+            sampling[STEER_ID_KEY] = self.steer.engine_id(sampling)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         sf = StopFilter(stop)                           # stop sequences: over the answer text only
         detok, n, finish = Detokenizer(self.tok), 0, "length"
@@ -2323,6 +2355,9 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/steer/"):
+                self._steer(path)
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -2436,6 +2471,8 @@ def make_handler(svc: Service):
                     if svc.aliases:                       # #297: the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
+                    if svc.steer is not None:             # the studio's saved vectors (serve/steering.py)
+                        data += [{**model, "id": x, "alias_of": svc.model} for x in svc.steer.models()]
                     if path.startswith("/v1/models/"):
                         chosen = next((m for m in data if m["id"] == path.removeprefix("/v1/models/")), None)
                         self._json(200 if chosen else 404, chosen or {"error": {"message": "model not found"}})
@@ -2461,6 +2498,9 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path.startswith("/steer/"):
+                self._steer(path)
+                return
             if path in ("/v1/chat/completions", "/v1/messages"):
                 # the id of this request's response, its X-Request-Id and its GET /v1/usage/{id} (UsageLog): made
                 # before the body is read, so even a 400 for bad JSON carries one
@@ -2560,6 +2600,50 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+
+        def _steer(self, path):
+            """The steering studio's calls (serve/steering.py), with the token in the steering dir's admin.token."""
+            st = svc.steer
+            if st is None:
+                self._json(404, {"error": {"message": "steering is off (config \"steering\")"}})
+                return
+            if not st.authorized(self.headers):
+                self._json(403, {"error": {"type": "permission_error", "message": "X-Steer-Token missing or wrong"}})
+                return
+            try:
+                if self.command == "GET":
+                    if path != "/steer/status":
+                        raise LookupError
+                    self._json(200, st.status())
+                    return
+                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("send a JSON object")
+                num = lambda k, d: req.get(k, d) if isinstance(req.get(k, d), (int, float)) else d   # noqa: E731
+                first, last = int(num("first", st.cover[0])), int(num("last", st.cover[1]))
+                if path == "/steer/measure":
+                    pos, neg = req.get("pos"), req.get("neg")
+                    if not (isinstance(pos, list) and isinstance(neg, list) and
+                            all(isinstance(x, str) for x in pos + neg)):
+                        raise ValueError("pos and neg: lists of texts")
+                    out = st.measure(pos, neg, float(num("scale", 0.025)), first, last)
+                elif path == "/steer/draft":
+                    out = st.set_draft(float(num("scale", 0.025)), first, last)
+                elif path == "/steer/save":
+                    out = st.save(req.get("name"), req.get("scale"), req.get("first"), req.get("last"))
+                elif path == "/steer/update":
+                    out = st.update(req.get("name"), float(num("scale", 0.025)), first, last)
+                elif path == "/steer/delete":
+                    out = st.delete(req.get("name"))
+                else:
+                    raise LookupError
+                self._json(200, out)
+            except LookupError:
+                self._json(404, {"error": {"message": "not found"}})
+            except ValueError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except (GpuBusy, EngineDied, EngineStuck, EngineStarting, queue.Empty) as e:
+                self._json(503, {"error": {"type": "server_error", "message": str(e) or "the engine did not answer"}})
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
@@ -3070,6 +3154,16 @@ def main() -> int:
               file=sys.stderr)
         return 2
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    steer_cfg = cfg.get("steering")
+    if isinstance(steer_cfg, dict) and steer_cfg.get("dir"):
+        # serve/steering.py: vectors made while serving (needs an engine started with a control vector)
+        cover = steer_cfg.get("cover") or [1, 47]
+        svc.steer = Steering(svc, Path(steer_cfg["dir"]), int(steer_cfg.get("n_layers", 48)),
+                             int(steer_cfg.get("n_embd", 2560)), int(steer_cfg.get("hc", 4)), cover)
+        if hasattr(engine, "command") and svc.loaded() and not getattr(engine, "unloaded", False):
+            svc.steer.replay()
+        print(f"[strata] steering studio API on /steer/* (token in {Path(steer_cfg['dir']) / 'admin.token'})",
+              flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True

@@ -84,3 +84,22 @@ at layer 16 is 0.113 against the short set's 0.175). `tools/steer_len.py`, 7 pro
 Mix 0.22 swears more than the short set at 0.15 and keeps explanations long; a "briefly" request is still one line,
 and the code question got shorter. The long rewrites insert some profanity mechanically (the model was told to put
 one in every sentence). Served: `steer/serve_steer.sh 0.22 8 32 profanity-ko-mix.gguf`.
+
+## Steering studio (feat/steering-studio)
+
+Vectors made while the model serves, and a page to make, compare, keep and chat with them
+(`tools/steer_studio.py`, Gradio). Nothing here restarts the engine.
+
+- **Engine.** `GEN ... sums=FILE` reads that request's prompt with the stock model through the batched path, from
+  token 0, and writes the residual sums as `STRATA_PREFILL_SUMS` does (`prefill_sums_arm`). `CVEC_LOAD <id> <scale>
+  <first> <last> <file>` puts another vector (raw `n_layers x n_embd` f32) into the start vector's device buffers,
+  so the CUDA graphs stay valid. A request then asks for it with `cvec=<id>` (2..255). The conversation caches key on
+  that id instead of on/off. The disk tier keeps 0 and 1 only, because an id names nothing in another run.
+  `--cvec-cover 1 47` lets a loaded vector steer every layer. Each covered layer costs an unfused residual write,
+  which was not measurable here (70-90 tok/s either way).
+- **Server.** `serve/steering.py`, config `"steering": {"dir": "/state/steer"}`. `/steer/measure|draft|save|update|
+  delete|status` need the token in `<dir>/admin.token` (header `X-Steer-Token`). A request uses a saved vector with
+  `"model": "steer-NAME"` or `"strata_steer": "NAME"` (`"draft"`: the last measured one). Each layer's row is set to
+  the length of that layer's mean residual, so a scale is the share of the residual it pushes by. 0.025 means 2.5%,
+  and the orca-yok vector at 0.22 is about 2.6% in these units. One pair measures in about 1 s.
+- **Page.** `steer-studio.service` (systemd --user) listens on 127.0.0.1 and the tailnet address only, port 7870.

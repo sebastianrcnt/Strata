@@ -229,7 +229,7 @@ bool parse(Index& x, const std::string& bytes) {
     const size_t described = bytes.size() - in.left;
     in.pod(x.geometry); in.pod(x.layer_lo); in.pod(x.layer_hi); in.pod(cvec);
     x.delta = delta != 0;
-    x.cvec = cvec != 0;
+    x.cvec = cvec;
     x.slots.resize(in.count(48));
     for (auto& s : x.slots) {
         if (!in.ok) break;
@@ -586,7 +586,7 @@ bool read_index_file(Index& x, const std::string& path, std::string& error) {
         // what matching needs (the slots' tokens and pictures), seeking over the states
         uint8_t cvec = 1;
         r.pod(x.geometry); r.pod(x.layer_lo); r.pod(x.layer_hi); r.pod(cvec);
-        x.cvec = cvec != 0;
+        x.cvec = cvec;
         x.slots.emplace_back();
         r.summary(x.slots[0]);
         const uint64_t n = r.count(1);
@@ -625,7 +625,7 @@ bool read_legacy(Reader& r, SavedConversation& out) {
     r.pod(out.layer_lo);
     r.pod(out.layer_hi);
     r.pod(cvec);
-    out.cvec = cvec != 0;
+    out.cvec = cvec;
     r.checkpoint(out.live);
     out.checkpoints.resize(r.count(1));
     for (auto& c : out.checkpoints) if (r.ok) r.checkpoint(c);
@@ -699,7 +699,7 @@ bool read_image(SavedConversation& image, const std::string& path, int depth, In
     r.pod(out.layer_lo);
     r.pod(out.layer_hi);
     r.pod(cvec);
-    out.cvec = cvec != 0;
+    out.cvec = cvec;
     const uint64_t slots = r.count(16);
     if (r.ok && slots == 0) r.ok = false;
     std::vector<int64_t> refs(slots);
@@ -1281,7 +1281,7 @@ ConversationDiskStats ConversationStore::persist(const std::vector<const SavedCo
 }
 
 ConversationStoreMatch ConversationStore::best(const std::vector<int32_t>& prompt,
-                                               const std::vector<ConversationImageKey>& images, bool cvec) const {
+                                               const std::vector<ConversationImageKey>& images, uint8_t cvec) const {
     auto& m = *impl_;
     ConversationStoreMatch best;
     std::lock_guard<std::mutex> lk(m.mu);

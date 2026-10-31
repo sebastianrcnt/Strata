@@ -137,7 +137,7 @@ struct LayerSums {
     int64_t tokens = 0;
 };
 
-LayerSums* layer_sums() {
+LayerSums*& layer_sums_slot() {
     static LayerSums* s = []() -> LayerSums* {
         const char* e = std::getenv("STRATA_PREFILL_SUMS");
         if (e == nullptr || *e == 0) return nullptr;
@@ -147,6 +147,8 @@ LayerSums* layer_sums() {
     }();
     return s;
 }
+
+LayerSums* layer_sums() { return layer_sums_slot(); }
 
 bool layer_sums_add(LayerSums& s, int64_t layers, int64_t l, const float* R, int64_t T, cudaStream_t cs) {
     s.acc.resize((size_t) (layers * N), 0.0);
@@ -199,6 +201,19 @@ struct Alloc {
 };
 
 }  // namespace
+
+void prefill_sums_arm(const std::string& path) {
+    LayerSums*& s = layer_sums_slot();
+    delete s;
+    s = new LayerSums;
+    s->path = path;
+}
+
+void prefill_sums_disarm() {
+    LayerSums*& s = layer_sums_slot();
+    delete s;
+    s = nullptr;
+}
 
 // Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
 // copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
