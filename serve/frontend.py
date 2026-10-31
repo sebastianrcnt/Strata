@@ -71,14 +71,43 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
+# DeepSeek-V4.1's template takes low, medium, high (its default) and max, or a whole number 1..100 (the "Reasoning
+# Effort: N" line of its prompt).  use_family("deepseek41") switches effort_kwargs to this table (unknown words are a
+# 400 there); the Qwen path keeps the pass-through rule below, unchanged.
+EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+                   "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+FAMILY = None                   # the model family this server runs (module state): None = Qwen, "deepseek41"
+
+
+def use_family(family: str | None) -> None:
+    """The reasoning-effort words of the model family this server runs (Service.set_family)."""
+    global FAMILY
+    FAMILY = family
+
+
+def _deepseek_effort(value) -> dict:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if not 1 <= value <= 100:
+            raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
+        return {"reasoning_effort": value}
+    key = str(value).strip().lower()
+    if key not in EFFORT_DEEPSEEK:
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
+    level = EFFORT_DEEPSEEK[key]
+    return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
+
+
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Local: llama.cpp's rule - "none" turns
     thinking off, any other value goes to the template as given, which maps it (sharp-seeded: off -> no thinking,
-    minimal/low -> low, high/xhigh/max/ultracode/extreme -> xhigh, anything else -> medium)."""
+    minimal/low -> low, high/xhigh/max/ultracode/extreme -> xhigh, anything else -> medium).  DeepSeek-V4.1
+    (use_family): its own table, EFFORT_DEEPSEEK."""
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
+    if FAMILY == "deepseek41":
+        return _deepseek_effort(value)
     key = str(value).strip().lower()
     return {"enable_thinking": False} if key == "none" else {"reasoning_effort": key}
 
@@ -89,7 +118,8 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else
+            ("high" if FAMILY == "deepseek41" else "xhigh")}
 
 
 def explicit_budget(req) -> tuple[str, object] | None:
@@ -714,9 +744,16 @@ class OutputParser:
                 self._reset_scan()
                 self.state, self.lead = "content", True
 
-    def finish(self) -> list[Event]:
+    @property
+    def clean(self) -> bool:
+        """No tag is held back: a clean point to stop the thinking at (serve/dsml.py's parser also counts what it
+        holds)."""
+        return not self.buf
+
+    def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211)."""
+        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason`
+        (the run's finish) is for serve/dsml.py's parser; this one does not use it."""
         out = []
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
