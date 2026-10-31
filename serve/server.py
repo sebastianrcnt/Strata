@@ -22,6 +22,14 @@ An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
 `StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
 talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes every API path testable without a GPU.
+
+DeepSeek-V4.1 (ported from upstream Strata 0.2.8): a config whose "arch" is "deepseek41" (or whose tokenizer's "pre"
+is "deepseek3") runs `strata-dsv41 --serve`, which speaks the same GEN/T/DONE lines with its own keys
+(StrataEngine.ds4_keys).  The family switch (Service.set_family) gives it DeepSeek's end token, its chat template
+(serve/fixtures/deepseek41, serve/dsml.py pick_template), DSML tool calls (serve/dsml.py), its reasoning-effort words
+(frontend.EFFORT_DEEPSEEK), the model card's sampling, a 32768-token default thinking budget and pictures through the
+engine's own vision tower (serve/ds_pictures.py).  Steering (control vectors) and logit_bias are Qwen-engine features:
+for DeepSeek they are refused with a 400.
 """
 from __future__ import annotations
 
@@ -57,6 +65,7 @@ from serve.frontend import (IMAGES_INLINE, LOGIT_BIAS_KEY, MAX_LOGIT_BIAS, ChatT
                             OutputParser, anthropic_to_messages, check_supported, explicit_budget, images_of,
                             openai_to_messages, parse_logit_bias, parse_stop)
 from serve.winjob import contain  # noqa: E402
+from serve.ds_pictures import DsPictures  # noqa: E402
 from serve.steering import STEER_ID_KEY, STEER_SUMS_KEY, Steering  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 
@@ -70,6 +79,7 @@ REPEAT_STOP_TOKENS = 256
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+DS41_DEFAULT_BUDGET = 32768   # DeepSeek-V4.1 only: the thinking budget when neither the request nor the config names one
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -89,6 +99,9 @@ class MockEngine:
     def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
         end = tokenizer.encode(IM_END, parse_special=True)
+        eos = (getattr(tokenizer, "special_ids", None) or {}).get("eos")
+        if len(end) != 1 and eos is not None:            # DeepSeek-V4.1's tokenizer has no <|im_end|>: its end token
+            end = [int(eos)]
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
@@ -220,7 +233,12 @@ class StrataEngine:
     Per-request sampling rides the same line as engine-side keys between max_new and the ids
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
+
+    `family` "deepseek41" (main() sets it; restart() keeps it): the engine is strata-dsv41, whose GEN line takes only
+    its own keys (ds4_keys), and whose ERR for a request that was read is followed by a DONE line (drained).
     """
+
+    family = None
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
@@ -487,6 +505,38 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    @staticmethod
+    def ds4_keys(sampling: dict) -> str:
+        """strata-dsv41's GEN keys (src/dsv41/ds4_main.cpp parse_gen): temperature, top_p, top_k, min_p, seed, and
+        `pin=N` (the first N prompt tokens are a start other requests share: Service.prepare's strata_prefix).  No
+        penalties, logit_bias, control vectors (cvec=, sums=) or tuning keys: that engine has none of them."""
+        keys = ""
+        t = sampling.get("temperature")
+        if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) > 0.0:
+            keys += f" temperature={float(t)!r}"
+        tp = sampling.get("top_p")
+        if isinstance(tp, (int, float)) and not isinstance(tp, bool) and 0.0 < float(tp) < 1.0:
+            keys += f" top_p={float(tp)!r}"
+        tk = sampling.get("top_k")
+        if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
+            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+        mp = sampling.get("min_p")
+        if isinstance(mp, (int, float)) and not isinstance(mp, bool) and 0.0 < float(mp) <= 1.0:
+            keys += f" min_p={float(mp)!r}"
+        seed = sampling.get("seed")
+        if isinstance(seed, int) and not isinstance(seed, bool) and seed > 0:
+            keys += f" seed={seed}"
+        prefix = sampling.get("strata_prefix")
+        if isinstance(prefix, dict):
+            pn = prefix.get("tokens")
+            if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
+                keys += f" pin={pn}"
+        return keys
+
+    def line_keys(self, sampling: dict) -> str:
+        """The GEN line's keys for this engine: strata-dsv41's own (ds4_keys) or the Qwen engine's (sampling_keys)."""
+        return self.ds4_keys(sampling) if self.family == "deepseek41" else self.sampling_keys(sampling)
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
@@ -496,8 +546,8 @@ class StrataEngine:
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        head = f"GENI {int(max_new)}{self.line_keys(sampling or {})} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.line_keys(sampling or {})}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -534,6 +584,8 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
+                    if self.family == "deepseek41":
+                        self._drain_done_after_err()
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
@@ -550,6 +602,20 @@ class StrataEngine:
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+
+    def _drain_done_after_err(self, wait_s: float = 2.0) -> None:
+        """strata-dsv41 follows the ERR of a request it had read (a picture it could not take, a failed prompt read)
+        with that request's `DONE 0 ... cancel` line; left in the queue, it would end the NEXT request at once with no
+        tokens.  Its other ERRs (a malformed line, a prompt over the context) come alone: nothing arrives, and after
+        `wait_s` the engine is idle anyway (it answers nothing until the next command)."""
+        try:
+            line = self.lines.get(timeout=wait_s)
+        except queue.Empty:
+            return
+        if line is None:
+            self.lines.put(None)                          # (the pump's end mark: generate() sees it next time)
+        elif line.startswith("DONE"):
+            self._parse_done(line)
 
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
@@ -951,6 +1017,23 @@ def enable_vision_swap(cfg: dict, env: dict) -> bool:
     return True
 
 
+DS41_SLOT_KEEP_DEFAULT = "1"      # the engine keeps a displaced conversation in RAM and in the slot folder (see below)
+DS41_SLOT_GB_DEFAULT = "2"        # the folder's cap in GB (a 6.5K-token conversation is about 17 MB)
+
+
+def deepseek_slot_env(env: dict, cfg: dict) -> None:
+    """DeepSeek-V4.1 only.  The engine sets a conversation aside when another request takes the model and takes it back
+    at its checkpoints (agents and sub-agents that take turns do not read their prompts again).  STRATA_DS4_SLOT_KEEP
+    switches it (the default above; a config's env or the shell wins); the folder is `ds4-slots` next to the run log
+    (STRATA_DS4_SLOT_DIR names another), and the engine caps it (STRATA_DS4_SLOT_GB, 2 here, 16 in the engine) and
+    removes what is older than a week or not this model's.  On by default; STRATA_DS4_SLOT_KEEP=0 turns it off."""
+    env.setdefault("STRATA_DS4_SLOT_KEEP", DS41_SLOT_KEEP_DEFAULT)
+    env.setdefault("STRATA_DS4_SLOT_GB", DS41_SLOT_GB_DEFAULT)
+    log = cfg.get("log")
+    if "STRATA_DS4_SLOT_DIR" not in env and log:
+        env["STRATA_DS4_SLOT_DIR"] = str(Path(log).parent / "ds4-slots")
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -966,6 +1049,8 @@ def child_env(cfg: dict) -> dict:
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
+    if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
+        deepseek_slot_env(env, cfg)
     return env
 
 
@@ -1010,6 +1095,25 @@ class ByteTokenizer:
 
 
 # ------------------------------------------------------------------------------------------------ core
+def end_token_ids(tokenizer) -> set[int]:
+    """The ids that end a reply for a tokenizer whose family was not named (Service.set_family sets them for DeepSeek).
+
+    Qwen's <|im_end|> and <|endoftext|> end a reply only where each is ONE token (as for every Qwen tokenizer: the
+    same set as before).  A tokenizer without them (DeepSeek-V4.1's splits "<|im_end|>" into '<', '|', 'im', '_end',
+    '|', '>') would make every piece of them a stop id; those are left out, and the end token the tokenizer names
+    (special_ids "eos") ends the reply instead."""
+    ids: set[int] = set()
+    for marker in (IM_END, "<|endoftext|>"):
+        got = tokenizer.encode(marker, parse_special=True)
+        if len(got) == 1:
+            ids.add(int(got[0]))
+    if not ids:
+        eos = (getattr(tokenizer, "special_ids", None) or {}).get("eos")
+        if eos is not None:
+            ids.add(int(eos))
+    return ids
+
+
 class Detokenizer:
     """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
     characters and holds a multi-byte character split across tokens until it is complete (invalid bytes become
@@ -1220,8 +1324,38 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = end_token_ids(tokenizer)
+        self.family = None                               # the model family ("deepseek41"): set_family() below
+        self.parser_cls = OutputParser                   # reads the model's output (reasoning, content, tool calls)
+        self.reasoning_budget_configured = False         # the config named reasoning_budget_tokens (0 included)
+
+    def set_family(self, family: str | None) -> None:
+        """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1: its own end
+        token, DSML tool calls, reasoning-effort words).  None keeps the Qwen defaults."""
+        import serve.frontend as _frontend
+        self.family = family
+        if family == "deepseek41":
+            from serve import dsml
+            eos = (getattr(self.tok, "special_ids", None) or {}).get("eos", 1)
+            self.stop_ids = {int(eos)}
+            self.parser_cls = dsml.DsmlOutputParser
+        else:
+            self.stop_ids = end_token_ids(self.tok)
+            self.parser_cls = OutputParser
+        _frontend.use_family(family)
+
+    def check_family_request(self, req: dict, logit_bias=None) -> None:
+        """What the DeepSeek-V4.1 engine cannot do is a 400, not a silent no-op: steering vectors (strata_steer, a
+        steer-NAME model: they are control vectors of the Qwen engine) and logit_bias (strata-dsv41 has no per-request
+        bias).  Nothing for the Qwen path."""
+        if self.family != "deepseek41" or not isinstance(req, dict):
+            return
+        model = req.get("model")
+        if req.get("strata_steer") or (isinstance(model, str) and model.startswith("steer-")):
+            raise ValueError("steering vectors (strata_steer, steer-NAME models) are not available here: the "
+                             "DeepSeek-V4.1 engine has no control vectors")
+        if logit_bias:
+            raise ValueError("logit_bias is not supported by the DeepSeek-V4.1 engine")
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1260,7 +1394,13 @@ class Service:
         """
         req = req if isinstance(req, dict) else {}
         name, value = explicit_budget(req) or ("reasoning_budget_tokens", None)
-        if value is None:
+        if value is None and self.family == "deepseek41":
+            # DeepSeek-V4.1: the effort is the template's own ("Reasoning Effort: N"), not a cap here; the config's
+            # budget, else (as Maya ships it) DS41_DEFAULT_BUDGET when nothing anywhere names one
+            value = self.reasoning_budget_tokens
+            if not value and not self.reasoning_budget_configured:
+                value = DS41_DEFAULT_BUDGET
+        elif value is None:
             ctk = req.get("chat_template_kwargs")
             ctk = ctk if isinstance(ctk, dict) else {}
             reasoning = req.get("reasoning")
@@ -1637,15 +1777,26 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-        the rest of the context."""
+        the rest of the context.  `req` (DeepSeek-V4.1 only): its "strata_prefix" is set to the shared start the
+        engine pins (deepseek_shared_start); other families leave it alone."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
         ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
+        ds_pics = False                                  # DeepSeek pictures (the engine's own tower): the file is written
+        if images and isinstance(self.vision, DsPictures):
+            # DeepSeek-V4.1: the engine has its own vision tower.  The pictures go to it as raw RGB in the file of a
+            # GENI line (serve/ds_pictures.py); each template placeholder becomes the run of image tokens it takes.
+            ids, ds_file = self.vision.build(ids, [Vision.load(src) for src in images])
+            self.embeddings.path = ds_file
+            images, ds_pics = [], True
         if images:
             if self.vision is None:
+                if self.family == "deepseek41":
+                    raise ValueError("this server was started without pictures for DeepSeek (--vision off in the "
+                                     "config's args, or a pack without the vision tower), so it cannot read images")
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
@@ -1681,20 +1832,68 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
-        if self.engine.max_context <= 0:                # #344: (re)starting, not a prompt that is too long
-            raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-        room = self.engine.max_context - CTX_SLACK - len(ids)
-        if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
-            if room < 1:
-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
-            max_new = room
-        elif max_new > room:
-            if not self.fit_max_tokens:
-                raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
-            max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+        try:
+            if self.engine.max_context <= 0:            # #344: (re)starting, not a prompt that is too long
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+            room = self.engine.max_context - CTX_SLACK - len(ids)
+            if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
+                if room < 1:
+                    raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                     f"({self.engine.max_context}); requests are never truncated")
+                max_new = room
+            elif max_new > room:
+                if not self.fit_max_tokens:
+                    raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                                     f"({self.engine.max_context}); requests are never truncated")
+                max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+            if self.family == "deepseek41" and req is not None:
+                req["strata_prefix"] = self.deepseek_prefix(req.get("strata_prefix"), messages, tools, kwargs, ids,
+                                                            ds_pics)
+                if not req["strata_prefix"]:
+                    req.pop("strata_prefix")
+        except (ValueError, EngineStarting):
+            if ds_pics:                                  # refused: run() never starts, so its picture file goes now
+                Path(self.embeddings.path).unlink(missing_ok=True)
+                self.embeddings.path = None
+            raise
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    @staticmethod
+    def deepseek_shared_start(messages) -> int:
+        """DeepSeek-V4.1 only: how many leading messages are the system prompt (its tools are rendered with them).  An
+        agent and its sub-agents that work behind the same system prompt and tools share exactly this start, so the
+        engine keeps a checkpoint of its state there (pin=N): the next agent behind the same start goes back to it
+        instead of reading it again.  0: none (STRATA_DS4_AUTO_PIN=0, no system message, or nothing after it)."""
+        if os.environ.get("STRATA_DS4_AUTO_PIN", "1") == "0":
+            return 0
+        n = 0
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+                n += 1
+            else:
+                break
+        return n if 0 < n < len(messages) else 0
+
+    def deepseek_prefix(self, spec, messages, tools, kwargs, ids, has_images=False) -> dict:
+        """The {"tokens": N} the engine pins (`pin=N`), or {}.  A client's own "strata_prefix": {"tokens": N} wins (a
+        whole number; out of range: ignored); otherwise the system prompt and its tools (deepseek_shared_start), as
+        the ids the rendered start shares with the prompt's.  Pictures: none (the slot is text only)."""
+        if spec is not None:
+            pn = spec.get("tokens") if isinstance(spec, dict) and set(spec) == {"tokens"} else None
+            if not isinstance(pn, int) or isinstance(pn, bool) or pn < 1:
+                raise ValueError('strata_prefix: {"tokens": N} (the first N prompt tokens, a whole number 1 or more)')
+            return {"tokens": pn} if pn < len(ids) - 1 and not has_images else {}
+        lead = 0 if has_images else self.deepseek_shared_start(messages)
+        if not lead:
+            return {}
+        text = self.template.render(messages[:lead], tools=tools, **{**kwargs, "add_generation_prompt": False})
+        head = self.tok.encode(text, parse_special=True)
+        n = 0
+        for x, y in zip(head, ids):
+            if x != y:
+                break
+            n += 1
+        return {"tokens": n} if 0 < n < len(ids) - 1 else {}
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -1741,16 +1940,28 @@ class Service:
         before it, the engine is stopped (the stop-token path: STOP and drain in the finally below) and "done" has
         "finish": "stop" and "stop_sequence": the string that matched - a normal completion, not a cancel."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
-        # the config's, then the Chat settings shared with apps, then the preset the request names as its model
-        defaults = {**self.sampling_defaults, **self.shared, **self.presets.get((sampling or {}).get("model"), {})}
+        if budget and self.family == "deepseek41" and max_new and max_new > 0:
+            # DeepSeek-V4.1 (upstream #984): a budget at or near max_tokens (the family default is 32768) never fires
+            # before the reply is cut off while still thinking, so it has no answer.  Close the thinking early enough
+            # to leave room for one.  (The Qwen path keeps its budgets as they were.)
+            reserve = min(max(512, max_new // 4), max_new // 2)
+            if budget > max_new - reserve:
+                budget = max(1, max_new - reserve)
+        # the model card's (DeepSeek-V4.1 only; the Qwen path has none), the config's, then the Chat settings shared
+        # with apps, then the preset the request names as its model
+        defaults = {**model_card_sampling(self.family, thinking), **self.sampling_defaults, **self.shared,
+                    **self.presets.get((sampling or {}).get("model"), {})}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         # the engine-side steering keys are set here only, never taken from a request
         sampling = {k: v for k, v in (sampling or {}).items() if k not in (STEER_ID_KEY, STEER_SUMS_KEY)}
-        if self.steer is not None:
+        if self.family == "deepseek41":                 # the Qwen engine's keys never reach strata-dsv41
+            sampling = {k: v for k, v in sampling.items() if k not in (
+                LOGIT_BIAS_KEY, "experimental_speed_projection", "strata_tune", "strata_steer")}
+        elif self.steer is not None:
             sampling[STEER_ID_KEY] = self.steer.engine_id(sampling)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True)
         sf = StopFilter(stop)                           # stop sequences: over the answer text only
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         reasoning_n = 0                                 # the tokens of n inside the thinking (usage.reasoning_tokens)
@@ -1829,7 +2040,7 @@ class Service:
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
-                                    if thought >= budget and not parser.buf and not detok.pending():
+                                    if thought >= budget and parser.clean and not detok.pending():
                                         wrap = True
                                         break
                         except EngineDied as e:
@@ -1947,7 +2158,7 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         if not sf.hit:                                  # the end: what the parser held may complete a stop string,
-            for ev in sf.feed(parser.finish()) + sf.flush():   # and what the filter held is not one: flushed
+            for ev in sf.feed(parser.finish(finish)) + sf.flush():   # and what the filter held is not one: flushed
                 yield "event", ev
             if sf.hit and finish == "length":
                 finish = "stop"                         # (n and the usage entry are what was generated, as ever)
@@ -2053,7 +2264,9 @@ def _is_json(text: str) -> bool:
         return False
 
 
-def openai_collect(chunks) -> dict:
+def openai_collect(chunks, dedupe_reasoning: bool = False) -> dict:
+    """`dedupe_reasoning` (DeepSeek-V4.1): a turn with no </think> is the answer (serve/dsml.py hands the reasoning
+    over as content at the end); the identical reasoning is not also returned."""
     content, reasoning, by_index, last = [], [], {}, None
     for c in chunks:
         if c is None:                              # a heartbeat
@@ -2073,6 +2286,8 @@ def openai_collect(chunks) -> dict:
     if last["choices"][0]["finish_reason"] != "tool_calls":
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
     msg = {"role": "assistant", "content": "".join(content) or None}
+    if dedupe_reasoning and "".join(reasoning).strip() and "".join(reasoning).strip() == "".join(content).strip():
+        reasoning = []              # a turn with no </think> (serve/dsml.py): the text is the answer; it is not also reasoning
     if "".join(reasoning):
         msg["reasoning_content"] = "".join(reasoning)
     if calls:
@@ -2182,7 +2397,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             yield "message_stop", {"type": "message_stop"}
 
 
-def anthropic_collect(events) -> dict:
+def anthropic_collect(events, dedupe_reasoning: bool = False) -> dict:
+    """`dedupe_reasoning`: as openai_collect's (a thinking block identical to the text block after it is dropped)."""
     msg, blocks = None, []
     for item in events:
         if item is None:                           # a heartbeat
@@ -2210,6 +2426,11 @@ def anthropic_collect(events) -> dict:
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+    for i in range(len(blocks) - 1 if dedupe_reasoning else 0):
+        a, b = blocks[i], blocks[i + 1]                 # a turn with no </think> (serve/dsml.py): the text is the answer
+        if a.get("type") == "thinking" and b.get("type") == "text" and a.get("thinking", "").strip() == b.get("text", "").strip():
+            del blocks[i]
+            break
     msg["content"] = blocks
     return msg
 
@@ -2605,7 +2826,9 @@ def make_handler(svc: Service):
             """The steering studio's calls (serve/steering.py), with the token in the steering dir's admin.token."""
             st = svc.steer
             if st is None:
-                self._json(404, {"error": {"message": "steering is off (config \"steering\")"}})
+                self._json(404, {"error": {"message": "steering is not available: the DeepSeek-V4.1 engine has no "
+                                                      "control vectors" if svc.family == "deepseek41" else
+                                                      "steering is off (config \"steering\")"}})
                 return
             if not st.authorized(self.headers):
                 self._json(403, {"error": {"type": "permission_error", "message": "X-Steer-Token missing or wrong"}})
@@ -2753,6 +2976,7 @@ def make_handler(svc: Service):
             stop = parse_stop(req, "openai")                 # a bad `stop` is a 400 too, before the engine loads
             req = dict(req)                                  # logit_bias, checked (a 400 if bad), for the engine line
             req[LOGIT_BIAS_KEY] = parse_logit_bias(req, svc.vocab_size())
+            svc.check_family_request(req, req[LOGIT_BIAS_KEY])   # DeepSeek: no steering, no logit_bias (a 400)
             messages, tools, kw = openai_to_messages(req)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and tools:
@@ -2762,14 +2986,14 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             cancel = threading.Event()
             self._watch_client(cancel)                       # includes image preparation
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel, req=req)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, self.usage_id, stop)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                return self._json(200, openai_collect(chunks, svc.family == "deepseek41"))
             self._sse()
             try:
                 for c in chunks:
@@ -2809,6 +3033,7 @@ def make_handler(svc: Service):
             stop = parse_stop(req, "anthropic")
             req = dict(req)                                  # Anthropic has no logit_bias: ignored, never sent on
             req.pop(LOGIT_BIAS_KEY, None)
+            svc.check_family_request(req)                    # DeepSeek: no steering (a 400)
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
@@ -2816,12 +3041,12 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             cancel = threading.Event()
             self._watch_client(cancel)                       # includes image preparation
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel, req=req)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, self.usage_id, stop)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                return self._json(200, anthropic_collect(events, svc.family == "deepseek41"))
             self._sse()
             try:
                 for item in events:
@@ -3024,6 +3249,42 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+# the API's model name per model family ("arch" in the config) when the config names none
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
+                      "deepseek41": "deepseek-v4.1-flash"}
+
+# The sampling the model card recommends, used when neither the request, the Chat settings nor the run config's
+# `sampling` block says otherwise.  DeepSeek-V4.1 only: this fork's Qwen path never had model-card defaults (a request
+# without a temperature stays greedy there, as before).
+MODEL_CARD_SAMPLING = {
+    # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
+    "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+}
+
+
+def model_card_sampling(arch, thinking) -> dict:
+    """The model card's sampling for the family `arch` and the thinking state ({} for any other family)."""
+    sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
+    return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+
+
+def arch_from_tokenizer(arch, pre) -> str | None:
+    """The model family a config that names none is served as: the pack's tokenizer says what it is (DeepSeek's
+    pre-tokenizer is "deepseek3"), so a hand-written config without "arch" does not get the Qwen stop ids and parser.
+    An arch the config names is never changed."""
+    if arch:
+        return arch
+    return "deepseek41" if str(pre or "").startswith("deepseek") else None
+
+
+def default_model_name(cfg: dict) -> str:
+    """The config's "model_name"; else DeepSeek-V4.1's name for "arch": "deepseek41"; else Flash-Next's (every Qwen
+    config, as before: this fork does not rename a Qwen config by its arch)."""
+    if cfg.get("model_name"):
+        return cfg["model_name"]
+    return FAMILY_MODEL_NAMES["deepseek41"] if cfg.get("arch") == "deepseek41" else "qwen3.8-flash-next"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -3089,7 +3350,16 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        try:                                            # the pack's pre-tokenizer name and special ids (DeepSeek's differ)
+            tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            tcfg = {}
+        tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
+        if not cfg.get("arch") and arch_from_tokenizer(None, tcfg.get("pre")):
+            cfg["arch"] = arch_from_tokenizer(None, tcfg.get("pre"))
+            print(f"[strata] the config names no \"arch\" and this tokenizer is DeepSeek's: serving it as {cfg['arch']} "
+                  f"(add \"arch\": \"{cfg['arch']}\" to the config to say it outright)", flush=True)
+    family = "deepseek41" if cfg.get("arch") == "deepseek41" else None
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -3122,16 +3392,35 @@ def main() -> int:
         # it is told about (WinError 2), so it is made absolute here
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
+        engine.family = family                          # strata-dsv41's GEN keys (restart() keeps the attribute)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
+    if family == "deepseek41":
+        from serve import dsml
+        tpl, swapped = dsml.pick_template(tpl)
+        if swapped:
+            print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
+                  "using the V4.1 template (serve/fixtures/deepseek41) so tool calls come back as real calls", flush=True)
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                  model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    svc.set_family(family)
+    if family == "deepseek41":
+        print("[strata] model family: DeepSeek-V4.1 (its end token, chat template, DSML tool calls and effort words)",
+              flush=True)
+        if a.engine == "strata" and vision is None:
+            # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no reader process.
+            # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None (images: a 400).
+            dsp = DsPictures.from_config(cfg, tmp_dir=Path(cfg["log"]).parent / "ds-pictures" if cfg.get("log") else None)
+            if dsp is not None:
+                svc.vision = vision = dsp
+                print("[strata] pictures: on (DeepSeek-V4.1 reads them with the engine's own vision tower; "
+                      "--vision off turns them off)", flush=True)
     presets = cfg.get("model_presets") or {}
     if not isinstance(presets, dict) or not all(isinstance(v, dict) for v in presets.values()):
         raise SystemExit("[strata] config model_presets: expected {\"name\": {sampling fields}}")
@@ -3155,7 +3444,10 @@ def main() -> int:
         return 2
     svc.api_key = a.api_key or cfg.get("api_key", "")
     steer_cfg = cfg.get("steering")
-    if isinstance(steer_cfg, dict) and steer_cfg.get("dir"):
+    if family == "deepseek41" and isinstance(steer_cfg, dict) and steer_cfg.get("dir"):
+        print("[strata] the config's \"steering\" is ignored: the DeepSeek-V4.1 engine has no control vectors "
+              "(/steer/* and strata_steer answer with an error)", flush=True)
+    elif isinstance(steer_cfg, dict) and steer_cfg.get("dir"):
         # serve/steering.py: vectors made while serving (needs an engine started with a control vector)
         cover = steer_cfg.get("cover") or [1, 47]
         svc.steer = Steering(svc, Path(steer_cfg["dir"]), int(steer_cfg.get("n_layers", 48)),
@@ -3195,6 +3487,7 @@ def main() -> int:
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
+            svc.reasoning_budget_configured = True
             budget = svc.reasoning_budget({})
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
@@ -3252,7 +3545,7 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
+        closers = [httpd.shutdown, getattr(engine, "close", None), getattr(vision, "close", None)]
         for close in filter(None, closers):
             try:
                 close()
